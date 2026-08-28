@@ -4,6 +4,7 @@
 /src-tauri/gen/schemas
 **/*.rs.bk
 *.pdb
+.codegraph/
 
 # 凭证与用户数据绝不允许进仓库
 credentials.json

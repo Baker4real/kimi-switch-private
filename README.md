@@ -36,7 +36,7 @@ npm install
 npm run tauri build
 ```
 
-产物：`src-tauri/target` 或 `target/release/kimi-switch.exe`（图形界面）、`target/release/kimi-switch-cli.exe`（命令行）。
+产物：`target/release/kimi-switch.exe`（图形界面）、`target/release/kimi-switch-cli.exe`（命令行）、`target/release/bundle/`（MSI/NSIS 安装包）。
 
 ## 使用
 
