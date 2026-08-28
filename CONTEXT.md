@@ -24,6 +24,10 @@ _Avoid_: 昵称, folder name
 某个账号在 Kimi 官方用量窗口（5 小时 / 7 天等）里已经用掉或还剩多少。
 _Avoid_: metric, quota monitor
 
+**额度查询**:
+向 Kimi 官方用量接口询问某个账号此刻的额度。
+_Avoid_: 额度刷新（易和 token 轮换、界面「刷新」按钮混在一起）
+
 **额度告急**:
 某个账号任一用量窗口已用达到或超过 80%，或该账号额度查询失败。
 _Avoid_: low quota, exhausted（exhausted 只表示用尽）
