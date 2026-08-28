@@ -1,6 +1,17 @@
 # Triage Labels
 
-The skills speak in terms of five canonical triage roles. This file maps those roles to the actual label strings used in this repo's issue tracker.
+The skills speak in terms of two category roles and five state roles. This file maps those roles to the actual label strings used in this repo's issue tracker. Every triaged issue should carry exactly one category label and one state label.
+
+## Category
+
+| Label in mattpocock/skills | Label in our tracker | Meaning                          |
+| -------------------------- | -------------------- | -------------------------------- |
+| `bug`                      | `bug`                | Something is broken              |
+| `enhancement`              | `enhancement`        | New feature or improvement       |
+
+These are the GitHub default names; do not invent a second pair.
+
+## State
 
 | Label in mattpocock/skills | Label in our tracker | Meaning                                  |
 | -------------------------- | -------------------- | ---------------------------------------- |

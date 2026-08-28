@@ -12,3 +12,6 @@ removed.json
 quota_cache.json
 audit.log
 .env
+.env.local
+.local/
+*.local.md
