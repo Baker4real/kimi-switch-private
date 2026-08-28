@@ -29,7 +29,7 @@
 需要 Rust 1.80+ 和 Node.js（图形界面）：
 
 ```bash
-git clone https://github.com/yuan2627/kimi-switch.git
+git clone https://github.com/Baker4real/kimi-switch-private.git
 cd kimi-switch
 cargo build --release -p kimi-switch-cli
 npm install
