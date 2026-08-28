@@ -324,6 +324,10 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 取账号 blob：active 账号优先读 live（并顺手修复 store 副本），parked 读 store，最后 legacy。
     ///
+    /// 「顺手修复 store 副本」是 ADR-0002 修订记录的第二条回灌路径：重授权 live 写失败
+    /// 窗口内对活跃账号一次读取（查额度/导出）即把旧 live 回灌库存、撤销新凭证——
+    /// 这是已接受的对外行为（窗口期一律以 live 为准），勿在此加防御。
+    ///
     /// 错误处理顺序与原始 Beta 实现一致：store 读取失败时不立即冒泡，而是先捕获错误、
     /// 继续尝试 `recover_legacy`；只有 legacy 也拿不到时才把原始 store 错误抛出去。这样即使
     /// keyring 后端本身故障，仍有机会从 legacy 布局恢复凭证。
@@ -465,6 +469,9 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 旧态回灌——它们会把旧 live 盖进刚替换的库存副本。写顺序固定「先库存后 live」：
     /// live 写失败时新凭证已安全落在库存，不会丢号。
     ///
+    /// 窗口期（store=新/live=旧）对外一律以 live 为准：其后的查询或切换都会把旧 live
+    /// 回灌库存、静默撤销新凭证（已接受行为，见 ADR-0002 修订与 issue #5）；补救是重试重新授权。
+    ///
     /// 错误文本只含账号 id 与原因，不含任何凭证内容。
     pub fn replace_account_blob(&self, target: &AccountId, raw: String) -> Result<Account> {
         let meta = self.runtime.parse_metadata(&raw);
@@ -494,7 +501,11 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         )?;
         if account.active {
             // 原子写（tmp + rename）：失败时旧 live 未被破坏，新凭证已在库存可重试。
-            Self::write_blob(&self.live_path(), &raw)?;
+            // 窗口期对外行为见 ADR-0002 修订：live 仍为旧凭证，其后的查询/切换都以旧 live 为准，
+            // 错误文案必须把状态与补救讲清楚。
+            Self::write_blob(&self.live_path(), &raw).map_err(|e| Error::Provider(format!(
+                "新凭证已保存到账号库，但写入当前登录文件失败：{e}；当前仍在使用旧凭证，之后的查询或切换都会以旧凭证为准，请尽快重试重新授权"
+            )))?;
         }
         Ok(account)
     }
@@ -1141,6 +1152,158 @@ mod tests {
         assert!(account.active, "当前账号身份保持不变");
         let accounts = p.list_accounts().await.unwrap();
         assert_eq!(accounts.len(), 1, "同一官方身份仍是一条：{accounts:?}");
+    }
+
+    /// 重授权当前账号时 live 原子写失败：错误文案必须明示状态与补救——新凭证已保存到
+    /// 账号库、live 仍是旧凭证、尽快重试重新授权——并带上底层 io 原因；
+    /// 库存已落新凭证，live 保持旧内容不被破坏。
+    #[test]
+    fn reauth_active_live_write_failure_reports_state_and_keeps_store_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.home()).unwrap();
+
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+
+        p.import_raw(old_u1.into(), None, Some(true)).unwrap();
+        fs::write(p.test_live_path(), old_u1).unwrap();
+
+        // 注入 live 写失败：把 write_blob 的 tmp 目标预制为目录，迫使 fs::write 失败
+        // （tmp 命名与 write_blob 内部一致；live 文件本身保持旧内容）。
+        let tmp_target = p
+            .test_live_path()
+            .with_extension(format!("tmp.{}", std::process::id()));
+        fs::create_dir_all(&tmp_target).unwrap();
+
+        let err = p
+            .replace_account_blob(&AccountId("u1".into()), new_u1.into())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("已保存到账号库"),
+            "错误必须说明新凭证已保存到账号库：{msg}"
+        );
+        assert!(
+            msg.contains("旧凭证"),
+            "错误必须说明当前仍在使用旧凭证：{msg}"
+        );
+        assert!(
+            msg.contains("重试重新授权"),
+            "错误必须给出补救动作（重试重新授权）：{msg}"
+        );
+        assert!(
+            msg.contains("os error"),
+            "错误必须带上底层 io 原因：{msg}"
+        );
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            new_u1,
+            "live 写失败时新凭证必须已经落库"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            old_u1,
+            "live 原子写失败不得破坏旧登录文件"
+        );
+    }
+
+    /// 钉住已接受行为（ADR-0002 修订）：重授权 live 写失败留下 store=新/live=旧 窗口后，
+    /// 其后一次切换的 capture-on-leave 会把旧 live 回灌库存、静默撤销新凭证——这是明文
+    /// 接受的对外行为（对外一律以 live 为准），由本测试钉住防止未来无意改变；
+    /// 若要改变，先重开 ADR-0002 决策。
+    #[tokio::test]
+    async fn reauth_live_write_failure_window_then_activate_backfills_old_live_into_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.home()).unwrap();
+
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+        let u2_blob = r#"{"uid":"u2","refresh_token":"RX","access_token":"AX"}"#;
+
+        p.import_raw(old_u1.into(), None, Some(true)).unwrap();
+        p.import_raw(u2_blob.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), old_u1).unwrap();
+
+        // 注入 live 写失败建立窗口（同上：预制 tmp 目标为目录）。
+        let tmp_target = p
+            .test_live_path()
+            .with_extension(format!("tmp.{}", std::process::id()));
+        fs::create_dir_all(&tmp_target).unwrap();
+        assert!(
+            p.replace_account_blob(&AccountId("u1".into()), new_u1.into())
+                .is_err()
+        );
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            new_u1,
+            "窗口成立：store 已是新凭证而 live 仍是旧凭证"
+        );
+
+        // 解除注入后切换到 u2：capture-on-leave 读到的仍是旧 live（u1）。
+        fs::remove_dir_all(&tmp_target).unwrap();
+        p.activate(&AccountId("u2".into())).await.unwrap();
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            old_u1,
+            "钉住已接受行为（ADR-0002 修订）：窗口内切换会把旧 live 回灌库存、撤销新凭证"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            u2_blob,
+            "切换后 live 应为 u2 的 blob"
+        );
+    }
+
+    /// 钉住已接受行为（ADR-0002 修订）：查询路径与切换路径一样会把旧 live 回灌库存。
+    /// 重授权 live 写失败留下 store=新/live=旧 窗口后，对活跃账号一次 `raw_blob_for_account`
+    /// 读取（查额度/导出的公共路径）即把旧 live 回写 store、静默撤销新凭证——这是明文
+    /// 接受的对外行为（窗口期一律以 live 为准），由本测试钉住防止未来无意改变；
+    /// 若要改变，先重开 ADR-0002 决策。
+    #[test]
+    fn reauth_live_write_failure_window_then_read_backfills_old_live_into_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.home()).unwrap();
+
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+
+        p.import_raw(old_u1.into(), None, Some(true)).unwrap();
+        fs::write(p.test_live_path(), old_u1).unwrap();
+
+        // 注入 live 写失败建立窗口（同上：预制 tmp 目标为目录）。
+        let tmp_target = p
+            .test_live_path()
+            .with_extension(format!("tmp.{}", std::process::id()));
+        fs::create_dir_all(&tmp_target).unwrap();
+        assert!(
+            p.replace_account_blob(&AccountId("u1".into()), new_u1.into())
+                .is_err()
+        );
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            new_u1,
+            "窗口成立：store 已是新凭证而 live 仍是旧凭证"
+        );
+
+        // 解除注入后对活跃账号读一次 blob（不走 query_quota，避免网络依赖）。
+        fs::remove_dir_all(&tmp_target).unwrap();
+        let account = fake_account("u1");
+        let raw = p.raw_blob_for_account(&account).unwrap();
+
+        assert_eq!(
+            raw, old_u1,
+            "钉住已接受行为（ADR-0002 修订）：窗口内读取以 live 为准，返回旧凭证"
+        );
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            old_u1,
+            "钉住已接受行为（ADR-0002 修订）：查询路径与切换路径一样会把旧 live 回灌库存、撤销新凭证"
+        );
     }
 
     /// 对不上（登录的是另一个官方身份）：失败，库存/live/账号列表一概不写。
