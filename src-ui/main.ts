@@ -282,7 +282,13 @@ async function startDeviceAuth(
     renderSnapshot(snapshotAfter);
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
-    if (!text.includes("已取消") && text !== "没有进行中的授权") {
+    // 链接返回前用户已关窗：迟到的失败不再弹错误 toast。
+    // 对话框仍开时，取消类文案继续按原规则过滤，其它失败照常提示。
+    if (
+      dialog.open &&
+      !text.includes("已取消") &&
+      text !== "没有进行中的授权"
+    ) {
       showToast(text, true);
     }
     dialog.close();
