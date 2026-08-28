@@ -1,0 +1,46 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "kimi-switch",
+  "version": "../package.json",
+  "identifier": "dev.kimiswitch.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist/web"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Kimi 换号器",
+        "width": 1180,
+        "height": 860,
+        "minWidth": 1080,
+        "minHeight": 760,
+        "resizable": true,
+        "decorations": false,
+        "additionalBrowserArgs": "--proxy-server=direct:// --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
+      }
+    ],
+    "security": {
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/256x256.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

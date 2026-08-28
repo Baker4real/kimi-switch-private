@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kimi 换号器</title>
+  </head>
+  <body>
+    <div class="window-shell">
+      <header id="window-titlebar-drag-surface" class="window-titlebar">
+        <div class="window-drag-region">
+          <span class="window-app-mark" aria-hidden="true"></span>
+          <span class="window-app-title">Kimi 换号器</span>
+        </div>
+        <div class="window-controls" aria-label="窗口控制">
+          <button id="window-minimize-button" class="window-control-button" type="button" aria-label="最小化">
+            <span class="window-control-icon window-control-icon--minimize" aria-hidden="true"></span>
+          </button>
+          <button id="window-maximize-button" class="window-control-button" type="button" aria-label="最大化">
+            <span class="window-control-icon window-control-icon--maximize" aria-hidden="true"></span>
+          </button>
+          <button id="window-close-button" class="window-control-button window-control-button--close" type="button" aria-label="关闭">
+            <span class="window-control-icon window-control-icon--close" aria-hidden="true"></span>
+          </button>
+        </div>
+      </header>
+
+      <main class="dashboard dashboard-shell">
+        <section class="app-toolbar">
+          <nav class="route-tabs" aria-label="主导航">
+            <a class="route-tab active" href="#overview" data-route="overview">总览</a>
+            <a class="route-tab" href="#library" data-route="library">账号库</a>
+            <a class="route-tab" href="#settings" data-route="settings">设置</a>
+          </nav>
+        </section>
+
+        <section class="page active" id="page-overview">
+          <div class="dashboard-grid">
+            <article class="rail-card current-account-card current-account-card--hero">
+              <div class="current-account-topbar">
+                <h2 class="section-title section-title-rail">当前账号</h2>
+                <div class="quota-monitor-pill">
+                  <span id="quota-monitor-dot" class="quota-monitor-dot" aria-hidden="true"></span>
+                  <span id="quota-monitor-label">额度就绪</span>
+                </div>
+              </div>
+              <div class="current-identity">
+                <h3 id="current-title" class="current-account-title">--</h3>
+                <p id="current-plan" class="current-plan">--</p>
+              </div>
+              <div id="current-quota-panel" class="current-quota-panel"></div>
+            </article>
+
+            <section class="overview-panel">
+              <div class="status-grid status-grid--three">
+                <article class="status-card">
+                  <span>当前账号</span>
+                  <strong id="metric-current">--</strong>
+                </article>
+                <article class="status-card">
+                  <span>账号总数</span>
+                  <strong id="metric-total">0</strong>
+                </article>
+                <article class="status-card">
+                  <span>额度告急</span>
+                  <strong id="metric-urgent">0</strong>
+                </article>
+              </div>
+              <article class="rail-card control-deck">
+                <h2 class="section-title section-title-rail">控制面板</h2>
+                <div class="control-stack control-stack--three">
+                  <button id="add-account-button" class="action-button action-button-primary" type="button">
+                    添加账号
+                  </button>
+                  <button id="import-button" class="action-button" type="button">导入当前账号</button>
+                  <button id="refresh-button" class="action-button" type="button">刷新</button>
+                </div>
+              </article>
+            </section>
+          </div>
+        </section>
+
+        <section class="page" id="page-library">
+          <div class="profiles-stage">
+            <div class="profiles-header">
+              <h2 class="section-title">账号库</h2>
+              <button id="library-add-button" class="action-button action-button-primary" type="button">
+                添加账号
+              </button>
+            </div>
+            <div id="accounts-empty" class="empty-state hidden">暂无账号。用「添加账号」浏览器授权，或先在 Kimi Code 登录后点「导入当前账号」。</div>
+            <div id="accounts-list" class="profiles-grid"></div>
+          </div>
+        </section>
+
+        <section class="page" id="page-settings">
+          <div class="settings-panel">
+            <h2 class="section-title">设置</h2>
+            <div class="settings-row">
+              <span>主题</span>
+              <div class="theme-dots" role="group" aria-label="主题">
+                <button id="theme-classic" class="theme-dot is-active" type="button" data-theme="classic" title="纸色浅色">
+                  纸色
+                </button>
+                <button id="theme-jade-night" class="theme-dot" type="button" data-theme="jade-night" title="Jade Night">
+                  深色
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="auth-dialog" class="app-dialog">
+      <h3 id="auth-dialog-title">添加账号 · 浏览器授权</h3>
+      <p id="auth-dialog-copy">正在获取授权链接…</p>
+      <label class="field">
+        <span>授权链接</span>
+        <input id="auth-url" type="text" readonly />
+      </label>
+      <div class="dialog-actions">
+        <button id="auth-copy-url" class="action-button" type="button">复制链接</button>
+        <button id="auth-open" class="action-button action-button-primary" type="button">打开浏览器</button>
+      </div>
+      <p class="dialog-kicker">页面如要求输入授权码：</p>
+      <p id="auth-user-code" class="device-code">----</p>
+      <div class="dialog-actions">
+        <button id="auth-copy-code" class="action-button" type="button">复制</button>
+        <button id="auth-cancel" class="action-button" type="button">取消</button>
+      </div>
+    </dialog>
+
+    <dialog id="rename-dialog" class="app-dialog">
+      <h3>重命名账号</h3>
+      <p id="rename-copy"></p>
+      <label class="field">
+        <span>别名</span>
+        <input id="rename-input" type="text" />
+      </label>
+      <div class="dialog-actions">
+        <button id="rename-cancel" class="action-button" type="button">取消</button>
+        <button id="rename-submit" class="action-button action-button-primary" type="button">确定</button>
+      </div>
+    </dialog>
+
+    <dialog id="delete-dialog" class="app-dialog">
+      <h3>确认删除</h3>
+      <p id="delete-copy"></p>
+      <p class="dialog-kicker">Kimi Code 当前的登录文件不受影响，仅移除账号库中的凭证副本。</p>
+      <div class="dialog-actions">
+        <button id="delete-cancel" class="action-button action-button-primary" type="button">取消</button>
+        <button id="delete-confirm" class="action-button action-button-danger" type="button">确认删除</button>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast hidden" role="status"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -7,7 +7,10 @@ Kimi Code 多账号管理工具（Rust workspace）：GUI（`kimi-switch.exe`）
 ```text
 crates/core/             数据模型、Provider trait、凭证仓库、路径、额度缓存
 crates/cli/              kimi-switch-cli 命令行
-crates/gui/              kimi-switch 图形界面（eframe/egui）
+crates/gui/              GUI 命令层（列表/切换/导入/设备码；不含 token DTO）
+src-tauri/               Tauri 壳（kimi-switch.exe）
+src-ui/                  纸感前端（总览 / 账号库 / 设置）
+scripts/generate-icons.mjs  图标确定性生成器（改图标改这里的常量后重跑，勿手改 icons/ 二进制）
 crates/providers/common/ 文件型 OAuth 账号切换共享引擎（FileBlobProvider/FileBlobRuntime）
 crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调、额度查询）
 ```
@@ -26,5 +29,23 @@ crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调�
 ```bash
 cargo check --workspace
 cargo test --workspace
-cargo build --release   # 产物：target/release/kimi-switch.exe / kimi-switch-cli.exe
+cargo build --release -p kimi-switch-cli
+cargo build --release -p kimi-switch   # GUI：须带 default feature custom-protocol，禁止连 127.0.0.1:1420
+npm install && npm run tauri build     # 等价官方打包入口；npm 侧 @tauri-apps/api、cli 必须与 crate tauri 同 minor（crate exact 钉版，不一致时 CLI 预检直接中止）
+node scripts/generate-icons.mjs        # 重生成 src-tauri/icons（零依赖，输出确定性）
 ```
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues 写在 `Baker4real/kimi-switch-private`；`gh` 必须带 `-R`，禁止打到公开上游 `yuan2627/kimi-switch`。See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+默认五套：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+single-context：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/domain.md`.
+

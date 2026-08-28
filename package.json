@@ -1,0 +1,19 @@
+{
+  "name": "kimi-switch",
+  "version": "1.4.17",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "typescript": "^5.8.2",
+    "vite": "^7.0.0"
+  }
+}

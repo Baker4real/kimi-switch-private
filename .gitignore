@@ -1,4 +1,7 @@
 /target
+/dist
+/node_modules
+/src-tauri/gen/schemas
 **/*.rs.bk
 *.pdb
 

@@ -6,6 +6,7 @@ members = [
     "crates/gui",
     "crates/providers/common",
     "crates/providers/kimi",
+    "src-tauri",
 ]
 
 [workspace.package]

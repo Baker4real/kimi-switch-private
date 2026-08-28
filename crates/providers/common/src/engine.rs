@@ -451,6 +451,53 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         )?;
         Ok(())
     }
+
+    /// 按卡重新授权原语：用一次新的授权结果 blob 覆盖指定账号的库存凭证。
+    ///
+    /// 官方身份辨认复用入库链路同款规则（[`FileBlobRuntime::parse_metadata`] 的
+    /// `primary_id`，缺失时回退 `label`，与 [`Self::live_account_id`] 一致）：
+    /// - 解析出的官方账号 id 与目标不同、或无法辨认 → 返回错误；不写库存、不写 live、不增删账号；
+    /// - 相同 → 替换该账号的库存 blob；registry 原样保留（别名、active 标记不变，
+    ///   同一官方身份仍是一条）；JSON 非法的 blob 解析不出主键，自然落入「无法辨认」拒绝路径；
+    /// - 目标是当前活跃账号 → 再把新 blob 原子写进 live 登录文件；非当前则完全不碰 live。
+    ///
+    /// 注意：这里严禁调用 capture-on-leave / [`Self::reconcile_active_from_live`] 之类的
+    /// 旧态回灌——它们会把旧 live 盖进刚替换的库存副本。写顺序固定「先库存后 live」：
+    /// live 写失败时新凭证已安全落在库存，不会丢号。
+    ///
+    /// 错误文本只含账号 id 与原因，不含任何凭证内容。
+    pub fn replace_account_blob(&self, target: &AccountId, raw: String) -> Result<Account> {
+        let meta = self.runtime.parse_metadata(&raw);
+        let observed = meta
+            .primary_id
+            .clone()
+            .or_else(|| meta.label.clone())
+            .ok_or_else(|| {
+                Error::Provider(
+                    "cannot identify authorized account from credentials; nothing written".into(),
+                )
+            })?;
+        if observed != target.0 {
+            return Err(Error::Provider(format!(
+                "authorized account {observed} does not match target account {}; nothing written",
+                target.0
+            )));
+        }
+        let account = self.require_account(target)?;
+
+        // 先落库存（唯一真本），再按 active 决定是否同步 live。
+        self.store.set(
+            self.runtime.id(),
+            account.id.0.as_str(),
+            self.runtime.store_field(),
+            &raw,
+        )?;
+        if account.active {
+            // 原子写（tmp + rename）：失败时旧 live 未被破坏，新凭证已在库存可重试。
+            Self::write_blob(&self.live_path(), &raw)?;
+        }
+        Ok(account)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1060,143 @@ mod tests {
     }
 
     // --- query_quota：parked-only 刷新 ---
+
+    // --- 按卡重新授权原语 replace_account_blob：只断言库存内容、live 内容与成功/失败 ---
+
+    /// 对上且非当前账号：库存 blob 被新凭证替换，别名与单卡保持，live 登录文件不动。
+    #[tokio::test]
+    async fn reauth_replaces_parked_account_without_touching_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.home()).unwrap();
+
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+        let u2_live = r#"{"uid":"u2","refresh_token":"RX","access_token":"AX"}"#;
+
+        p.import_raw(old_u1.into(), Some("工作号".into()), Some(false))
+            .unwrap();
+        p.import_raw(u2_live.into(), None, Some(true)).unwrap();
+        fs::write(p.test_live_path(), u2_live).unwrap();
+
+        let account = p
+            .replace_account_blob(&AccountId("u1".into()), new_u1.into())
+            .unwrap();
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            new_u1,
+            "非当前账号应只替换库存 blob"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            u2_live,
+            "目标不是当前账号时不得改 live 登录文件"
+        );
+        assert_eq!(account.label, "工作号", "重授权后应保留原别名");
+        assert!(!account.active, "非当前账号的 active 标记不得被改");
+
+        let ids: Vec<String> = p
+            .list_accounts()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id.0)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "同一官方身份仍是一条，不得新增重复卡：{ids:?}"
+        );
+    }
+
+    /// 对上且是当前账号：库存与 live 都换成新凭证；严禁先把旧 live 回灌库存
+    /// （任何把旧 live 写回 store 的顺序错误都会让 store 断言失败）。
+    #[tokio::test]
+    async fn reauth_replaces_active_account_and_writes_new_blob_to_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.home()).unwrap();
+
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+
+        p.import_raw(old_u1.into(), None, Some(true)).unwrap();
+        fs::write(p.test_live_path(), old_u1).unwrap();
+
+        let account = p
+            .replace_account_blob(&AccountId("u1".into()), new_u1.into())
+            .unwrap();
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            new_u1,
+            "库存必须是新凭证；若旧 live 被误回灌则这里仍是 R1"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            new_u1,
+            "当前账号的新凭证必须原子写入 Kimi Code 正在使用的登录文件"
+        );
+        assert!(account.active, "当前账号身份保持不变");
+        let accounts = p.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1, "同一官方身份仍是一条：{accounts:?}");
+    }
+
+    /// 对不上（登录的是另一个官方身份）：失败，库存/live/账号列表一概不写。
+    #[tokio::test]
+    async fn reauth_rejects_identity_mismatch_without_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.home()).unwrap();
+
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let other = r#"{"uid":"u9","refresh_token":"R9","access_token":"A9"}"#;
+
+        p.import_raw(old_u1.into(), None, Some(false)).unwrap();
+
+        let err = p
+            .replace_account_blob(&AccountId("u1".into()), other.into())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "错误应说明官方身份对不上：{err}"
+        );
+
+        assert_eq!(p.test_store_get("u1").unwrap(), old_u1, "库存不得被改");
+        assert!(p.test_store_get("u9").is_none(), "陌生身份不得被写入库存");
+        assert!(!p.test_live_path().exists(), "失败路径不得写 live 登录文件");
+        let accounts = p.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1, "不得新增账号：{accounts:?}");
+    }
+
+    /// 凭证无法辨认官方 id（解析不出主键）：同样失败且不写任何地方。
+    #[tokio::test]
+    async fn reauth_rejects_unidentifiable_credentials_without_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.home()).unwrap();
+
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        p.import_raw(old_u1.into(), None, Some(false)).unwrap();
+
+        for bad in ["{}", "not-json"] {
+            let err = p
+                .replace_account_blob(&AccountId("u1".into()), bad.into())
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("cannot identify"),
+                "无法辨认时应明确报错而不是改库：{err}"
+            );
+        }
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            old_u1,
+            "不可辨认 → 失败且不写库存"
+        );
+        assert!(!p.test_live_path().exists(), "不可辨认 → 不写 live");
+    }
 
     #[tokio::test]
     async fn query_quota_skips_refresh_for_active_account() {
