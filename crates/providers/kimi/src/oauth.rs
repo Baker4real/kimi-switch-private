@@ -10,10 +10,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
-use sha2::{Digest, Sha256};
 use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::Account;
 use kimi_switch_engine::{extract_access_token, extract_refresh_token, RefreshOutcome};
+use sha2::{Digest, Sha256};
 
 use crate::kimi_files::decode_jwt_payload;
 use crate::{kimi_files, paths};
@@ -72,7 +72,7 @@ async fn refresh_blob_at(blob: &str, oauth_base: &str) -> Result<RefreshOutcome>
     let client = reqwest::Client::builder()
         .timeout(REFRESH_HTTP_TIMEOUT)
         .build()
-        .map_err(|e| Error::Provider(format!("kimi refresh client failed: {e}")))?;
+        .map_err(|e| Error::provider(format!("kimi refresh client failed: {e}")))?;
     let resp = client
         .post(&url)
         .header("User-Agent", "kimi-switch")
@@ -80,7 +80,7 @@ async fn refresh_blob_at(blob: &str, oauth_base: &str) -> Result<RefreshOutcome>
         .form(&form)
         .send()
         .await
-        .map_err(|e| Error::Provider(format!("kimi refresh request failed: {e}")))?;
+        .map_err(|e| Error::provider(format!("kimi refresh request failed: {e}")))?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -93,14 +93,15 @@ async fn refresh_blob_at(blob: &str, oauth_base: &str) -> Result<RefreshOutcome>
         return Ok(RefreshOutcome::DeadToken);
     }
     if !status.is_success() {
-        return Err(Error::Provider(format!(
-            "kimi refresh HTTP {status}: {body}"
-        )));
+        return Err(Error::provider_http(
+            status.as_u16(),
+            format!("kimi refresh HTTP {status}: {body}"),
+        ));
     }
     let access = parsed.get("access_token").and_then(|v| v.as_str());
     let Some(access) = access else {
-        return Err(Error::Provider(
-            "kimi refresh response missing access_token".into(),
+        return Err(Error::provider(
+            "kimi refresh response missing access_token",
         ));
     };
 
@@ -459,7 +460,7 @@ async fn acquire_and_read_with_timeout(
         }
     })
     .await
-    .map_err(|e| Error::Provider(format!("kimi credential lock task failed: {e}")))?
+    .map_err(|e| Error::provider(format!("kimi credential lock task failed: {e}")))?
 }
 
 fn try_reap_stale_directory(
@@ -556,7 +557,7 @@ async fn write_credentials_and_release(
     tokio::task::spawn_blocking(move || {
         let result = (|| {
             let parent = path.parent().ok_or_else(|| {
-                Error::Provider("kimi credential path has no parent directory".into())
+                Error::provider("kimi credential path has no parent directory")
             })?;
             let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
             temporary.write_all(contents.as_bytes())?;
@@ -582,7 +583,7 @@ async fn write_credentials_and_release(
         result
     })
     .await
-    .map_err(|e| Error::Provider(format!("kimi credential write task failed: {e}")))?
+    .map_err(|e| Error::provider(format!("kimi credential write task failed: {e}")))?
 }
 
 async fn write_dead_fingerprint_and_release(
@@ -596,13 +597,13 @@ async fn write_dead_fingerprint_and_release(
         result
     })
     .await
-    .map_err(|e| Error::Provider(format!("kimi dead-token guard task failed: {e}")))?
+    .map_err(|e| Error::provider(format!("kimi dead-token guard task failed: {e}")))?
 }
 
 fn atomic_private_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| Error::Provider("kimi guard path has no parent directory".into()))?;
+        .ok_or_else(|| Error::provider("kimi guard path has no parent directory"))?;
     std::fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(contents.as_bytes())?;
@@ -961,7 +962,6 @@ mod tests {
             active: true,
             created_at: Utc::now(),
             last_used_at: None,
-            priority: 100,
             extra: serde_json::Map::new(),
         }
     }

@@ -55,7 +55,7 @@ fn quota_from(
     window: QuotaWindow,
     provider: &str,
     id: &AccountId,
-    note: Option<&str>,
+    membership: Option<&str>,
 ) -> Option<Quota> {
     let limit = to_u64(detail.get("limit"))?;
     let used = to_u64(detail.get("used")).or_else(|| {
@@ -67,6 +67,7 @@ fn quota_from(
     } else {
         0.0
     };
+    let membership = membership.map(String::from);
     Some(Quota {
         provider: provider.into(),
         account_id: id.clone(),
@@ -75,18 +76,18 @@ fn quota_from(
         limit,
         reset_at: reset_at(detail),
         status: QuotaStatus::from_percent(pct),
-        note: note.map(String::from),
+        // GUI 过渡仍从 note 读会员等级；#27 改读一等字段后可停双写。
+        note: membership.clone(),
+        membership,
     })
 }
 
-/// 解析 /usages 响应为多窗口 Quota。会员等级（user.membership.level）挂在每个窗口的 note 上。
+/// 解析 /usages 响应为多窗口 Quota。会员等级写入 `Quota.membership`，并双写 `note`。
 pub fn parse_usages(body: &str, provider: &str, id: &AccountId) -> Vec<Quota> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return vec![];
     };
-    let membership = v
-        .pointer("/user/membership/level")
-        .and_then(|x| x.as_str());
+    let membership = v.pointer("/user/membership/level").and_then(|x| x.as_str());
     let mut out = Vec::new();
     if let Some(usage) = v.get("usage") {
         if let Some(q) = quota_from(usage, QuotaWindow::SevenDay, provider, id, membership) {
@@ -133,7 +134,7 @@ async fn fetch_quota_with_active_recovery_at(
     test_recovery: Option<(&str, crate::oauth::RefreshLockProtocol)>,
 ) -> Result<Vec<Quota>> {
     match fetch_quota_at(access_token, account, api_base).await {
-        Err(error) if account.active && is_unauthorized(&error) => {
+        Err(error) if account.active && error.http_status() == Some(401) => {
             let recovered = if let Some((oauth_base, protocol)) = test_recovery {
                 crate::oauth::recover_active_401_at(
                     access_token,
@@ -167,19 +168,16 @@ async fn fetch_quota_at(
         .header("User-Agent", "kimi-switch")
         .send()
         .await
-        .map_err(|e| Error::QuotaFetch(format!("kimi usages request failed: {e}")))?;
+        .map_err(|e| Error::quota_network(format!("kimi usages request failed: {e}")))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(Error::QuotaFetch(format!(
-            "kimi usages HTTP {status}: {body}"
-        )));
+        return Err(Error::quota_http(
+            status.as_u16(),
+            format!("kimi usages HTTP {status}: {body}"),
+        ));
     }
     Ok(parse_usages(&body, "kimi", &account.id))
-}
-
-fn is_unauthorized(error: &Error) -> bool {
-    matches!(error, Error::QuotaFetch(message) if message.starts_with("kimi usages HTTP 401 "))
 }
 
 #[cfg(test)]
@@ -221,6 +219,7 @@ mod tests {
             "usage":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"}}"#;
         let q = parse_usages(body, "kimi", &AccountId("u1".into()));
         assert_eq!(q[0].note.as_deref(), Some("LEVEL_INTERMEDIATE"));
+        assert_eq!(q[0].membership.as_deref(), Some("LEVEL_INTERMEDIATE"));
     }
 
     #[tokio::test]
@@ -294,7 +293,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.unwrap_err().to_string().contains("usages HTTP 401"));
+        let err = result.unwrap_err();
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.is_authentication_failure());
+        assert!(!err.is_retryable());
         assert_eq!(std::fs::read_to_string(credentials).unwrap(), old);
         assert_eq!(server.finish().len(), 2);
     }
@@ -313,7 +315,6 @@ mod tests {
             active: true,
             created_at: Utc::now(),
             last_used_at: None,
-            priority: 100,
             extra: serde_json::Map::new(),
         }
     }

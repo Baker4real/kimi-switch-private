@@ -5,39 +5,35 @@ compile_error!("生产构建不能走 Vite devUrl，请启用 feature custom-pro
 
 use std::sync::Arc;
 
-use kimi_switch_gui::{Backend, Snapshot, ThemeId};
+use kimi_switch_gui::{Backend, CommandError, Snapshot, ThemeId};
 use tauri::{Manager, State};
 
 struct AppState {
     backend: Arc<Backend>,
 }
 
-fn map_err(err: anyhow::Error) -> String {
-    format!("{err:#}")
+fn map_err(err: anyhow::Error) -> CommandError {
+    CommandError::from_anyhow(err)
 }
 
+/// 列出账号并 collect 额度（节流）。启动加载、静默查询、刷新按钮共用这一条。
 #[tauri::command]
-async fn list_accounts(state: State<'_, AppState>) -> Result<Snapshot, String> {
+async fn list_accounts(state: State<'_, AppState>) -> Result<Snapshot, CommandError> {
     Ok(state.backend.snapshot(None).await)
 }
 
 #[tauri::command]
-async fn refresh_accounts(state: State<'_, AppState>) -> Result<Snapshot, String> {
-    Ok(state.backend.snapshot(None).await)
-}
-
-#[tauri::command]
-async fn import_current(state: State<'_, AppState>) -> Result<Snapshot, String> {
+async fn import_current(state: State<'_, AppState>) -> Result<Snapshot, CommandError> {
     state.backend.import().await.map_err(map_err)
 }
 
 #[tauri::command]
-async fn swap_account(state: State<'_, AppState>, id: String) -> Result<Snapshot, String> {
+async fn swap_account(state: State<'_, AppState>, id: String) -> Result<Snapshot, CommandError> {
     state.backend.swap(&id).await.map_err(map_err)
 }
 
 #[tauri::command]
-async fn remove_account(state: State<'_, AppState>, id: String) -> Result<Snapshot, String> {
+async fn remove_account(state: State<'_, AppState>, id: String) -> Result<Snapshot, CommandError> {
     state.backend.remove(&id).await.map_err(map_err)
 }
 
@@ -46,7 +42,7 @@ async fn rename_account(
     state: State<'_, AppState>,
     id: String,
     label: String,
-) -> Result<Snapshot, String> {
+) -> Result<Snapshot, CommandError> {
     state.backend.rename(&id, &label).await.map_err(map_err)
 }
 
@@ -55,7 +51,7 @@ async fn rename_account(
 async fn start_device_auth(
     state: State<'_, AppState>,
     target: Option<String>,
-) -> Result<kimi_switch_gui::AuthLink, String> {
+) -> Result<kimi_switch_gui::AuthLink, CommandError> {
     state
         .backend
         .start_device_auth(target)
@@ -64,7 +60,7 @@ async fn start_device_auth(
 }
 
 #[tauri::command]
-async fn complete_device_auth(state: State<'_, AppState>) -> Result<Snapshot, String> {
+async fn complete_device_auth(state: State<'_, AppState>) -> Result<Snapshot, CommandError> {
     state.backend.complete_device_auth().await.map_err(map_err)
 }
 
@@ -74,17 +70,12 @@ fn cancel_device_auth(state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn open_url(url: String) -> Result<(), String> {
+fn open_url(url: String) -> Result<(), CommandError> {
     Backend::open_url(&url).map_err(map_err)
 }
 
 #[tauri::command]
-fn get_theme() -> ThemeId {
-    Backend::load_theme()
-}
-
-#[tauri::command]
-fn set_theme(theme: String) -> Result<ThemeId, String> {
+fn set_theme(theme: String) -> Result<ThemeId, CommandError> {
     let theme = ThemeId::parse(&theme);
     Backend::save_theme(theme).map_err(map_err)?;
     Ok(theme)
@@ -121,7 +112,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_accounts,
-            refresh_accounts,
             import_current,
             swap_account,
             remove_account,
@@ -130,7 +120,6 @@ pub fn run() {
             complete_device_auth,
             cancel_device_auth,
             open_url,
-            get_theme,
             set_theme,
         ])
         .run(tauri::generate_context!())

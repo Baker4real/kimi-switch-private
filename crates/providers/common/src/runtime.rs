@@ -20,15 +20,6 @@ pub struct BlobMetadata {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// 隔离运行所需的差异点。
-#[derive(Debug, Clone)]
-pub struct IsolationSpec {
-    /// 隔离环境变量名（Beta `BETA_HOME` / Kimi `KIMI_CODE_HOME`）。
-    pub env_var: &'static str,
-    /// 原生 CLI 可执行名（`beta` / `kimi`）。
-    pub native_cli: &'static str,
-}
-
 /// 刷新结果。
 pub enum RefreshOutcome {
     /// 刷新成功，返回轮换后的完整 blob。
@@ -39,13 +30,11 @@ pub enum RefreshOutcome {
     Unsupported,
 }
 
-/// 每个文件型 runtime 的差异点契约。机制（切换/回滚/回灌/隔离）在引擎里，不在这里。
+/// 每个文件型 runtime 的差异点契约。机制（切换/回滚/回灌）在引擎里，不在这里。
 #[async_trait]
 pub trait FileBlobRuntime: Send + Sync + 'static {
-    /// provider 标识，如 "beta" / "kimi"。
+    /// provider 标识，如 "kimi"。
     fn id(&self) -> &'static str;
-    /// 人类可读名称。
-    fn display_name(&self) -> &'static str;
     /// store 里存 blob 的字段名。默认 "blob"；Beta 为兼容历史数据返回 "auth_json"。
     fn store_field(&self) -> &'static str {
         "blob"
@@ -62,8 +51,6 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
     fn live_cred_path(&self, home: &Path) -> PathBuf;
     /// 从 blob 抽最小元数据。解析失败返回 `Default`（透传策略，不 panic）。
     fn parse_metadata(&self, blob: &str) -> BlobMetadata;
-    /// 隔离运行差异点。
-    fn isolation(&self) -> IsolationSpec;
 
     /// 刷新一个 blob，返回轮换后的完整 blob。仅对 parked 账号调用。
     async fn refresh(&self, blob: &str) -> Result<RefreshOutcome>;
@@ -74,7 +61,4 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
     fn recover_legacy(&self, _home: &Path, _account: &Account) -> Option<String> {
         None
     }
-
-    /// 可选：额外物化（如复制真实 config 进隔离目录）。默认无。
-    fn materialize_extra(&self, _home: &Path, _env_dir: &Path) {}
 }

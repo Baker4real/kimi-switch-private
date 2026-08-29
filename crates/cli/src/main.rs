@@ -12,14 +12,13 @@
 //! 显示的编号（1 起）。
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    settings, Account, AccountRegistry, AuditEvent, AuditLog, CredentialStore,
-    FileStore, KeyringStore, Provider, Quota, QuotaCache, QuotaWindow, RemovedAccounts,
+    settings, Account, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
+    KeyringStore, Provider, Quota, QuotaState, QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 
@@ -106,10 +105,9 @@ fn resolve_account(ctx: &AppContext, input: &str) -> Result<Account> {
             anyhow::bail!("invalid account index 0; numbering starts at 1");
         }
         let ordered = ctx.list_ordered()?;
-        return ordered
-            .into_iter()
-            .nth(n - 1)
-            .with_context(|| format!("no account at index {n}; run `kimi-switch` to see the list"));
+        return ordered.into_iter().nth(n - 1).with_context(|| {
+            format!("no account at index {n}; run `kimi-switch` to see the list")
+        });
     }
     ctx.registry
         .find_unique(trimmed)?
@@ -144,14 +142,6 @@ async fn main() -> Result<()> {
 // 默认入口：账号列表 + 额度
 // ---------------------------------------------------------------------------
 
-/// 单个账号的额度查询结果。
-enum QuotaOutcome {
-    Ready(Vec<Quota>),
-    /// 查询失败但有仍有效的旧缓存。
-    Stale(Vec<Quota>),
-    Failed(String),
-}
-
 async fn status(ctx: &AppContext) -> Result<()> {
     // 1. 自动导入/对齐本地激活账号（`rm` 过的账号有墓碑，跳过）。
     sync_local_active(ctx);
@@ -163,103 +153,43 @@ async fn status(ctx: &AppContext) -> Result<()> {
         return Ok(());
     }
 
-    // 3. 并发查额度（缓存节流 + 失败退避，避免高频打 usage 端点）。
+    // 3. 额度快照（节流 / 退避 / 并发 / 陈旧回退收口在 core）。
     let cache_path = AppPaths::resolve()?.quota_cache_file();
-    let mut cache = QuotaCache::load(&cache_path);
-    let quota_cfg = settings::current().quota.clone();
-    let min_refresh = Duration::from_millis(quota_cfg.min_refresh_interval_ms);
-    let backoff_cap = Duration::from_millis(quota_cfg.failure_backoff_max_ms);
+    let ids: Vec<_> = accounts.iter().map(|account| account.id.clone()).collect();
+    let snapshots =
+        kimi_switch_core::quota_snapshot::collect(ctx.kimi.clone(), "kimi", &ids, &cache_path)
+            .await;
 
-    let mut outcomes: Vec<Option<QuotaOutcome>> = Vec::with_capacity(accounts.len());
-    let mut jobs = Vec::new();
-    for (idx, account) in accounts.iter().enumerate() {
-        outcomes.push(None);
-        if let Some(entry) = cache.fresh("kimi", &account.id.0, min_refresh) {
-            outcomes[idx] = Some(QuotaOutcome::Ready(entry.quotas));
-            continue;
-        }
-        if let Some(failure) =
-            cache.in_failure_backoff("kimi", &account.id.0, min_refresh, backoff_cap)
-        {
-            let error = failure.error.clone();
-            outcomes[idx] = Some(match cache.get("kimi", &account.id.0) {
-                Some(entry) if !kimi_switch_core::is_authentication_failure(&error) => {
-                    QuotaOutcome::Stale(entry.quotas)
-                }
-                _ => QuotaOutcome::Failed(error),
-            });
-            continue;
-        }
-        jobs.push((idx, account.id.clone()));
-    }
-
-    let mut handles = Vec::new();
-    for (idx, id) in jobs {
-        let kimi = ctx.kimi.clone();
-        handles.push(tokio::spawn(async move {
-            let result = kimi_switch_core::query_quota_with_retry(kimi.as_ref(), &id)
-                .await
-                .map_err(|e| e.to_string());
-            (idx, id, result)
-        }));
-    }
-    for handle in handles {
-        let (idx, id, result) = handle.await?;
-        match result {
-            Ok(quotas) => {
-                cache.set("kimi", &id.0, quotas.clone());
-                outcomes[idx] = Some(QuotaOutcome::Ready(quotas));
-            }
-            Err(error) => {
-                cache.record_failure("kimi", &id.0, &error);
-                outcomes[idx] = Some(match cache.get("kimi", &id.0) {
-                    Some(entry) if !kimi_switch_core::is_authentication_failure(&error) => {
-                        QuotaOutcome::Stale(entry.quotas)
-                    }
-                    _ => QuotaOutcome::Failed(error),
-                });
-            }
-        }
-    }
-    cache.save(&cache_path);
-
-    // 4. 渲染。
+    // 4. 渲染。CLI 仍不打印会员等级；节流命中不标 stale，失败回落标 `(stale)`。
     println!("kimi");
-    for (idx, (account, outcome)) in accounts.iter().zip(outcomes.iter()).enumerate() {
+    for (idx, (account, snapshot)) in accounts.iter().zip(snapshots.iter()).enumerate() {
         let n = idx + 1;
         let star = if account.active { "*" } else { " " };
-        let quota_text = match outcome {
-            Some(QuotaOutcome::Ready(quotas)) => format_quotas(quotas),
-            Some(QuotaOutcome::Stale(quotas)) => format!("{} (stale)", format_quotas(quotas)),
-            Some(QuotaOutcome::Failed(error)) => format!("quota: {error}"),
-            None => "quota: n/a".to_string(),
+        let quota_text = match &snapshot.state {
+            QuotaState::Failed(error) => format!("quota: {error}"),
+            QuotaState::Ready(quotas) | QuotaState::Cached(quotas) if snapshot.stale => {
+                format!("{} (stale)", format_quotas(quotas))
+            }
+            QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => format_quotas(quotas),
         };
         println!("  {star} {n:>2}  {:<24} {quota_text}", account.id);
     }
     Ok(())
 }
 
-/// 扫本地 `~/.kimi-code`；如果当前激活账号没记录过就 import 进 registry（已存在时只对齐 active）。
-/// 用户刚 `rm` 掉的账号有墓碑，跳过。未登录过（文件缺失）静默跳过。
+/// 扫本地 `~/.kimi-code`；当前账号没记录过就入库（已存在则对齐 active）。墓碑命中或未登录则跳过。
 fn sync_local_active(ctx: &AppContext) {
-    let removed = AppContext::load_removed().unwrap_or_else(|_| {
-        RemovedAccounts::load(&std::path::PathBuf::from("kimi-switch-removed-missing.json"))
-    });
-    let Ok(id) = ctx.kimi.live_account_id() else {
+    let Ok(paths) = AppPaths::resolve() else {
         return;
     };
-    if removed.contains("kimi", &id.0) {
-        tracing::debug!(id = %id, "skip tombstoned kimi auto-import");
-        return;
-    }
-    match ctx.kimi.sync_active_metadata(None) {
-        Ok(account) => {
-            if let Err(e) = ctx.registry.set_active("kimi", &account.id) {
-                tracing::debug!(err=%e, "skip kimi active marker");
-            }
-        }
-        Err(e) => tracing::debug!(err=%e, "skip kimi auto-import"),
-    }
+    let removed_path = paths.removed_file();
+    kimi_switch_core::sync_local_active(
+        "kimi",
+        &removed_path,
+        ctx.registry.as_ref(),
+        || ctx.kimi.live_account_id(),
+        || ctx.kimi.sync_active_metadata(None),
+    );
 }
 
 /// 把多窗口额度渲染成一行：`5h 18% (18/100) resets 08-15 20:52 · 7d 4% (4/100)`。
@@ -376,20 +306,17 @@ fn print_listing(ctx: &AppContext) -> Result<()> {
 
 async fn rm(ctx: &AppContext, id_input: &str) -> Result<()> {
     let acc = resolve_account(ctx, id_input)?;
-
-    ctx.registry.remove("kimi", &acc.id)?;
-    AppContext::load_removed()?.add("kimi", acc.id.0.as_str())?;
-
-    if let Err(e) = ctx.store.delete("kimi", acc.id.0.as_str(), "blob") {
-        tracing::warn!(err=%e, "credential store delete failed (continuing)");
-    }
-    // 清掉该账号的 quota 缓存，避免尸号数字粘在下一个同 id 导入上。
-    let mut cache = QuotaCache::load(&AppPaths::resolve()?.quota_cache_file());
-    cache.remove("kimi", &acc.id.0);
-    cache.save(&AppPaths::resolve()?.quota_cache_file());
-
-    ctx.audit
-        .append(AuditEvent::ok("rm", "kimi", Some(acc.id.0.as_str())));
+    let paths = AppPaths::resolve()?;
+    kimi_switch_core::remove_account(
+        ctx.registry.as_ref(),
+        ctx.store.as_ref(),
+        ctx.kimi.store_field(),
+        &paths.removed_file(),
+        &paths.quota_cache_file(),
+        &ctx.audit,
+        "kimi",
+        &acc.id,
+    )?;
     println!("removed kimi/{}", acc.id);
     Ok(())
 }

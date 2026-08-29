@@ -53,7 +53,7 @@ fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .map_err(|e| Error::Provider(format!("kimi device flow client failed: {e}")))
+        .map_err(|e| Error::provider(format!("kimi device flow client failed: {e}")))
 }
 
 /// 官方客户端同款 X-Msh-* 头。
@@ -81,19 +81,20 @@ async fn request_device_code_at(oauth_base: &str) -> Result<DeviceAuthorization>
         .form(&form)
         .send()
         .await
-        .map_err(|e| Error::Provider(format!("kimi device code request failed: {e}")))?;
+        .map_err(|e| Error::provider(format!("kimi device code request failed: {e}")))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(Error::Provider(format!(
-            "kimi device code HTTP {status}: {body}"
-        )));
+        return Err(Error::provider_http(
+            status.as_u16(),
+            format!("kimi device code HTTP {status}: {body}"),
+        ));
     }
     let v: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| Error::Provider(format!("kimi device code parse failed: {e}")))?;
+        .map_err(|e| Error::provider(format!("kimi device code parse failed: {e}")))?;
     let get_str = |key: &str| v.get(key).and_then(|x| x.as_str()).map(String::from);
     let device_code = get_str("device_code")
-        .ok_or_else(|| Error::Provider("kimi device code response missing device_code".into()))?;
+        .ok_or_else(|| Error::provider("kimi device code response missing device_code"))?;
     Ok(DeviceAuthorization {
         device_code,
         user_code: get_str("user_code").unwrap_or_default(),
@@ -128,10 +129,10 @@ async fn poll_for_token_at(
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Err(Error::Provider("授权已取消".into()));
+            return Err(Error::cancelled("授权已取消"));
         }
         if Instant::now() >= deadline {
-            return Err(Error::Provider("授权超时：设备码已过期，请重新添加".into()));
+            return Err(Error::provider("授权超时：设备码已过期，请重新添加"));
         }
         tokio::time::sleep(interval).await;
 
@@ -147,7 +148,7 @@ async fn poll_for_token_at(
             .form(&form)
             .send()
             .await
-            .map_err(|e| Error::Provider(format!("kimi token poll failed: {e}")))?;
+            .map_err(|e| Error::provider(format!("kimi token poll failed: {e}")))?;
         let body = resp.text().await.unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 
@@ -158,25 +159,25 @@ async fn poll_for_token_at(
                 continue;
             }
             Some("expired_token") => {
-                return Err(Error::Provider("授权超时：设备码已过期，请重新添加".into()));
+                return Err(Error::provider("授权超时：设备码已过期，请重新添加"));
             }
             Some("access_denied") => {
-                return Err(Error::Provider("授权被拒绝".into()));
+                return Err(Error::provider("授权被拒绝"));
             }
             Some(other) => {
                 let desc = v
                     .get("error_description")
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
-                return Err(Error::Provider(format!("kimi OAuth error: {other} {desc}")));
+                return Err(Error::provider(format!("kimi OAuth error: {other} {desc}")));
             }
             None => {}
         }
 
         let access = v.get("access_token").and_then(|x| x.as_str());
         let Some(access) = access else {
-            return Err(Error::Provider(
-                "kimi token response missing access_token".into(),
+            return Err(Error::provider(
+                "kimi token response missing access_token",
             ));
         };
         let expires_in = v.get("expires_in").and_then(|x| x.as_i64()).unwrap_or(900);
@@ -236,7 +237,9 @@ mod tests {
         let server = MockServer::start(vec![]);
         let blob = poll_for_token_at(&auth(), server.base_url(), Arc::new(AtomicBool::new(true)))
             .await;
-        assert!(blob.unwrap_err().to_string().contains("取消"));
+        let err = blob.unwrap_err();
+        assert_eq!(err.provider_kind(), Some(kimi_switch_core::ProviderKind::Cancelled));
+        assert!(err.to_string().contains("取消"));
     }
 
     #[tokio::test]

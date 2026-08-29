@@ -1,4 +1,4 @@
-//! 账号库读写与额度查询。所有出口都是 DTO，不含凭证。
+//! 账号库读写与额度快照渲染。所有出口都是 DTO，不含凭证。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -6,15 +6,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore, KeyringStore,
-    Provider, Quota, QuotaCache, QuotaWindow, RemovedAccounts,
+    Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
+    KeyringStore, Provider, Quota, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::KimiProvider;
 
-use crate::dto::{
-    AccountRow, AuthLink, QuotaView, Snapshot, ThemeId, UiMessage,
-};
+use crate::dto::{AccountRow, AuthLink, QuotaView, Snapshot, ThemeId, UiMessage};
 
 pub struct Backend {
     store: Arc<dyn CredentialStore>,
@@ -59,24 +57,19 @@ impl Backend {
         Ok(())
     }
 
-    fn load_removed() -> RemovedAccounts {
-        AppPaths::resolve()
-            .map(|p| RemovedAccounts::load(&p.removed_file()))
-            .unwrap_or_else(|_| RemovedAccounts::load(std::path::Path::new("removed-missing.json")))
-    }
-
     /// 扫本地 Kimi Code；当前激活账号没记录过就入库（已删除的有墓碑，跳过）。
     pub fn sync_local_active(&self) {
-        let removed = Self::load_removed();
-        let Ok(id) = self.kimi.live_account_id() else {
+        let Ok(paths) = AppPaths::resolve() else {
             return;
         };
-        if removed.contains("kimi", &id.0) {
-            return;
-        }
-        if let Ok(account) = self.kimi.sync_active_metadata(None) {
-            let _ = self.registry.set_active("kimi", &account.id);
-        }
+        let removed_path = paths.removed_file();
+        kimi_switch_core::sync_local_active(
+            "kimi",
+            &removed_path,
+            self.registry.as_ref(),
+            || self.kimi.live_account_id(),
+            || self.kimi.sync_active_metadata(None),
+        );
     }
 
     pub async fn snapshot(&self, message: Option<UiMessage>) -> Snapshot {
@@ -100,31 +93,10 @@ impl Backend {
     async fn load_rows(&self) -> Vec<AccountRow> {
         let mut accounts = self.registry.list_by_provider("kimi").unwrap_or_default();
         accounts.sort_by_key(|a| !a.active);
-        let mut rows = Vec::with_capacity(accounts.len());
-        for account in accounts {
-            let (membership, quotas, error) =
-                match kimi_switch_core::query_quota_with_retry(self.kimi.as_ref(), &account.id)
-                    .await
-                {
-                    Ok(quotas) => {
-                        let membership = quotas
-                            .iter()
-                            .find_map(|q| q.note.as_deref())
-                            .map(prettify_membership);
-                        (membership, quota_views(&quotas), None)
-                    }
-                    Err(e) => (None, Vec::new(), Some(compact_error(&e.to_string()))),
-                };
-            rows.push(AccountRow {
-                label: account.label.clone(),
-                id: account.id.0,
-                active: account.active,
-                membership,
-                quotas,
-                error,
-            });
-        }
-        rows
+        let cache_path = AppPaths::resolve()
+            .map(|p| p.quota_cache_file())
+            .unwrap_or_else(|_| std::path::PathBuf::from("quota-cache-missing.json"));
+        collect_account_rows(self.kimi.clone(), &accounts, &cache_path).await
     }
 
     pub async fn import(&self) -> Result<Snapshot> {
@@ -134,7 +106,8 @@ impl Backend {
             .map_err(anyhow::Error::from)
             .context("导入失败：请先在 Kimi Code 里登录账号")?;
         self.registry.set_active("kimi", &account.id)?;
-        if let Ok(mut removed) = AppPaths::resolve().map(|p| RemovedAccounts::load(&p.removed_file()))
+        if let Ok(mut removed) =
+            AppPaths::resolve().map(|p| RemovedAccounts::load(&p.removed_file()))
         {
             let _ = removed.clear("kimi", account.id.0.as_str());
         }
@@ -167,22 +140,17 @@ impl Backend {
 
     pub async fn remove(&self, id: &str) -> Result<Snapshot> {
         let id = AccountId(id.to_string());
-        self.registry.remove("kimi", &id)?;
-        if let Ok(mut removed) =
-            AppPaths::resolve().map(|p| RemovedAccounts::load(&p.removed_file()))
-        {
-            removed.add("kimi", id.0.as_str())?;
-        }
-        if let Err(e) = self.store.delete("kimi", id.0.as_str(), "blob") {
-            tracing::warn!(err=%e, "credential store delete failed (continuing)");
-        }
-        if let Ok(paths) = AppPaths::resolve() {
-            let mut cache = QuotaCache::load(&paths.quota_cache_file());
-            cache.remove("kimi", &id.0);
-            cache.save(&paths.quota_cache_file());
-        }
-        self.audit
-            .append(AuditEvent::ok("rm", "kimi", Some(id.0.as_str())));
+        let paths = AppPaths::resolve()?;
+        kimi_switch_core::remove_account(
+            self.registry.as_ref(),
+            self.store.as_ref(),
+            self.kimi.store_field(),
+            &paths.removed_file(),
+            &paths.quota_cache_file(),
+            &self.audit,
+            "kimi",
+            &id,
+        )?;
         Ok(self
             .snapshot(Some(UiMessage {
                 text: format!("已删除 {id}"),
@@ -261,7 +229,7 @@ impl Backend {
     pub async fn complete_device_auth(&self) -> Result<Snapshot> {
         let pending = self.pending_auth.lock().expect("pending_auth lock").clone();
         let Some((auth, cancel, target)) = pending else {
-            anyhow::bail!("没有进行中的授权");
+            return Err(kimi_switch_core::Error::no_pending_auth().into());
         };
         let result = device_flow::poll_for_token(&auth, cancel)
             .await
@@ -285,8 +253,7 @@ impl Backend {
                 .await);
         };
         // 按卡重新授权：写库与否、官方身份是否对得上全部由引擎判定；
-        // 这里只借用同一套解析规则，把失败翻译成面向用户的原因（不含任何凭证内容）。
-        let preview = kimi_switch_kimi::parse_authorized_user_id(&blob);
+        // GUI 只把 ReauthError 映成文案，不重解析凭证。
         match self.kimi.replace_account_blob(&target, blob) {
             Ok(account) => {
                 self.audit.append(AuditEvent::ok(
@@ -308,26 +275,70 @@ impl Backend {
                     Some(target.0.as_str()),
                     &e.to_string(),
                 ));
-                let reason = match preview {
-                    None => "无法从授权结果辨认官方账号，未更新这张卡".to_string(),
-                    Some(observed) if observed != target.0 => {
-                        format!("登录的是账号 {observed}，不是这张卡（{target}），已拒绝更新凭证")
-                    }
-                    // 身份对上却仍失败（如存储层 IO）：透传原始原因帮助排查。
-                    Some(_) => format!("重新授权 {target} 失败：{e}"),
-                };
-                Err(anyhow::anyhow!(reason))
+                Err(anyhow::Error::from(e))
             }
         }
     }
 
     pub fn open_url(url: &str) -> Result<()> {
-        std::process::Command::new("explorer")
+        // explorer.exe 会把 URL 参数误判成文件夹路径，弹出文件资源管理器而不是浏览器；
+        // rundll32 url.dll,FileProtocolHandler 走系统默认浏览器关联，行为可靠。
+        // 用 status() 等退出码而不是 spawn() 立刻返回，失败才能真正报到前端。
+        let status = std::process::Command::new("rundll32")
+            .arg("url.dll,FileProtocolHandler")
             .arg(url)
-            .spawn()
+            .status()
             .context("无法打开浏览器")?;
+        anyhow::ensure!(status.success(), "无法打开浏览器");
         Ok(())
     }
+}
+
+/// 列出与刷新共用：走 core 额度快照（节流 / 退避 / 并发），GUI 只做展示映射。
+pub(crate) async fn collect_account_rows<P>(
+    provider: Arc<P>,
+    accounts: &[Account],
+    cache_path: &std::path::Path,
+) -> Vec<AccountRow>
+where
+    P: Provider + 'static,
+{
+    let ids: Vec<AccountId> = accounts.iter().map(|account| account.id.clone()).collect();
+    let snapshots =
+        kimi_switch_core::quota_snapshot::collect(provider, "kimi", &ids, cache_path).await;
+    accounts
+        .iter()
+        .zip(snapshots.iter())
+        .map(|(account, snapshot)| account_row(account, snapshot))
+        .collect()
+}
+
+pub(crate) fn account_row(account: &Account, snapshot: &QuotaSnapshot) -> AccountRow {
+    let membership = snapshot.membership.as_deref().map(prettify_membership);
+    let (quotas, error) = match &snapshot.state {
+        QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => (quota_views(quotas), None),
+        QuotaState::Failed(message) => (Vec::new(), Some(compact_error(message))),
+    };
+    AccountRow {
+        id: account.id.0.clone(),
+        label: account.label.clone(),
+        active: account.active,
+        membership,
+        quotas,
+        error,
+        cached_at: snapshot
+            .stale
+            .then(|| format_cached_at(snapshot.fetched_at)),
+    }
+}
+
+fn format_cached_at(fetched_at: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "缓存于 {}",
+        fetched_at
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+    )
 }
 
 fn prettify_membership(level: &str) -> String {
@@ -362,7 +373,7 @@ fn quota_views(quotas: &[Quota]) -> Vec<QuotaView> {
                 )
             });
             QuotaView {
-                tone: QuotaView::tone(ratio).to_string(),
+                tone: QuotaView::tone(ratio),
                 window,
                 ratio,
                 text,

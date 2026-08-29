@@ -2,7 +2,7 @@
 //!
 //! 关键约束（与 `crates/providers/beta/src/lib.rs` 保持一致）：
 //! - `activate` 不依赖网络；切换 = flock → snapshot 旧文件 → 原子写新 blob → 任一步失败回滚。
-//! - `capture_live_into_store`（覆盖 live 前把 live 凭证回灌进 owner 账号 store）必须放在
+//! - capture-on-leave（覆盖 live 前把 live 凭证回灌进 owner 账号 store）必须放在
 //!   `spawn_blocking` 内部执行，不能用 `block_in_place`：本引擎的 activate 调用方既可能运行在
 //!   多线程 runtime（cli/daemon）也可能是 current-thread runtime（测试），`block_in_place` 在
 //!   后者会直接 panic。Beta 现有实现把 capture 调用放进 spawn_blocking 正是为了避开这个问题，
@@ -18,12 +18,10 @@ use chrono::Utc;
 
 use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::swap::{swap_with_snapshot, SwapTarget};
-use kimi_switch_core::{
-    Account, AccountId, AccountRegistry, ClientTarget, CredentialStore, Provider, Quota,
-};
+use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, Provider, Quota};
 
 use crate::json::{extract_access_token, extract_refresh_token};
-use crate::runtime::{BlobMetadata, FileBlobRuntime, IsolationSpec, RefreshOutcome};
+use crate::runtime::{BlobMetadata, FileBlobRuntime, RefreshOutcome};
 
 /// 文件型 OAuth 账号切换引擎：接一个 [`FileBlobRuntime`] adapter 即可获得完整 [`Provider`] 实现。
 pub struct FileBlobProvider<A: FileBlobRuntime> {
@@ -53,32 +51,16 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         }
     }
 
-    pub fn home(&self) -> PathBuf {
-        self.home.clone()
-    }
-
-    pub fn isolation(&self) -> IsolationSpec {
-        self.runtime.isolation()
+    /// store 里该 provider 使用的凭证字段名。删除账号必须用这个名字，调用方不得硬编码。
+    pub fn store_field(&self) -> &'static str {
+        self.runtime.store_field()
     }
 
     fn live_path(&self) -> PathBuf {
         self.runtime.live_cred_path(&self.home)
     }
 
-    /// live 凭证文件相对 `home` 的子路径（隔离物化用：如 `credentials/kimi-code.json`）。
-    pub fn live_rel_path(&self) -> PathBuf {
-        self.live_path()
-            .strip_prefix(&self.home)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| self.live_path())
-    }
-
-    /// 转调 runtime 的额外物化（如 Beta 复制 `config.toml` 进隔离目录）。
-    pub fn materialize_extra_into(&self, env_dir: &Path) {
-        self.runtime.materialize_extra(&self.home, env_dir);
-    }
-
-    /// 原子写 live 凭证：tmp + rename + 0o600。同时供隔离物化写入使用（`pub(crate)`）。
+    /// 原子写 live 凭证：tmp + rename + 0o600。
     pub(crate) fn write_blob(path: &Path, contents: &str) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -129,6 +111,12 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     fn value_matches_account(value: &str, account: &Account) -> bool {
         value == account.id.0 || (!account.label.trim().is_empty() && value == account.label)
     }
+
+    /// 官方身份辨认：`primary_id`，缺失则回退 `label`。
+    /// 导入、切换、重新授权共用这一处定义，不得在调用方再解析凭证。
+    fn official_identity(meta: &BlobMetadata) -> Option<&str> {
+        meta.primary_id.as_deref().or(meta.label.as_deref())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +125,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 从 blob 落库：blob 进 store，元数据进 registry.toml。`active_override=None` 时保留原 active。
-    /// 元数据由 `self.runtime.parse_metadata(&raw)` 派生；若调用方已持有 metadata（如 legacy
-    /// registry 迁移场景），改用 [`Self::store_account_with_metadata`] 跳过重新派生。
+    /// 官方身份由 [`Self::official_identity`] 从 `parse_metadata` 得出。
     fn store_account(
         &self,
         raw: String,
@@ -157,14 +144,12 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         label_hint: Option<String>,
         active_override: Option<bool>,
     ) -> Result<Account> {
-        let id_string = meta
-            .primary_id
-            .clone()
+        let id_string = Self::official_identity(&meta)
+            .map(str::to_string)
             .or_else(|| label_hint.clone())
             .ok_or_else(|| {
-                Error::Provider(
-                    "cannot parse account id from credentials; pass --label to set it explicitly"
-                        .into(),
+                Error::provider(
+                    "cannot parse account id from credentials; pass --label to set it explicitly",
                 )
             })?;
         let id = AccountId(id_string);
@@ -212,7 +197,6 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                 .map(|a| a.created_at)
                 .unwrap_or_else(Utc::now),
             last_used_at: existing.and_then(|a| a.last_used_at),
-            priority: 100,
             extra,
         };
         self.registry.upsert(account.clone())?;
@@ -232,38 +216,34 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 从当前 live 文件导入（可切换）。
     pub fn import_active(&self, label_hint: Option<String>) -> Result<Account> {
         let raw = fs::read_to_string(self.live_path())
-            .map_err(|e| Error::Provider(format!("read live credentials failed: {e}")))?;
+            .map_err(|e| Error::provider(format!("read live credentials failed: {e}")))?;
         self.store_account(raw, label_hint, Some(true))
     }
 
     /// 只对齐当前 live 的元数据 active 标记，不写凭证（默认入口用，避免弹钥匙串）。
     pub fn sync_active_metadata(&self, label_hint: Option<String>) -> Result<Account> {
         let raw = fs::read_to_string(self.live_path())
-            .map_err(|e| Error::Provider(format!("read live credentials failed: {e}")))?;
+            .map_err(|e| Error::provider(format!("read live credentials failed: {e}")))?;
         // 复用 store_account，但不覆盖 store 里已有的可切换 blob：仅当 store 尚无该账号时才写。
         let meta = self.runtime.parse_metadata(&raw);
-        let has_blob = meta
-            .primary_id
-            .as_ref()
-            .map(|pid| {
-                self.store
-                    .get(self.runtime.id(), pid, self.runtime.store_field())
-                    .ok()
-                    .flatten()
-                    .is_some()
-            })
-            .unwrap_or(false);
-        if has_blob {
-            // 已有可切换副本：只更新 active 标记，不重写 blob。
-            let pid = meta.primary_id.clone().unwrap();
-            let id = AccountId(pid);
-            self.registry.set_active(self.runtime.id(), &id)?;
-            return self.registry.find(self.runtime.id(), &id)?.ok_or_else(|| {
-                Error::AccountNotFound {
-                    provider: self.runtime.id().into(),
-                    id: id.to_string(),
-                }
-            });
+        if let Some(pid) = Self::official_identity(&meta) {
+            let has_blob = self
+                .store
+                .get(self.runtime.id(), pid, self.runtime.store_field())
+                .ok()
+                .flatten()
+                .is_some();
+            if has_blob {
+                // 已有可切换副本：只更新 active 标记，不重写 blob。
+                let id = AccountId(pid.to_string());
+                self.registry.set_active(self.runtime.id(), &id)?;
+                return self.registry.find(self.runtime.id(), &id)?.ok_or_else(|| {
+                    Error::AccountNotFound {
+                        provider: self.runtime.id().into(),
+                        id: id.to_string(),
+                    }
+                });
+            }
         }
         self.store_account(raw, label_hint, Some(true))
     }
@@ -271,30 +251,17 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 当前 live 凭证对应的 registry id。默认入口用它对照墓碑，避免 `rm` 后被自动导入加回。
     pub fn live_account_id(&self) -> Result<AccountId> {
         let raw = fs::read_to_string(self.live_path())
-            .map_err(|e| Error::Provider(format!("read live credentials failed: {e}")))?;
+            .map_err(|e| Error::provider(format!("read live credentials failed: {e}")))?;
         let meta = self.runtime.parse_metadata(&raw);
         if let Some(existing) = self.find_by_dedup(&meta) {
             return Ok(existing.id);
         }
-        let id_string = meta
-            .primary_id
-            .clone()
-            .or(meta.label.clone())
-            .ok_or_else(|| {
-                Error::Provider("cannot parse account id from live credentials".into())
-            })?;
-        Ok(AccountId(id_string))
+        let id_string = Self::official_identity(&meta)
+            .ok_or_else(|| Error::provider("cannot parse account id from live credentials"))?;
+        Ok(AccountId(id_string.to_string()))
     }
 
-    /// 从任意文件导入（校验合法 JSON）。
-    pub fn import_from_file(&self, path: PathBuf, label_hint: Option<String>) -> Result<Account> {
-        let raw = fs::read_to_string(&path)?;
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .map_err(|e| Error::Provider(format!("{} is not valid JSON: {e}", path.display())))?;
-        self.store_account(raw, label_hint, None)
-    }
-
-    /// 从原始 blob 导入（migrate 用）。
+    /// 从原始 blob 导入（设备码授权入库）。
     pub fn import_raw(
         &self,
         raw: String,
@@ -302,18 +269,6 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         active: Option<bool>,
     ) -> Result<Account> {
         self.store_account(raw, label_hint, active)
-    }
-
-    /// 同 [`Self::import_raw`]，但用调用方提供的 metadata（不重新从 blob 派生）。
-    /// 供 legacy registry 迁移场景使用：迁移前的 metadata 可能带有当前 blob 解析逻辑
-    /// 推导不出的字段（如缓存的用量、旧 schema 才有的字段），必须原样保留。
-    pub fn import_raw_with_explicit_metadata(
-        &self,
-        raw: String,
-        metadata: BlobMetadata,
-        active: Option<bool>,
-    ) -> Result<Account> {
-        self.store_account_with_metadata(raw, metadata, None, active)
     }
 }
 
@@ -331,7 +286,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 错误处理顺序与原始 Beta 实现一致：store 读取失败时不立即冒泡，而是先捕获错误、
     /// 继续尝试 `recover_legacy`；只有 legacy 也拿不到时才把原始 store 错误抛出去。这样即使
     /// keyring 后端本身故障，仍有机会从 legacy 布局恢复凭证。
-    pub fn raw_blob_for_account(&self, account: &Account) -> Result<String> {
+    fn raw_blob_for_account(&self, account: &Account) -> Result<String> {
         if let Some(raw) = self.read_live_if_matches(account) {
             let _ = self.store.set(
                 self.runtime.id(),
@@ -376,22 +331,10 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         Self::metadata_matches(&meta, account, self.runtime.dedup_extra_key()).then_some(raw)
     }
 
-    /// 覆盖 live 前把 live 凭证回灌进其 owner 账号 store（自身走一份，供 `reconcile_active_from_live`
-    /// 这类纯同步调用点使用）。
+    /// 覆盖 live 前把 live 凭证回灌进其 owner 账号 store。
+    /// 只接收借用参数，供 `activate` 的 `spawn_blocking` 闭包与同步 reconcile 共用一份实现。
     ///
     /// 守卫：live 缺 refresh 且 store 已有 refresh 时跳过（防静默写死账号）。
-    fn capture_live_into_store(&self) -> Result<()> {
-        Self::capture_live_into_store_with(
-            self.runtime.as_ref(),
-            self.store.as_ref(),
-            self.registry.as_ref(),
-            &self.home,
-        )
-    }
-
-    /// 与 [`Self::capture_live_into_store`] 逻辑相同，但只接收借用参数，
-    /// 便于在 `activate` 的 `spawn_blocking` 闭包内以 clone 出来的 `Arc` 直接调用，
-    /// 不必依赖 `&self`（`self` 不是 `'static`，不能安全地移进 `spawn_blocking`）。
     fn capture_live_into_store_with(
         runtime: &A,
         store: &dyn CredentialStore,
@@ -432,41 +375,28 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         Ok(())
     }
 
-    /// daemon capture-on-arrival：只 live→store，不碰 active 标记。
-    pub fn reconcile_active_from_live(&self) -> Result<()> {
-        self.capture_live_into_store()
-    }
-
-    /// 隔离物化用：导出账号 blob。
-    pub fn export_blob(&self, id: &AccountId) -> Result<String> {
-        let account = self.require_account(id)?;
-        self.raw_blob_for_account(&account)
-    }
-
-    /// 隔离结束吸收（可能轮换过的）凭证，仅更新 store 副本。
-    pub fn absorb_blob(&self, id: &AccountId, raw: &str) -> Result<()> {
-        serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|e| Error::Provider(format!("isolated credentials not valid JSON: {e}")))?;
-        self.store.set(
-            self.runtime.id(),
-            id.0.as_str(),
-            self.runtime.store_field(),
-            raw,
-        )?;
-        Ok(())
+    /// 只 live→store，不碰 active 标记。
+    #[cfg(test)]
+    fn reconcile_active_from_live(&self) -> Result<()> {
+        Self::capture_live_into_store_with(
+            self.runtime.as_ref(),
+            self.store.as_ref(),
+            self.registry.as_ref(),
+            &self.home,
+        )
     }
 
     /// 按卡重新授权原语：用一次新的授权结果 blob 覆盖指定账号的库存凭证。
     ///
-    /// 官方身份辨认复用入库链路同款规则（[`FileBlobRuntime::parse_metadata`] 的
-    /// `primary_id`，缺失时回退 `label`，与 [`Self::live_account_id`] 一致）：
-    /// - 解析出的官方账号 id 与目标不同、或无法辨认 → 返回错误；不写库存、不写 live、不增删账号；
+    /// 官方身份辨认走 [`Self::official_identity`]（`primary_id`，缺失时回退 `label`），
+    /// 与导入、切换同一回退顺序：
+    /// - 解析出的官方账号 id 与目标不同、或无法辨认 → 返回 [`kimi_switch_core::ReauthError`]；不写库存、不写 live、不增删账号；
     /// - 相同 → 替换该账号的库存 blob；registry 原样保留（别名、active 标记不变，
     ///   同一官方身份仍是一条）；JSON 非法的 blob 解析不出主键，自然落入「无法辨认」拒绝路径；
     /// - 目标是当前活跃账号 → 再把新 blob 原子写进 live 登录文件；非当前则完全不碰 live。
     ///
-    /// 注意：这里严禁调用 capture-on-leave / [`Self::reconcile_active_from_live`] 之类的
-    /// 旧态回灌——它们会把旧 live 盖进刚替换的库存副本。写顺序固定「先库存后 live」：
+    /// 注意：这里严禁调用 capture-on-leave 之类的旧态回灌——它们会把旧 live
+    /// 盖进刚替换的库存副本。写顺序固定「先库存后 live」：
     /// live 写失败时新凭证已安全落在库存，不会丢号。
     ///
     /// 窗口期（store=新/live=旧）对外一律以 live 为准：其后的查询或切换都会把旧 live
@@ -475,20 +405,9 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 错误文本只含账号 id 与原因，不含任何凭证内容。
     pub fn replace_account_blob(&self, target: &AccountId, raw: String) -> Result<Account> {
         let meta = self.runtime.parse_metadata(&raw);
-        let observed = meta
-            .primary_id
-            .clone()
-            .or_else(|| meta.label.clone())
-            .ok_or_else(|| {
-                Error::Provider(
-                    "cannot identify authorized account from credentials; nothing written".into(),
-                )
-            })?;
+        let observed = Self::official_identity(&meta).ok_or_else(Error::reauth_unidentifiable)?;
         if observed != target.0 {
-            return Err(Error::Provider(format!(
-                "authorized account {observed} does not match target account {}; nothing written",
-                target.0
-            )));
+            return Err(Error::reauth_identity_mismatch(observed, &target.0));
         }
         let account = self.require_account(target)?;
 
@@ -503,9 +422,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             // 原子写（tmp + rename）：失败时旧 live 未被破坏，新凭证已在库存可重试。
             // 窗口期对外行为见 ADR-0002 修订：live 仍为旧凭证，其后的查询/切换都以旧 live 为准，
             // 错误文案必须把状态与补救讲清楚。
-            Self::write_blob(&self.live_path(), &raw).map_err(|e| Error::Provider(format!(
-                "新凭证已保存到账号库，但写入当前登录文件失败：{e}；当前仍在使用旧凭证，之后的查询或切换都会以旧凭证为准，请尽快重试重新授权"
-            )))?;
+            Self::write_blob(&self.live_path(), &raw).map_err(Error::reauth_live_write_failed)?;
         }
         Ok(account)
     }
@@ -517,26 +434,6 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 
 #[async_trait]
 impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
-    fn id(&self) -> &'static str {
-        self.runtime.id()
-    }
-
-    fn display_name(&self) -> &'static str {
-        self.runtime.display_name()
-    }
-
-    fn client_targets(&self) -> Vec<ClientTarget> {
-        vec![ClientTarget {
-            id: format!("{}_live", self.runtime.id()),
-            display_name: format!("{} credentials", self.runtime.display_name()),
-            probe_path: self.live_path(),
-        }]
-    }
-
-    async fn list_accounts(&self) -> Result<Vec<Account>> {
-        self.registry.list_by_provider(self.runtime.id())
-    }
-
     async fn activate(&self, id: &AccountId) -> Result<()> {
         // 阶段 1：异步预处理（仅查 registry + store，无网络调用），与 Beta 现有实现一致。
         let account = self.require_account(id)?;
@@ -571,12 +468,17 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
                 live_path,
                 writer: Box::new(move |p: &Path| FileBlobProvider::<A>::write_blob(p, &blob)),
             }];
-            swap_with_snapshot(provider_id, &home, targets, || {
+            let lock_dir = registry
+                .path()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home.clone());
+            swap_with_snapshot(provider_id, &home, &lock_dir, targets, || {
                 registry.set_active(provider_id, &id_owned)
             })
         })
         .await
-        .map_err(|e| Error::Provider(format!("spawn_blocking join failed: {e}")))?
+        .map_err(|e| Error::provider(format!("spawn_blocking join failed: {e}")))?
     }
 
     async fn query_quota(&self, id: &AccountId) -> Result<Vec<Quota>> {
@@ -590,7 +492,9 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
             }
         }
         let access = extract_access_token(&raw).ok_or_else(|| {
-            Error::QuotaFetch("no access_token in credentials; schema may have changed".into())
+            Error::quota_missing_credential(
+                "no access_token in credentials; schema may have changed",
+            )
         })?;
         self.runtime.fetch_quota(&access, &account).await
     }
@@ -628,6 +532,10 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 
 #[cfg(test)]
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
+    pub(crate) fn test_home(&self) -> PathBuf {
+        self.home.clone()
+    }
+
     pub(crate) fn test_live_path(&self) -> PathBuf {
         self.live_path()
     }
@@ -646,6 +554,10 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     pub(crate) fn test_registry_upsert(&self, account: Account) -> Result<()> {
         self.registry.upsert(account)
     }
+
+    pub(crate) fn test_list_accounts(&self) -> Result<Vec<Account>> {
+        self.registry.list_by_provider(self.runtime.id())
+    }
 }
 
 #[cfg(test)]
@@ -654,6 +566,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    use kimi_switch_core::error::ReauthError;
     use kimi_switch_core::FileStore;
 
     #[derive(Clone, Copy)]
@@ -710,9 +623,6 @@ mod tests {
         fn id(&self) -> &'static str {
             "fake"
         }
-        fn display_name(&self) -> &'static str {
-            "Fake"
-        }
         fn home(&self) -> PathBuf {
             self.home.clone()
         }
@@ -735,12 +645,6 @@ mod tests {
                     .or_else(|| v.get("uid").and_then(|x| x.as_str()).map(String::from)),
                 dedup_key: v.get("dedup").and_then(|x| x.as_str()).map(String::from),
                 extra: serde_json::Map::new(),
-            }
-        }
-        fn isolation(&self) -> IsolationSpec {
-            IsolationSpec {
-                env_var: "FAKE_HOME",
-                native_cli: "fake",
             }
         }
         async fn refresh(&self, blob: &str) -> Result<RefreshOutcome> {
@@ -767,8 +671,7 @@ mod tests {
     }
 
     /// 包一层 `CredentialStore`，`get` 恒定失败，模拟 keyring 后端故障；`set`/`delete` 照常转发到内层
-    /// `FileStore`。用于验证 [`FileBlobProvider::raw_blob_for_account`] 的错误处理顺序：
-    /// store 错误不应抢先冒泡，必须先尝试 `recover_legacy`。
+    /// `FileStore`。用于验证读 blob 的错误处理顺序：store 错误不应抢先冒泡，必须先尝试 `recover_legacy`。
     struct FailingGetStore {
         inner: FileStore,
     }
@@ -803,7 +706,6 @@ mod tests {
             active: false,
             created_at: chrono::Utc::now(),
             last_used_at: None,
-            priority: 100,
             extra: serde_json::Map::new(),
         }
     }
@@ -814,7 +716,7 @@ mod tests {
     fn capture_skips_when_live_missing_refresh_but_store_has_it() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
         // 注册 owner + store 有 refresh。
         p.import_raw(
             r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#.into(),
@@ -833,7 +735,7 @@ mod tests {
     fn capture_overwrites_when_live_has_refresh_and_store_lacks_it() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
         p.import_raw(
             r#"{"uid":"u1","access_token":"A1"}"#.into(),
             None,
@@ -851,7 +753,7 @@ mod tests {
     fn capture_overwrites_when_neither_side_has_refresh() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
         p.import_raw(
             r#"{"uid":"u1","access_token":"A1"}"#.into(),
             None,
@@ -869,7 +771,7 @@ mod tests {
     fn capture_skips_when_no_owner_matches() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
         fs::write(p.test_live_path(), r#"{"uid":"unmanaged"}"#).unwrap();
         // 无匹配账号 → 不写 store。
         p.reconcile_active_from_live().unwrap();
@@ -891,7 +793,7 @@ mod tests {
         let runtime =
             FakeRuntime::with_dedup_extra_key(tmp.path().join("home"), "legacy_account_id");
         let p = provider_with(tmp.path(), runtime);
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         // 模拟迁移前已存在的账号：id = 旧 account_key，label = 邮箱，
         // extra 只有旧键名 "legacy_account_id"，没有 "dedup_key"。
@@ -925,7 +827,7 @@ mod tests {
     fn label_metadata_field_matches_account_label_when_primary_id_does_not() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let mut account = fake_account("some-id");
         account.label = "user@example.com".into();
@@ -945,47 +847,10 @@ mod tests {
         assert!(stored.contains("unrelated-id"));
     }
 
-    // --- Finding 2 回归：import_raw_with_explicit_metadata 应优先用调用方提供的 metadata ---
+    // --- 导入 ---
 
     #[test]
-    fn import_raw_with_explicit_metadata_prefers_caller_supplied_metadata_over_derived() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = provider(tmp.path());
-
-        let raw = r#"{"uid":"u1","access_token":"A1"}"#.to_string();
-        // 显式 metadata 与从 raw 派生的结果不同：primary_id/label 换成别的值，
-        // 并带一个 raw 派生不出的 extra 字段（模拟 legacy registry 里缓存的用量字段）。
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            "cached_field".into(),
-            serde_json::Value::String("explicit-value".into()),
-        );
-        let metadata = BlobMetadata {
-            primary_id: Some("explicit-id".into()),
-            label: Some("explicit-label".into()),
-            dedup_key: None,
-            extra,
-        };
-
-        let account = p
-            .import_raw_with_explicit_metadata(raw, metadata, Some(true))
-            .unwrap();
-        assert_eq!(
-            account.id.0, "explicit-id",
-            "应使用显式 metadata 的 primary_id，而不是从 raw 派生的 u1"
-        );
-        assert_eq!(account.label, "explicit-label");
-        assert_eq!(
-            account.extra.get("cached_field").and_then(|v| v.as_str()),
-            Some("explicit-value"),
-            "raw 派生不出的字段应原样保留"
-        );
-    }
-
-    // --- 导入 / 导出 / 吸收 ---
-
-    #[test]
-    fn import_raw_and_export_blob_roundtrip() {
+    fn import_raw_stores_blob_and_marks_active() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
         let account = p
@@ -997,36 +862,13 @@ mod tests {
             .unwrap();
         assert_eq!(account.id.0, "u1");
         assert!(account.active);
-        let exported = p.export_blob(&account.id).unwrap();
-        assert!(exported.contains("A1"));
+        assert!(p.test_store_get("u1").unwrap().contains("A1"));
     }
 
-    #[test]
-    fn absorb_blob_rejects_invalid_json_and_updates_store_on_success() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = provider(tmp.path());
-        let account = p
-            .import_raw(
-                r#"{"uid":"u1","access_token":"A1"}"#.into(),
-                None,
-                Some(false),
-            )
-            .unwrap();
+    // --- 读 blob：store 错误处理顺序（不抢先冒泡，先试 legacy）---
 
-        assert!(p.absorb_blob(&account.id, "not json").is_err());
-
-        p.absorb_blob(&account.id, r#"{"uid":"u1","access_token":"NEW"}"#)
-            .unwrap();
-        assert_eq!(
-            p.test_store_get("u1").unwrap(),
-            r#"{"uid":"u1","access_token":"NEW"}"#
-        );
-    }
-
-    // --- raw_blob_for_account：store 错误处理顺序（不抢先冒泡，先试 legacy）---
-
-    #[test]
-    fn raw_blob_for_account_falls_back_to_legacy_when_store_get_errors() {
+    #[tokio::test]
+    async fn query_quota_falls_back_to_legacy_when_store_get_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::with_legacy(
             tmp.path().join("home"),
@@ -1037,12 +879,18 @@ mod tests {
         });
         let registry = Arc::new(AccountRegistry::new(tmp.path().join("registry.toml")));
         let p = FileBlobProvider::new(runtime, store, registry);
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let account = fake_account("u1");
-        let raw = p.raw_blob_for_account(&account).unwrap();
-        assert!(
-            raw.contains("FROM_LEGACY"),
+        p.test_registry_upsert(account.clone()).unwrap();
+        p.query_quota(&account.id).await.unwrap();
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("FROM_LEGACY"),
             "store.get 失败时应继续尝试 recover_legacy 而不是直接冒泡错误"
         );
         // legacy 命中后应顺手修复 store 副本（即使底层 get 会失败，set 走 FileStore 正常写入）。
@@ -1051,8 +899,8 @@ mod tests {
             .contains("FROM_LEGACY"));
     }
 
-    #[test]
-    fn raw_blob_for_account_surfaces_store_error_when_legacy_also_misses() {
+    #[tokio::test]
+    async fn query_quota_surfaces_store_error_when_legacy_also_misses() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::new(tmp.path().join("home")); // legacy_blob = None
         let store = Arc::new(FailingGetStore {
@@ -1060,10 +908,11 @@ mod tests {
         });
         let registry = Arc::new(AccountRegistry::new(tmp.path().join("registry.toml")));
         let p = FileBlobProvider::new(runtime, store, registry);
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let account = fake_account("u1");
-        let err = p.raw_blob_for_account(&account).unwrap_err();
+        p.test_registry_upsert(account.clone()).unwrap();
+        let err = p.query_quota(&account.id).await.unwrap_err();
         assert!(
             err.to_string().contains("simulated store failure"),
             "legacy 也拿不到时应把原始 store 错误抛出去，而不是泛化成\"未找到凭证\"：{err}"
@@ -1075,11 +924,11 @@ mod tests {
     // --- 按卡重新授权原语 replace_account_blob：只断言库存内容、live 内容与成功/失败 ---
 
     /// 对上且非当前账号：库存 blob 被新凭证替换，别名与单卡保持，live 登录文件不动。
-    #[tokio::test]
-    async fn reauth_replaces_parked_account_without_touching_live() {
+    #[test]
+    fn reauth_replaces_parked_account_without_touching_live() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
         let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
@@ -1108,8 +957,7 @@ mod tests {
         assert!(!account.active, "非当前账号的 active 标记不得被改");
 
         let ids: Vec<String> = p
-            .list_accounts()
-            .await
+            .test_list_accounts()
             .unwrap()
             .into_iter()
             .map(|a| a.id.0)
@@ -1123,11 +971,11 @@ mod tests {
 
     /// 对上且是当前账号：库存与 live 都换成新凭证；严禁先把旧 live 回灌库存
     /// （任何把旧 live 写回 store 的顺序错误都会让 store 断言失败）。
-    #[tokio::test]
-    async fn reauth_replaces_active_account_and_writes_new_blob_to_live() {
+    #[test]
+    fn reauth_replaces_active_account_and_writes_new_blob_to_live() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
         let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
@@ -1150,7 +998,7 @@ mod tests {
             "当前账号的新凭证必须原子写入 Kimi Code 正在使用的登录文件"
         );
         assert!(account.active, "当前账号身份保持不变");
-        let accounts = p.list_accounts().await.unwrap();
+        let accounts = p.test_list_accounts().unwrap();
         assert_eq!(accounts.len(), 1, "同一官方身份仍是一条：{accounts:?}");
     }
 
@@ -1161,7 +1009,7 @@ mod tests {
     fn reauth_active_live_write_failure_reports_state_and_keeps_store_new() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
         let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
@@ -1179,6 +1027,15 @@ mod tests {
         let err = p
             .replace_account_blob(&AccountId("u1".into()), new_u1.into())
             .unwrap_err();
+        match err.reauth_error() {
+            Some(ReauthError::LiveWriteFailed { cause }) => {
+                assert!(
+                    cause.contains("os error"),
+                    "LiveWriteFailed 应带上底层 io 原因：{cause}"
+                );
+            }
+            other => panic!("live 写失败应透出 LiveWriteFailed，得到 {other:?} / {err}"),
+        }
         let msg = err.to_string();
         assert!(
             msg.contains("已保存到账号库"),
@@ -1192,10 +1049,7 @@ mod tests {
             msg.contains("重试重新授权"),
             "错误必须给出补救动作（重试重新授权）：{msg}"
         );
-        assert!(
-            msg.contains("os error"),
-            "错误必须带上底层 io 原因：{msg}"
-        );
+        assert!(msg.contains("os error"), "错误必须带上底层 io 原因：{msg}");
 
         assert_eq!(
             p.test_store_get("u1").unwrap(),
@@ -1217,7 +1071,7 @@ mod tests {
     async fn reauth_live_write_failure_window_then_activate_backfills_old_live_into_store() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
         let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
@@ -1232,10 +1086,9 @@ mod tests {
             .test_live_path()
             .with_extension(format!("tmp.{}", std::process::id()));
         fs::create_dir_all(&tmp_target).unwrap();
-        assert!(
-            p.replace_account_blob(&AccountId("u1".into()), new_u1.into())
-                .is_err()
-        );
+        assert!(p
+            .replace_account_blob(&AccountId("u1".into()), new_u1.into())
+            .is_err());
         assert_eq!(
             p.test_store_get("u1").unwrap(),
             new_u1,
@@ -1259,15 +1112,15 @@ mod tests {
     }
 
     /// 钉住已接受行为（ADR-0002 修订）：查询路径与切换路径一样会把旧 live 回灌库存。
-    /// 重授权 live 写失败留下 store=新/live=旧 窗口后，对活跃账号一次 `raw_blob_for_account`
-    /// 读取（查额度/导出的公共路径）即把旧 live 回写 store、静默撤销新凭证——这是明文
+    /// 重授权 live 写失败留下 store=新/live=旧 窗口后，对活跃账号一次额度查询
+    /// 即把旧 live 回写 store、静默撤销新凭证——这是明文
     /// 接受的对外行为（窗口期一律以 live 为准），由本测试钉住防止未来无意改变；
     /// 若要改变，先重开 ADR-0002 决策。
-    #[test]
-    fn reauth_live_write_failure_window_then_read_backfills_old_live_into_store() {
+    #[tokio::test]
+    async fn reauth_live_write_failure_window_then_query_quota_backfills_old_live_into_store() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
         let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
@@ -1280,24 +1133,27 @@ mod tests {
             .test_live_path()
             .with_extension(format!("tmp.{}", std::process::id()));
         fs::create_dir_all(&tmp_target).unwrap();
-        assert!(
-            p.replace_account_blob(&AccountId("u1".into()), new_u1.into())
-                .is_err()
-        );
+        assert!(p
+            .replace_account_blob(&AccountId("u1".into()), new_u1.into())
+            .is_err());
         assert_eq!(
             p.test_store_get("u1").unwrap(),
             new_u1,
             "窗口成立：store 已是新凭证而 live 仍是旧凭证"
         );
 
-        // 解除注入后对活跃账号读一次 blob（不走 query_quota，避免网络依赖）。
+        // 解除注入后对活跃账号查一次额度（FakeRuntime 无网络）。
         fs::remove_dir_all(&tmp_target).unwrap();
-        let account = fake_account("u1");
-        let raw = p.raw_blob_for_account(&account).unwrap();
+        p.query_quota(&AccountId("u1".into())).await.unwrap();
 
         assert_eq!(
-            raw, old_u1,
-            "钉住已接受行为（ADR-0002 修订）：窗口内读取以 live 为准，返回旧凭证"
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("A1"),
+            "钉住已接受行为（ADR-0002 修订）：窗口内查询以 live 为准，用旧凭证"
         );
         assert_eq!(
             p.test_store_get("u1").unwrap(),
@@ -1306,12 +1162,79 @@ mod tests {
         );
     }
 
-    /// 对不上（登录的是另一个官方身份）：失败，库存/live/账号列表一概不写。
-    #[tokio::test]
-    async fn reauth_rejects_identity_mismatch_without_any_write() {
+    /// 官方身份辨认只有一处：`primary_id` 缺失时回退 `label`。
+    /// 导入、切换（live_account_id）、重新授权共用同一回退顺序。
+    #[test]
+    fn official_identity_falls_back_to_label_on_import_swap_and_reauth() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        let labeled = r#"{"label":"only-label","refresh_token":"R1","access_token":"A1"}"#;
+        let account = p
+            .import_raw(labeled.into(), None, Some(true))
+            .expect("导入应能用 label 回退辨认官方身份");
+        assert_eq!(account.id.0, "only-label");
+
+        fs::write(p.test_live_path(), labeled).unwrap();
+        assert_eq!(
+            p.live_account_id().unwrap().0,
+            "only-label",
+            "切换路径辨认 live 官方身份应与导入同一回退"
+        );
+
+        let refreshed = r#"{"label":"only-label","refresh_token":"R2","access_token":"A2"}"#;
+        p.replace_account_blob(&account.id, refreshed.into())
+            .unwrap();
+        assert_eq!(p.test_store_get("only-label").unwrap(), refreshed);
+
+        let other = r#"{"label":"other-id","refresh_token":"R9","access_token":"A9"}"#;
+        let err = p
+            .replace_account_blob(&account.id, other.into())
+            .unwrap_err();
+        match err.reauth_error() {
+            Some(ReauthError::IdentityMismatch { observed, target }) => {
+                assert_eq!(observed, "other-id");
+                assert_eq!(target, "only-label");
+            }
+            other => panic!("期望 IdentityMismatch，得到 {other:?} / {err}"),
+        }
+    }
+
+    /// primary_id 在时不回退 label：三条路径都以 primary_id 为准。
+    #[test]
+    fn official_identity_prefers_primary_id_over_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        let raw = r#"{"uid":"u-primary","label":"u-label","access_token":"A1"}"#;
+        let account = p.import_raw(raw.into(), None, Some(true)).unwrap();
+        assert_eq!(account.id.0, "u-primary");
+
+        fs::write(p.test_live_path(), raw).unwrap();
+        assert_eq!(p.live_account_id().unwrap().0, "u-primary");
+
+        let err = p
+            .replace_account_blob(&AccountId("u-label".into()), raw.into())
+            .unwrap_err();
+        match err.reauth_error() {
+            Some(ReauthError::IdentityMismatch { observed, target }) => {
+                assert_eq!(observed, "u-primary");
+                assert_eq!(target, "u-label");
+            }
+            other => panic!("期望 IdentityMismatch，得到 {other:?} / {err}"),
+        }
+        assert!(p.test_store_get("u-label").is_none());
+        assert_eq!(p.test_store_get("u-primary").unwrap(), raw);
+    }
+
+    /// 对不上（登录的是另一个官方身份）：失败，库存/live/账号列表一概不写。
+    #[test]
+    fn reauth_rejects_identity_mismatch_without_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
         let other = r#"{"uid":"u9","refresh_token":"R9","access_token":"A9"}"#;
@@ -1321,6 +1244,13 @@ mod tests {
         let err = p
             .replace_account_blob(&AccountId("u1".into()), other.into())
             .unwrap_err();
+        match err.reauth_error() {
+            Some(ReauthError::IdentityMismatch { observed, target }) => {
+                assert_eq!(observed, "u9");
+                assert_eq!(target, "u1");
+            }
+            other => panic!("身份不符应透出 IdentityMismatch，得到 {other:?} / {err}"),
+        }
         assert!(
             err.to_string().contains("does not match"),
             "错误应说明官方身份对不上：{err}"
@@ -1329,7 +1259,7 @@ mod tests {
         assert_eq!(p.test_store_get("u1").unwrap(), old_u1, "库存不得被改");
         assert!(p.test_store_get("u9").is_none(), "陌生身份不得被写入库存");
         assert!(!p.test_live_path().exists(), "失败路径不得写 live 登录文件");
-        let accounts = p.list_accounts().await.unwrap();
+        let accounts = p.test_list_accounts().unwrap();
         assert_eq!(accounts.len(), 1, "不得新增账号：{accounts:?}");
     }
 
@@ -1338,7 +1268,7 @@ mod tests {
     async fn reauth_rejects_unidentifiable_credentials_without_any_write() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
-        fs::create_dir_all(p.home()).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
 
         let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
         p.import_raw(old_u1.into(), None, Some(false)).unwrap();
@@ -1347,6 +1277,10 @@ mod tests {
             let err = p
                 .replace_account_blob(&AccountId("u1".into()), bad.into())
                 .unwrap_err();
+            assert!(
+                matches!(err.reauth_error(), Some(ReauthError::Unidentifiable)),
+                "无法辨认应透出 Unidentifiable：{err}"
+            );
             assert!(
                 err.to_string().contains("cannot identify"),
                 "无法辨认时应明确报错而不是改库：{err}"

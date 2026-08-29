@@ -4,6 +4,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kimi 换号器</title>
+    <script>
+      try {
+        var t = localStorage.getItem("kimi-switch.theme");
+        if (t === "jade-night" || t === "classic") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div class="window-shell">
@@ -28,17 +36,23 @@
       <main class="dashboard dashboard-shell">
         <section class="app-toolbar">
           <nav class="route-tabs" aria-label="主导航">
-            <a class="route-tab active" href="#overview" data-route="overview">总览</a>
+            <a class="route-tab active" href="#overview" data-route="overview" aria-current="page">总览</a>
             <a class="route-tab" href="#library" data-route="library">账号库</a>
             <a class="route-tab" href="#settings" data-route="settings">设置</a>
           </nav>
         </section>
 
         <section class="page active" id="page-overview">
-          <div class="dashboard-grid">
+          <div id="overview-load-error" class="empty-state overview-load-error hidden">
+            <p>账号快照加载失败。</p>
+            <button id="overview-retry-button" class="action-button action-button-primary" type="button">
+              重试
+            </button>
+          </div>
+          <div class="dashboard-grid" id="overview-dashboard">
             <article class="rail-card current-account-card current-account-card--hero">
               <div class="current-account-topbar">
-                <h2 class="section-title section-title-rail">当前账号</h2>
+                <h2 class="section-title">当前账号</h2>
                 <div class="quota-monitor-pill">
                   <span id="quota-monitor-dot" class="quota-monitor-dot" aria-hidden="true"></span>
                   <span id="quota-monitor-label">额度就绪</span>
@@ -67,7 +81,7 @@
                 </article>
               </div>
               <article class="rail-card control-deck">
-                <h2 class="section-title section-title-rail">控制面板</h2>
+                <h2 class="section-title">控制面板</h2>
                 <div class="control-stack control-stack--three">
                   <button id="add-account-button" class="action-button action-button-primary" type="button">
                     添加账号
@@ -84,9 +98,14 @@
           <div class="profiles-stage">
             <div class="profiles-header">
               <h2 class="section-title">账号库</h2>
-              <button id="library-add-button" class="action-button action-button-primary" type="button">
-                添加账号
-              </button>
+              <div class="profiles-header-actions">
+                <button id="library-refresh-button" class="action-button" type="button" title="重新拉取全部账号的额度">
+                  刷新
+                </button>
+                <button id="library-add-button" class="action-button action-button-primary" type="button">
+                  添加账号
+                </button>
+              </div>
             </div>
             <div id="accounts-empty" class="empty-state hidden">暂无账号。用「添加账号」浏览器授权，或先在 Kimi Code 登录后点「导入当前账号」。</div>
             <div id="accounts-list" class="profiles-grid"></div>
@@ -99,10 +118,10 @@
             <div class="settings-row">
               <span>主题</span>
               <div class="theme-dots" role="group" aria-label="主题">
-                <button id="theme-classic" class="theme-dot is-active" type="button" data-theme="classic" title="纸色浅色">
+                <button id="theme-classic" class="theme-dot is-active" type="button" data-theme="classic" title="纸色浅色" aria-pressed="true">
                   纸色
                 </button>
-                <button id="theme-jade-night" class="theme-dot" type="button" data-theme="jade-night" title="Jade Night">
+                <button id="theme-jade-night" class="theme-dot" type="button" data-theme="jade-night" title="Jade Night" aria-pressed="false">
                   深色
                 </button>
               </div>
@@ -132,16 +151,18 @@
     </dialog>
 
     <dialog id="rename-dialog" class="app-dialog">
-      <h3>重命名账号</h3>
-      <p id="rename-copy"></p>
-      <label class="field">
-        <span>别名</span>
-        <input id="rename-input" type="text" />
-      </label>
-      <div class="dialog-actions">
-        <button id="rename-cancel" class="action-button" type="button">取消</button>
-        <button id="rename-submit" class="action-button action-button-primary" type="button">确定</button>
-      </div>
+      <form id="rename-form">
+        <h3>重命名账号</h3>
+        <p id="rename-copy"></p>
+        <label class="field">
+          <span>别名</span>
+          <input id="rename-input" type="text" name="alias" autocomplete="off" />
+        </label>
+        <div class="dialog-actions">
+          <button id="rename-cancel" class="action-button" type="button">取消</button>
+          <button id="rename-submit" class="action-button action-button-primary" type="submit">确定</button>
+        </div>
+      </form>
     </dialog>
 
     <dialog id="delete-dialog" class="app-dialog">

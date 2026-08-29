@@ -1,0 +1,71 @@
+import { describe, expect, it } from "vitest";
+
+import { quotaHtml, type QuotaView } from "./quota";
+
+function quota(partial: Partial<QuotaView> = {}): QuotaView {
+  return {
+    window: "5 小时",
+    ratio: 0.42,
+    text: "42 / 100",
+    reset: "4h 后重置",
+    tone: "ok",
+    ...partial,
+  };
+}
+
+describe("quotaHtml", () => {
+  it("查询失败时保持原文案且不含进度条", () => {
+    const html = quotaHtml([], `失败 <x>`, null);
+    expect(html).toBe(`<p class="quota-error">额度查询失败: 失败 &lt;x&gt;</p>`);
+    expect(html).not.toContain("progressbar");
+  });
+
+  it("无额度窗口时输出 n/a", () => {
+    expect(quotaHtml([], null, null)).toBe(`<p class="quota-reset">额度: n/a</p>`);
+  });
+
+  it("额度条带 progressbar 语义与窗口名、用量文字", () => {
+    const html = quotaHtml([quota()], null, null);
+    expect(html).toContain(`role="progressbar"`);
+    expect(html).toContain(`aria-label="5 小时"`);
+    expect(html).toContain(`aria-valuemin="0"`);
+    expect(html).toContain(`aria-valuemax="100"`);
+    expect(html).toContain(`aria-valuenow="42"`);
+    expect(html).toContain(`aria-valuetext="42 / 100"`);
+    expect(html).toContain(`quota-fill--ok`);
+    expect(html).toContain(`style="width:42%"`);
+    expect(html).toContain(`<span class="quota-reset">4h 后重置</span>`);
+  });
+
+  it("ratio 为空时不输出 aria-valuenow，条宽按 0", () => {
+    const html = quotaHtml([quota({ ratio: null, text: "n/a", reset: null })], null, null);
+    expect(html).not.toContain("aria-valuenow");
+    expect(html).toContain(`aria-valuetext="n/a"`);
+    expect(html).toContain(`style="width:0%"`);
+  });
+
+  it("四档压力 class 与 DTO tone 一致", () => {
+    for (const tone of ["ok", "warn", "high", "full"] as const) {
+      expect(quotaHtml([quota({ tone })], null, null)).toContain(`quota-fill--${tone}`);
+    }
+  });
+
+  it("转义窗口名、用量文字与重置时间", () => {
+    const html = quotaHtml(
+      [quota({ window: `5"h`, text: `a<b>`, reset: `c&d` })],
+      null,
+      null,
+    );
+    expect(html).toContain(`aria-label="5&quot;h"`);
+    expect(html).toContain(`aria-valuetext="a&lt;b&gt;"`);
+    expect(html).toContain(`c&amp;d`);
+    expect(html).not.toContain(`5"h`);
+    expect(html).not.toContain(`a<b>`);
+  });
+
+  it("有 cached_at 时追加灰字时间", () => {
+    const html = quotaHtml([], "超时", "缓存于 12:00");
+    expect(html).toContain(`额度查询失败: 超时`);
+    expect(html).toContain(`<p class="quota-cached">缓存于 12:00</p>`);
+  });
+});

@@ -9,6 +9,9 @@ use crate::model::{AccountId, Quota};
 use crate::provider::Provider;
 use crate::settings::{self, Quota as QuotaSettings};
 
+/// 额度重试日志里的 provider 标识。trait 不再暴露 `id()`，由实现内部常量自报（Kimi）。
+const PROVIDER_ID: &str = "kimi";
+
 /// 按当前配置查询 quota，失败或单次超时后做保守重试。
 pub async fn query_quota_with_retry(provider: &dyn Provider, id: &AccountId) -> Result<Vec<Quota>> {
     let cfg = settings::current().quota.clone();
@@ -27,15 +30,15 @@ async fn query_quota_with_retry_config(
     for attempt in 1..=max_attempts {
         let result = match tokio::time::timeout(timeout, provider.query_quota(id)).await {
             Ok(inner) => inner,
-            Err(_) => Err(Error::QuotaFetch("quota fetch timeout".into())),
+            Err(_) => Err(Error::quota_timeout()),
         };
 
         match result {
             Ok(quotas) => return Ok(quotas),
-            Err(e) if attempt < max_attempts && !is_non_retryable_http_error(&e) => {
+            Err(e) if attempt < max_attempts && e.is_retryable() => {
                 let retry_delay = retry_delay(cfg.fetch_retry_delay_ms, attempt);
                 tracing::debug!(
-                    provider = provider.id(),
+                    provider = PROVIDER_ID,
                     account = %id,
                     attempt,
                     max_attempts,
@@ -47,41 +50,17 @@ async fn query_quota_with_retry_config(
                     tokio::time::sleep(retry_delay).await;
                 }
             }
-            Err(e) if is_non_retryable_http_error(&e) => return Err(e),
-            Err(e) => return Err(error_with_attempts(e, max_attempts)),
+            Err(e) if !e.is_retryable() => return Err(e),
+            Err(e) => return Err(e.with_attempt_count(max_attempts)),
         }
     }
 
-    Err(Error::QuotaFetch("quota fetch failed".into()))
+    Err(Error::quota_other("quota fetch failed"))
 }
 
 fn retry_delay(base_ms: u64, failed_attempt: u32) -> Duration {
     let exponent = failed_attempt.saturating_sub(1).min(63);
     Duration::from_millis(base_ms.saturating_mul(1_u64 << exponent))
-}
-
-fn is_non_retryable_http_error(error: &Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    text.contains("401")
-        || text.contains("403")
-        || text.contains("429")
-        || text.contains("unauthorized")
-        || text.contains("forbidden")
-        || text.contains("too many requests")
-        || text.contains("rate_limit")
-        || text.contains("rate limited")
-}
-
-fn error_with_attempts(error: Error, max_attempts: u32) -> Error {
-    if max_attempts <= 1 {
-        return error;
-    }
-    match error {
-        Error::QuotaFetch(message) => {
-            Error::QuotaFetch(format!("{message} after {max_attempts} attempts"))
-        }
-        other => Error::QuotaFetch(format!("{other} after {max_attempts} attempts")),
-    }
 }
 
 #[cfg(test)]
@@ -91,30 +70,12 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::model::{Account, ClientTarget};
-
     struct FlakyProvider {
         calls: AtomicUsize,
     }
 
     #[async_trait]
     impl Provider for FlakyProvider {
-        fn id(&self) -> &'static str {
-            "test"
-        }
-
-        fn display_name(&self) -> &'static str {
-            "Test"
-        }
-
-        fn client_targets(&self) -> Vec<ClientTarget> {
-            Vec::new()
-        }
-
-        async fn list_accounts(&self) -> Result<Vec<Account>> {
-            Ok(Vec::new())
-        }
-
         async fn activate(&self, _id: &AccountId) -> Result<()> {
             Ok(())
         }
@@ -122,7 +83,7 @@ mod tests {
         async fn query_quota(&self, _id: &AccountId) -> Result<Vec<Quota>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
-                Err(Error::QuotaFetch("temporary failure".into()))
+                Err(Error::quota_other("temporary failure"))
             } else {
                 Ok(Vec::new())
             }
@@ -151,22 +112,6 @@ mod tests {
 
     #[async_trait]
     impl Provider for AlwaysTimeoutProvider {
-        fn id(&self) -> &'static str {
-            "test"
-        }
-
-        fn display_name(&self) -> &'static str {
-            "Test"
-        }
-
-        fn client_targets(&self) -> Vec<ClientTarget> {
-            Vec::new()
-        }
-
-        async fn list_accounts(&self) -> Result<Vec<Account>> {
-            Ok(Vec::new())
-        }
-
         async fn activate(&self, _id: &AccountId) -> Result<()> {
             Ok(())
         }
@@ -197,34 +142,18 @@ mod tests {
 
     struct AlwaysErrorProvider {
         calls: AtomicUsize,
-        message: &'static str,
+        error: fn() -> Error,
     }
 
     #[async_trait]
     impl Provider for AlwaysErrorProvider {
-        fn id(&self) -> &'static str {
-            "test"
-        }
-
-        fn display_name(&self) -> &'static str {
-            "Test"
-        }
-
-        fn client_targets(&self) -> Vec<ClientTarget> {
-            Vec::new()
-        }
-
-        async fn list_accounts(&self) -> Result<Vec<Account>> {
-            Ok(Vec::new())
-        }
-
         async fn activate(&self, _id: &AccountId) -> Result<()> {
             Ok(())
         }
 
         async fn query_quota(&self, _id: &AccountId) -> Result<Vec<Quota>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(Error::QuotaFetch(self.message.into()))
+            Err((self.error)())
         }
     }
 
@@ -232,7 +161,7 @@ mod tests {
     async fn retries_are_capped_at_five() {
         let provider = AlwaysErrorProvider {
             calls: AtomicUsize::new(0),
-            message: "temporary failure",
+            error: || Error::quota_other("temporary failure"),
         };
         let cfg = QuotaSettings {
             fetch_retries: 99,
@@ -251,15 +180,18 @@ mod tests {
 
     #[tokio::test]
     async fn non_retryable_http_failures_are_not_retried() {
-        for message in [
-            "usage returned 401 Unauthorized",
-            "usage returned 403 Forbidden",
-            "usage returned 429 Too Many Requests",
-            "usage returned rate_limit_error",
+        for (status, message) in [
+            (401, "usage returned 401 Unauthorized"),
+            (403, "usage returned 403 Forbidden"),
+            (429, "usage returned 429 Too Many Requests"),
         ] {
             let provider = AlwaysErrorProvider {
                 calls: AtomicUsize::new(0),
-                message,
+                error: match status {
+                    401 => || Error::quota_http(401, "usage returned 401 Unauthorized"),
+                    403 => || Error::quota_http(403, "usage returned 403 Forbidden"),
+                    _ => || Error::quota_http(429, "usage returned 429 Too Many Requests"),
+                },
             };
             let cfg = QuotaSettings {
                 fetch_retries: 5,
@@ -269,12 +201,34 @@ mod tests {
 
             let err = query_quota_with_retry_config(&provider, &AccountId("alice".into()), &cfg)
                 .await
-                .unwrap_err()
-                .to_string();
+                .unwrap_err();
 
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "{message}");
-            assert!(!err.contains("after"), "{err}");
+            assert_eq!(err.http_status(), Some(status), "{message}");
+            assert!(!err.is_retryable(), "{message}");
         }
+    }
+
+    #[tokio::test]
+    async fn http_status_in_message_text_is_not_classification() {
+        let provider = AlwaysErrorProvider {
+            calls: AtomicUsize::new(0),
+            error: || Error::quota_other("usage returned 401 Unauthorized"),
+        };
+        let cfg = QuotaSettings {
+            fetch_retries: 1,
+            fetch_retry_delay_ms: 0,
+            ..QuotaSettings::default()
+        };
+
+        let err = query_quota_with_retry_config(&provider, &AccountId("alice".into()), &cfg)
+            .await
+            .unwrap_err();
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(err.http_status(), None);
+        assert!(err.is_retryable());
+        assert!(!err.is_authentication_failure());
     }
 
     #[test]

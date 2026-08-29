@@ -8,7 +8,6 @@
 //! label = "alice"
 //! active = true
 //! created_at = "2026-05-28T10:00:00Z"
-//! priority = 100
 //!
 //! [accounts.extra]
 //! email = "alice@example.com"
@@ -38,6 +37,9 @@ struct RegistryFile {
 /// 设计上故意做成「每次加载/保存都全量读写」：
 /// - 数据量小（账号数量个位数）。
 /// - 避免内存中长期持有可能过期的快照。
+///
+/// 全部写操作（激活 / 改名 / 删除 / 更新）的读-改-写持注册表同目录的
+/// `.kimi-switch.lock`，与 [`crate::swap::swap_with_snapshot`] 共用临界区。
 pub struct AccountRegistry {
     path: PathBuf,
 }
@@ -57,6 +59,17 @@ impl AccountRegistry {
         &self.path
     }
 
+    fn lock_dir(&self) -> PathBuf {
+        match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    }
+
+    fn with_write_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::switch_lock::with_exclusive_lock(&self.lock_dir(), f)
+    }
+
     /// 加载注册表；文件不存在时返回空列表。
     pub fn load(&self) -> Result<Vec<Account>> {
         if !self.path.exists() {
@@ -72,6 +85,10 @@ impl AccountRegistry {
 
     /// 保存（全量覆写）。先写 tmp 再 rename，避免半截文件。
     pub fn save(&self, accounts: &[Account]) -> Result<()> {
+        self.with_write_lock(|| self.save_unlocked(accounts))
+    }
+
+    fn save_unlocked(&self, accounts: &[Account]) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -143,53 +160,59 @@ impl AccountRegistry {
 
     /// 插入或更新一个账号（按 (provider, id) 主键去重）。
     pub fn upsert(&self, account: Account) -> Result<()> {
-        let mut all = self.load()?;
-        if let Some(existing) = all
-            .iter_mut()
-            .find(|a| a.provider == account.provider && a.id == account.id)
-        {
-            *existing = account;
-        } else {
-            all.push(account);
-        }
-        self.save(&all)
+        self.with_write_lock(|| {
+            let mut all = self.load()?;
+            if let Some(existing) = all
+                .iter_mut()
+                .find(|a| a.provider == account.provider && a.id == account.id)
+            {
+                *existing = account;
+            } else {
+                all.push(account);
+            }
+            self.save_unlocked(&all)
+        })
     }
 
     /// 删除一个账号。
     pub fn remove(&self, provider: &str, id: &AccountId) -> Result<()> {
-        let mut all = self.load()?;
-        let before = all.len();
-        all.retain(|a| !(a.provider == provider && a.id == *id));
-        if all.len() == before {
-            return Err(Error::AccountNotFound {
-                provider: provider.into(),
-                id: id.to_string(),
-            });
-        }
-        self.save(&all)
+        self.with_write_lock(|| {
+            let mut all = self.load()?;
+            let before = all.len();
+            all.retain(|a| !(a.provider == provider && a.id == *id));
+            if all.len() == before {
+                return Err(Error::AccountNotFound {
+                    provider: provider.into(),
+                    id: id.to_string(),
+                });
+            }
+            self.save_unlocked(&all)
+        })
     }
 
     /// 把指定账号标记为该 Provider 的激活账号，其他同 Provider 账号置为 inactive。
     pub fn set_active(&self, provider: &str, id: &AccountId) -> Result<()> {
-        let mut all = self.load()?;
-        let mut found = false;
-        for a in &mut all {
-            if a.provider == provider {
-                let is_target = a.id == *id;
-                a.active = is_target;
-                if is_target {
-                    found = true;
-                    a.last_used_at = Some(chrono::Utc::now());
+        self.with_write_lock(|| {
+            let mut all = self.load()?;
+            let mut found = false;
+            for a in &mut all {
+                if a.provider == provider {
+                    let is_target = a.id == *id;
+                    a.active = is_target;
+                    if is_target {
+                        found = true;
+                        a.last_used_at = Some(chrono::Utc::now());
+                    }
                 }
             }
-        }
-        if !found {
-            return Err(Error::AccountNotFound {
-                provider: provider.into(),
-                id: id.to_string(),
-            });
-        }
-        self.save(&all)
+            if !found {
+                return Err(Error::AccountNotFound {
+                    provider: provider.into(),
+                    id: id.to_string(),
+                });
+            }
+            self.save_unlocked(&all)
+        })
     }
 }
 
@@ -242,7 +265,6 @@ mod tests {
             active: false,
             created_at: chrono::Utc::now(),
             last_used_at: None,
-            priority: 100,
             extra: serde_json::Map::new(),
         }
     }
@@ -355,5 +377,106 @@ mod tests {
         let actives: Vec<_> = all.iter().filter(|a| a.active).collect();
         assert_eq!(actives.len(), 1);
         assert_eq!(actives[0].id.0, "b");
+    }
+
+    #[test]
+    fn concurrent_upserts_do_not_drop_sibling_accounts() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("registry.toml");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let alice_path = path.clone();
+        let alice_barrier = barrier.clone();
+        let alice = std::thread::spawn(move || {
+            let reg = AccountRegistry::new(alice_path);
+            alice_barrier.wait();
+            for i in 0..80 {
+                let mut account = make_account("kimi", "alice");
+                account.label = format!("alice-{i}");
+                reg.upsert(account).unwrap();
+            }
+        });
+
+        let bob_path = path.clone();
+        let bob = std::thread::spawn(move || {
+            let reg = AccountRegistry::new(bob_path);
+            barrier.wait();
+            for i in 0..80 {
+                let mut account = make_account("kimi", "bob");
+                account.label = format!("bob-{i}");
+                reg.upsert(account).unwrap();
+            }
+        });
+
+        alice.join().expect("alice upsert thread");
+        bob.join().expect("bob upsert thread");
+
+        let all = AccountRegistry::new(path).load().unwrap();
+        let ids: Vec<&str> = all.iter().map(|a| a.id.0.as_str()).collect();
+        assert!(
+            ids.contains(&"alice") && ids.contains(&"bob"),
+            "并发 upsert 丢更新: {ids:?}"
+        );
+        assert!(
+            all.iter()
+                .find(|a| a.id.0 == "alice")
+                .is_some_and(|a| a.label.starts_with("alice-")),
+            "{all:?}"
+        );
+        assert!(
+            all.iter()
+                .find(|a| a.id.0 == "bob")
+                .is_some_and(|a| a.label.starts_with("bob-")),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_set_active_and_rename_keep_both_updates() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("registry.toml");
+        let reg = AccountRegistry::new(path.clone());
+        reg.upsert(make_account("kimi", "alice")).unwrap();
+        reg.upsert(make_account("kimi", "bob")).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let activate_path = path.clone();
+        let activate_barrier = barrier.clone();
+        let activate = std::thread::spawn(move || {
+            let reg = AccountRegistry::new(activate_path);
+            activate_barrier.wait();
+            for _ in 0..80 {
+                reg.set_active("kimi", &AccountId("alice".into())).unwrap();
+            }
+        });
+
+        let rename_path = path.clone();
+        let rename = std::thread::spawn(move || {
+            let reg = AccountRegistry::new(rename_path);
+            barrier.wait();
+            for i in 0..80 {
+                let mut account = make_account("kimi", "bob");
+                account.label = format!("bob-{i}");
+                reg.upsert(account).unwrap();
+            }
+        });
+
+        activate.join().expect("set_active thread");
+        rename.join().expect("rename thread");
+
+        let all = AccountRegistry::new(path).load().unwrap();
+        let alice = all.iter().find(|a| a.id.0 == "alice").expect("alice");
+        let bob = all.iter().find(|a| a.id.0 == "bob").expect("bob");
+        assert!(alice.active, "切换标记被改名覆盖: {all:?}");
+        assert!(
+            bob.label.starts_with("bob-"),
+            "改名被切换覆盖: {}",
+            bob.label
+        );
+        assert!(!bob.active, "set_active 应只激活 alice: {all:?}");
     }
 }

@@ -1,0 +1,132 @@
+//! 活跃账号同步：对照墓碑后对齐或入库当前 live 身份。
+//!
+//! CLI 与 GUI 共用这一份实现。live 不可读或墓碑命中时静默跳过，不走假路径回退。
+
+use std::path::Path;
+
+use crate::account_registry::AccountRegistry;
+use crate::error::Result;
+use crate::model::{Account, AccountId};
+use crate::removed::RemovedAccounts;
+
+/// 同步本地当前账号进账号库。
+///
+/// `live_account_id` 失败（未登录 / live 不可读）或墓碑命中则跳过。
+/// `sync_active_metadata` 负责把 live 对齐或入库；成功后再 `set_active`，
+/// 保证新入库的账号会关掉同 provider 其他卡的 active 标记。
+pub fn sync_local_active(
+    provider_id: &str,
+    removed_path: &Path,
+    registry: &AccountRegistry,
+    live_account_id: impl FnOnce() -> Result<AccountId>,
+    sync_active_metadata: impl FnOnce() -> Result<Account>,
+) {
+    let Ok(id) = live_account_id() else {
+        return;
+    };
+    let removed = RemovedAccounts::load(removed_path);
+    if removed.contains(provider_id, &id.0) {
+        tracing::debug!(id = %id, "skip tombstoned auto-import");
+        return;
+    }
+    match sync_active_metadata() {
+        Ok(account) => {
+            if let Err(e) = registry.set_active(provider_id, &account.id) {
+                tracing::debug!(err=%e, "skip active marker");
+            }
+        }
+        Err(e) => tracing::debug!(err=%e, "skip auto-import"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    use crate::error::Error;
+
+    fn account(id: &str, active: bool) -> Account {
+        Account {
+            provider: "kimi".into(),
+            id: AccountId(id.into()),
+            label: id.into(),
+            active,
+            created_at: Utc::now(),
+            last_used_at: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn live_ok(id: &str) -> impl FnOnce() -> Result<AccountId> {
+        let id = id.to_string();
+        move || Ok(AccountId(id))
+    }
+
+    fn live_err() -> impl FnOnce() -> Result<AccountId> {
+        || Err(Error::provider("no live credentials"))
+    }
+
+    #[test]
+    fn sync_local_active_skips_tombstoned_live_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = AccountRegistry::new(tmp.path().join("registry.toml"));
+        let removed_path = tmp.path().join("removed.json");
+        RemovedAccounts::load(&removed_path)
+            .add("kimi", "alice")
+            .unwrap();
+
+        sync_local_active("kimi", &removed_path, &registry, live_ok("alice"), || {
+            panic!("tombstone 命中时不得入库")
+        });
+
+        assert!(registry.list_by_provider("kimi").unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_local_active_skips_when_live_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = AccountRegistry::new(tmp.path().join("registry.toml"));
+        let removed_path = tmp.path().join("removed.json");
+
+        sync_local_active("kimi", &removed_path, &registry, live_err(), || {
+            panic!("live 不可读时不得入库")
+        });
+
+        assert!(registry.list_by_provider("kimi").unwrap().is_empty());
+        assert!(!removed_path.exists());
+    }
+
+    #[test]
+    fn sync_local_active_marks_live_account_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = AccountRegistry::new(tmp.path().join("registry.toml"));
+        registry.upsert(account("alice", false)).unwrap();
+        registry.upsert(account("bob", true)).unwrap();
+        let removed_path = tmp.path().join("removed.json");
+        let alice = account("alice", false);
+
+        sync_local_active("kimi", &removed_path, &registry, live_ok("alice"), || {
+            Ok(alice)
+        });
+
+        let listed = registry.list_by_provider("kimi").unwrap();
+        let alice = listed.iter().find(|a| a.id.0 == "alice").unwrap();
+        let bob = listed.iter().find(|a| a.id.0 == "bob").unwrap();
+        assert!(alice.active);
+        assert!(!bob.active);
+    }
+
+    #[test]
+    fn sync_local_active_swallows_metadata_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = AccountRegistry::new(tmp.path().join("registry.toml"));
+        let removed_path = tmp.path().join("removed.json");
+
+        sync_local_active("kimi", &removed_path, &registry, live_ok("alice"), || {
+            Err(Error::provider("read live failed"))
+        });
+
+        assert!(registry.list_by_provider("kimi").unwrap().is_empty());
+    }
+}

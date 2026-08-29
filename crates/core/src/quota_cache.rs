@@ -13,6 +13,7 @@ use std::path::Path;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, QuotaFailure, QuotaFailureKind};
 use crate::model::{Quota, QuotaWindow};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,34 @@ pub struct FailureEntry {
     pub consecutive: u32,
     /// 最近一次失败的错误文本，退避期间原样复用给展示层。
     pub error: String,
+    /// 额度失败种类。老缓存文件缺此字段时视为 [`QuotaFailureKind::Other`]。
+    #[serde(default)]
+    pub kind: QuotaFailureKind,
+    /// 结构化 HTTP 状态。老缓存文件缺此字段时视为未知。
+    #[serde(default)]
+    pub status: Option<u16>,
+}
+
+impl FailureEntry {
+    fn from_error(error: &Error, consecutive: u32) -> Self {
+        let failure = persist_quota_failure(error);
+        Self {
+            failed_at: Utc::now(),
+            consecutive,
+            error: failure.message,
+            kind: failure.kind,
+            status: failure.status,
+        }
+    }
+
+    /// 还原为错误类型，分类走 [`Error`] 上的唯一定义。
+    pub fn as_error(&self) -> Error {
+        Error::quota_fetch(QuotaFailure {
+            kind: self.kind,
+            status: self.status,
+            message: self.error.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -97,7 +126,7 @@ impl QuotaCache {
         if self
             .failures
             .get(&key)
-            .is_some_and(|entry| is_authentication_failure(&entry.error))
+            .is_some_and(|entry| entry.as_error().is_authentication_failure())
         {
             return None;
         }
@@ -127,9 +156,9 @@ impl QuotaCache {
     ///
     /// 失败结果不进 `entries`（不能拿失败当数据用），单独记在这里只为算退避窗口。
     /// 鉴权失败还会丢掉旧的成功缓存，避免下一屏把过期 0% 当成真实余量。
-    pub fn record_failure(&mut self, provider: &str, account_id: &str, error: &str) {
+    pub fn record_failure(&mut self, provider: &str, account_id: &str, error: &Error) {
         let key = cache_key(provider, account_id);
-        if is_authentication_failure(error) {
+        if error.is_authentication_failure() {
             self.entries.remove(&key);
         }
         let consecutive = self
@@ -137,14 +166,8 @@ impl QuotaCache {
             .get(&key)
             .map(|f| f.consecutive.saturating_add(1))
             .unwrap_or(1);
-        self.failures.insert(
-            key,
-            FailureEntry {
-                failed_at: Utc::now(),
-                consecutive,
-                error: error.to_string(),
-            },
-        );
+        self.failures
+            .insert(key, FailureEntry::from_error(error, consecutive));
     }
 
     /// 删除某账号的成功缓存与失败退避（`rm` 时调用，避免尸号数字粘在下一个同 id 导入上）。
@@ -167,7 +190,7 @@ impl QuotaCache {
         let entry = self.failures.get(&cache_key(provider, account_id))?;
         // 401/403 往往会在原生客户端刚刷新凭据后立刻恢复。仍保留一个基础窗口避免请求风暴，
         // 但不把旧鉴权失败指数退避到 15 分钟，否则用户明明已经恢复登录仍会长期看到旧错误。
-        let effective_cap = if is_authentication_failure(&entry.error) {
+        let effective_cap = if entry.as_error().is_authentication_failure() {
             base
         } else {
             cap
@@ -179,6 +202,14 @@ impl QuotaCache {
             return None;
         }
         Some(entry)
+    }
+
+    /// 把成功缓存的时间戳拨到过去，供额度快照测试模拟节流窗口已过。
+    #[cfg(test)]
+    pub(crate) fn age_success(&mut self, provider: &str, account_id: &str, age: Duration) {
+        if let Some(entry) = self.entries.get_mut(&cache_key(provider, account_id)) {
+            entry.cached_at = Utc::now() - age;
+        }
     }
 }
 
@@ -196,22 +227,24 @@ fn cache_key(provider: &str, account_id: &str) -> String {
     format!("{provider}::{account_id}")
 }
 
-/// 额度查询失败是否属于确定性鉴权/缺凭据，而不是网络或 429。
-///
-/// 这类错误不得把旧 quota 缓存当可用余量展示，也不得成为自动切换候选。
-pub fn is_authentication_failure(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("401")
-        || lower.contains("403")
-        || lower.contains("unauthorized")
-        || lower.contains("forbidden")
-        || lower.contains("re-login")
-        || lower.contains("invalid_grant")
-        || lower.contains("missing credential")
-        || lower.contains("no credentials")
-        || lower.contains("no keyring entry")
-        || lower.contains("access token missing")
-        || lower.contains("belong to another")
+fn persist_quota_failure(error: &Error) -> QuotaFailure {
+    match error {
+        Error::QuotaFetch(failure) => failure.clone(),
+        Error::Provider(failure) => QuotaFailure {
+            kind: if failure.status.is_some() {
+                QuotaFailureKind::Http
+            } else {
+                QuotaFailureKind::Other
+            },
+            status: failure.status,
+            message: failure.message.clone(),
+        },
+        other => QuotaFailure {
+            kind: QuotaFailureKind::Other,
+            status: other.http_status(),
+            message: other.to_string(),
+        },
+    }
 }
 
 /// 判断单个 quota 窗口是否已失效。
@@ -247,6 +280,7 @@ mod tests {
             reset_at: Some(Utc::now() + Duration::days(3)),
             status: QuotaStatus::Ok,
             note: None,
+            membership: None,
         }
     }
 
@@ -275,16 +309,30 @@ mod tests {
         let mut cache = QuotaCache::default();
 
         // 首次失败 → 退避 base，窗口内跳过查询。
-        cache.record_failure("alpha", "a@x.com", "429 rate limited");
+        cache.record_failure(
+            "alpha",
+            "a@x.com",
+            &Error::quota_http(429, "429 rate limited"),
+        );
         let hit = cache
             .in_failure_backoff("alpha", "a@x.com", base, cap)
             .unwrap();
         assert_eq!(hit.consecutive, 1);
         assert_eq!(hit.error, "429 rate limited");
+        assert_eq!(hit.status, Some(429));
+        assert!(!hit.as_error().is_authentication_failure());
 
         // 第 3 次失败 → 退避 4*base；把 failed_at 拨到 3*base 之前仍在窗口内。
-        cache.record_failure("alpha", "a@x.com", "429 rate limited");
-        cache.record_failure("alpha", "a@x.com", "429 rate limited");
+        cache.record_failure(
+            "alpha",
+            "a@x.com",
+            &Error::quota_http(429, "429 rate limited"),
+        );
+        cache.record_failure(
+            "alpha",
+            "a@x.com",
+            &Error::quota_http(429, "429 rate limited"),
+        );
         cache.failures.get_mut("alpha::a@x.com").unwrap().failed_at =
             Utc::now() - Duration::seconds(270);
         assert!(cache
@@ -315,7 +363,7 @@ mod tests {
             cache.record_failure(
                 "alpha",
                 "a@x.com",
-                "quota fetch: usage returned 401 Unauthorized",
+                &Error::quota_http(401, "wording that never mentions the status"),
             );
         }
         cache.failures.get_mut("alpha::a@x.com").unwrap().failed_at =
@@ -338,7 +386,7 @@ mod tests {
         cache.record_failure(
             "gamma",
             "auth0|dead",
-            "re-login required for gamma:auth0|dead; stored credentials belong to another Gamma account",
+            &Error::quota_http(401, "wording that never mentions the status"),
         );
         assert!(cache.get("gamma", "auth0|dead").is_none());
         assert!(cache
@@ -350,7 +398,11 @@ mod tests {
     fn remove_clears_success_and_failure_entries() {
         let mut cache = QuotaCache::default();
         cache.set("gamma", "auth0|gone", vec![sample_quota()]);
-        cache.record_failure("gamma", "auth0|gone", "429 rate limited");
+        cache.record_failure(
+            "gamma",
+            "auth0|gone",
+            &Error::quota_http(429, "429 rate limited"),
+        );
         cache.remove("gamma", "auth0|gone");
         assert!(cache.get("gamma", "auth0|gone").is_none());
         assert!(cache

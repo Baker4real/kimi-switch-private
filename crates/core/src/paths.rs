@@ -32,7 +32,7 @@ pub struct AppPaths {
     pub config_dir: PathBuf,
     /// 数据：审计日志、备份快照。
     pub data_dir: PathBuf,
-    /// 运行时状态：当前激活账号缓存、daemon pid 等。
+    /// 运行时状态：当前激活账号缓存、切换快照等。
     pub state_dir: PathBuf,
     /// 缓存：额度查询缓存等可丢弃数据。
     pub cache_dir: PathBuf,
@@ -106,18 +106,6 @@ impl AppPaths {
     /// 切换前快照根目录：`<state_dir>/snapshots/`。
     pub fn snapshots_dir(&self) -> PathBuf {
         self.state_dir.join("snapshots")
-    }
-
-    /// kimi-switchd 守护进程 PID 文件:`<state_dir>/kimi-switchd.pid`。
-    /// 通过 fs2 文件锁标识唯一存活实例;退出后保留 PID 仅作信息参考。
-    pub fn daemon_pid_file(&self) -> PathBuf {
-        self.state_dir.join("kimi-switchd.pid")
-    }
-
-    /// kimi-switchd 守护进程日志文件:`<data_dir>/kimi-switchd.log`。
-    /// 用 append 模式打开,后续可由 logrotate 切割。
-    pub fn daemon_log_file(&self) -> PathBuf {
-        self.data_dir.join("kimi-switchd.log")
     }
 
     /// quota 查询结果缓存：`<cache_dir>/quota_cache.json`。

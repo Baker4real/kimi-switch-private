@@ -33,12 +33,15 @@
 :root {
   color-scheme: light;
   --canvas-bg: #f2efea;
-  --surface-pressed: rgba(173, 180, 205, 0.92);
+  /* 同一色相加深 H≈227° S≈24% L 74%→42%。叠在 --canvas-bg 上实测：
+     主按钮白字 5.62:1，激活 Tab / 主题钮白字 5.15:1，hover 6.70:1。 */
+  --surface-pressed: rgba(81, 92, 133, 0.92);
   --border: rgba(228, 223, 214, 0.92);
   --border-accent: rgba(208, 236, 244, 0.96);
   --text-strong: #565867;
-  --text-body: #6c707f;
-  --text-muted: #9a9dac;
+  /* body #626674 on canvas 4.99:1；muted #616476 on canvas 5.10:1（均 ≥ 4.5）。 */
+  --text-body: #626674;
+  --text-muted: #616476;
   --text-inverse: #f9f8f4;
   --track: #ebe7e1;
   --blue-fill: #8fd4f3;
@@ -58,8 +61,8 @@
   --dialog-background: linear-gradient(180deg, rgba(250, 248, 244, 0.98), rgba(243, 239, 234, 0.98));
   --route-tabs-background: rgba(248, 245, 240, 0.88);
   --monitor-background: rgba(248, 245, 240, 0.92);
-  --primary-background: rgba(173, 180, 205, 0.96);
-  --primary-background-hover: rgba(162, 170, 196, 0.98);
+  --primary-background: rgba(81, 92, 133, 0.96);
+  --primary-background-hover: rgba(73, 84, 120, 0.98);
   --primary-shadow: 0 10px 20px rgba(166, 170, 191, 0.18);
   --button-background: rgba(250, 248, 244, 0.94);
   --button-border: rgba(227, 221, 214, 0.98);
@@ -83,11 +86,10 @@
   --danger-hover-background: rgba(255, 247, 245, 0.98);
   --shadow-soft: 0 24px 56px rgba(118, 110, 102, 0.08);
   --shadow-card: 0 18px 42px rgba(133, 123, 113, 0.08);
-  --radius-shell: 28px;
   --radius-card: 24px;
   --radius-metric: 18px;
   --radius-pill: 999px;
-  --font-display: "Cormorant Garamond Custom", "Times New Roman", serif;
+  --font-display: "Cormorant Garamond Custom", "Noto Sans SC Custom", "Times New Roman", serif;
   --font-body: "IBM Plex Sans Custom", "Noto Sans SC Custom", "Segoe UI", sans-serif;
   --tone-ok: linear-gradient(90deg, #3fb950, #56d364);
   --tone-warn: linear-gradient(90deg, #d29922, #e3b341);
@@ -98,7 +100,8 @@
 :root[data-theme="jade-night"] {
   color-scheme: dark;
   --canvas-bg: #151816;
-  --surface-pressed: rgba(84, 119, 105, 0.94);
+  /* 与主色同色相；叠底后激活 Tab 深字 4.98:1，主按钮 5.11:1，muted 5.79:1，body 11.95:1。 */
+  --surface-pressed: rgba(96, 149, 132, 0.94);
   --border: rgba(83, 96, 86, 0.75);
   --border-accent: rgba(98, 164, 147, 0.9);
   --text-strong: #ecf1e8;
@@ -285,7 +288,26 @@ p {
 }
 
 .window-control-button.is-maximized .window-control-icon--maximize::before {
-  transform: translate(2px, -2px);
+  width: 8px;
+  height: 8px;
+  inset: auto;
+  top: 3px;
+  left: 0;
+  margin: 0;
+  transform: none;
+  background: var(--shell-background);
+  z-index: 1;
+}
+
+.window-control-button.is-maximized .window-control-icon--maximize::after {
+  width: 8px;
+  height: 8px;
+  inset: auto;
+  top: 0;
+  left: 3px;
+  margin: 0;
+  border: 1.4px solid currentColor;
+  border-radius: 2px;
 }
 
 .window-control-icon--close::before,
@@ -366,13 +388,9 @@ p {
 .section-title {
   font-family: var(--font-display);
   font-size: 2.125rem;
-  line-height: 0.95;
-  letter-spacing: -0.018em;
+  line-height: 1.15;
+  letter-spacing: 0;
   color: var(--text-strong);
-}
-
-.section-title-rail {
-  font-size: 2.1rem;
 }
 
 .dashboard-grid {
@@ -480,7 +498,8 @@ p {
   color: var(--text-strong);
   font-family: var(--font-display);
   font-size: 2rem;
-  line-height: 0.95;
+  line-height: 1.15;
+  letter-spacing: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -639,7 +658,7 @@ p {
 .quota-label,
 .quota-reset {
   color: var(--text-muted);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
 }
 
 .quota-reset {
@@ -663,9 +682,9 @@ p {
   border-radius: var(--radius-pill);
   background: var(--field-background);
   color: var(--text-body);
-  font-size: 0.62rem;
+  font-size: 12px;
   font-weight: 600;
-  line-height: 12px;
+  line-height: 16px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -674,7 +693,7 @@ p {
 /* 条加高以容纳条上的用量文字徽章；总览与账号库共用同一高度 */
 .quota-track {
   position: relative;
-  height: 16px;
+  height: 20px;
   border-radius: var(--radius-pill);
   background: var(--track);
   overflow: hidden;
@@ -706,6 +725,12 @@ p {
   font-size: 0.78rem;
 }
 
+.quota-cached {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+
 .empty-state {
   padding: 28px;
   border: 1px dashed var(--empty-border);
@@ -713,6 +738,13 @@ p {
   background: var(--empty-background);
   color: var(--text-body);
   text-align: center;
+}
+
+.overview-load-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
 }
 
 .settings-panel {
@@ -770,6 +802,8 @@ p {
 .app-dialog h3 {
   font-family: var(--font-display);
   font-size: 1.8rem;
+  line-height: 1.15;
+  letter-spacing: 0;
   margin-bottom: 8px;
 }
 
@@ -838,5 +872,23 @@ p {
   .control-stack--three,
   .status-grid--three {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .quota-monitor-pill.is-busy .quota-monitor-dot {
+    animation: none;
+  }
+
+  .route-tab,
+  .action-button,
+  .profile-pill {
+    transition: background 140ms ease, color 140ms ease;
+  }
+
+  .route-tab:hover,
+  .action-button:hover:not(:disabled),
+  .profile-pill:hover:not(:disabled) {
+    transform: none;
   }
 }

@@ -43,6 +43,7 @@ pub struct Settings {
     pub beta: Beta,
 }
 
+/// 自动切换段：serde 接受存量 `config.toml`，运行时零消费。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoSwap {
@@ -86,6 +87,7 @@ pub struct Token {
     pub refresh_slack_ms: i64,
 }
 
+/// daemon 段：serde 接受存量 `config.toml`，运行时零消费。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Daemon {
@@ -97,6 +99,7 @@ pub struct Daemon {
     pub idle_poll_interval_ms: u64,
 }
 
+/// Beta 段：serde 接受存量 `config.toml`，运行时零消费。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Beta {
@@ -204,54 +207,9 @@ pub fn install(settings: Arc<Settings>) {
     *cell().write().expect("settings rwlock poisoned") = settings;
 }
 
-/// 将 `[auto_swap] enabled` 写入 `<config_dir>/config.toml`，其余字段保持不变。
-///
-/// 文件不存在时创建；存在时只修改目标键，不覆盖其他用户配置。
-pub fn set_auto_swap_enabled(enabled: bool) -> Result<()> {
-    let path = AppPaths::resolve()?.config_file();
-    let mut doc: toml_edit::DocumentMut = if path.exists() {
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
-        raw.parse::<toml_edit::DocumentMut>()
-            .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?
-    } else {
-        toml_edit::DocumentMut::new()
-    };
-
-    doc["auto_swap"]["enabled"] = toml_edit::value(enabled);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::Config(format!("create dir {}: {e}", parent.display())))?;
-    }
-    std::fs::write(&path, doc.to_string())
-        .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn defaults_match_compile_time_constants() {
-        let s = Settings::default();
-        assert_eq!(s.auto_swap.threshold, defaults::AUTO_SWAP_THRESHOLD);
-        assert_eq!(
-            s.auto_swap.settle_grace_ms,
-            defaults::AUTO_SWAP_SETTLE_GRACE_MS
-        );
-        assert_eq!(s.daemon.poll_interval_ms, defaults::DAEMON_POLL_INTERVAL_MS);
-        assert_eq!(
-            s.daemon.idle_threshold_ms,
-            defaults::DAEMON_IDLE_THRESHOLD_MS
-        );
-        assert_eq!(s.quota.fetch_retries, defaults::QUOTA_FETCH_RETRIES);
-        assert_eq!(
-            s.quota.fetch_retry_delay_ms,
-            defaults::QUOTA_FETCH_RETRY_DELAY_MS
-        );
-    }
 
     #[test]
     fn missing_file_yields_defaults() {
@@ -295,5 +253,40 @@ foo = 1
         .unwrap();
         let err = load_from(&path).unwrap_err().to_string();
         assert!(err.contains("foo"), "{err}");
+    }
+
+    #[test]
+    fn stock_auto_swap_daemon_beta_sections_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[auto_swap]
+enabled = false
+threshold = 0.5
+cooldown_ms = 1
+settle_grace_ms = 2
+
+[daemon]
+poll_interval_ms = 1000
+idle_threshold_ms = 2000
+idle_poll_interval_ms = 3000
+
+[beta]
+usage_cache_max_age_ms = 4000
+"#,
+        )
+        .unwrap();
+        let s = load_from(&path).unwrap();
+        assert!(!s.auto_swap.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+        assert_eq!(s.auto_swap.cooldown_ms, 1);
+        assert_eq!(s.auto_swap.settle_grace_ms, 2);
+        assert_eq!(s.daemon.poll_interval_ms, 1000);
+        assert_eq!(s.daemon.idle_threshold_ms, 2000);
+        assert_eq!(s.daemon.idle_poll_interval_ms, 3000);
+        assert_eq!(s.beta.usage_cache_max_age_ms, 4000);
+        assert_eq!(s.quota.fetch_retries, defaults::QUOTA_FETCH_RETRIES);
     }
 }

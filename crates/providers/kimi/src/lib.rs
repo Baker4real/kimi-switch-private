@@ -13,9 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use kimi_switch_core::error::Result;
 use kimi_switch_core::{Account, AccountRegistry, CredentialStore, Quota};
-use kimi_switch_engine::{
-    BlobMetadata, FileBlobProvider, FileBlobRuntime, IsolationSpec, RefreshOutcome,
-};
+use kimi_switch_engine::{BlobMetadata, FileBlobProvider, FileBlobRuntime, RefreshOutcome};
 
 pub const PROVIDER_ID: &str = "kimi";
 
@@ -27,9 +25,6 @@ impl FileBlobRuntime for KimiRuntime {
     fn id(&self) -> &'static str {
         PROVIDER_ID
     }
-    fn display_name(&self) -> &'static str {
-        "Kimi / Moonshot"
-    }
     fn home(&self) -> PathBuf {
         paths::kimi_home()
     }
@@ -38,12 +33,6 @@ impl FileBlobRuntime for KimiRuntime {
     }
     fn parse_metadata(&self, blob: &str) -> BlobMetadata {
         kimi_files::parse_metadata(blob)
-    }
-    fn isolation(&self) -> IsolationSpec {
-        IsolationSpec {
-            env_var: "KIMI_CODE_HOME",
-            native_cli: "kimi",
-        }
     }
     async fn refresh(&self, blob: &str) -> Result<RefreshOutcome> {
         oauth::refresh_blob(blob).await
@@ -55,13 +44,6 @@ impl FileBlobRuntime for KimiRuntime {
 
 /// 便捷别名：Kimi Provider = 文件型引擎 + Kimi adapter。
 pub type KimiProvider = FileBlobProvider<KimiRuntime>;
-
-/// 从一次设备码授权结果 blob 解析官方账号 id（与入库链路同一套解析规则）。
-/// 仅供上层在失败分支生成面向用户的原因提示；写库与否的判定权始终在引擎的
-/// [`FileBlobProvider::replace_account_blob`]，这里的结果不作为任何写入依据。
-pub fn parse_authorized_user_id(blob: &str) -> Option<String> {
-    kimi_files::parse_metadata(blob).primary_id
-}
 
 /// 构造 KimiProvider（与 BetaProvider/AlphaProvider 的 `::new` 调用面一致）。
 pub fn new(store: Arc<dyn CredentialStore>, registry: Arc<AccountRegistry>) -> KimiProvider {
