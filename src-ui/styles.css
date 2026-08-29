@@ -725,6 +725,12 @@ p {
   font-size: 0.78rem;
 }
 
+/* 凭证待续期：凭证生命周期状态而非额度查询故障，不用错误红（issue #43）。 */
+.quota-expired {
+  color: var(--text-body);
+  font-size: 0.78rem;
+}
+
 .quota-cached {
   margin: 8px 0 0;
   color: var(--text-muted);
@@ -782,6 +788,60 @@ p {
 .theme-dot.is-active {
   background: var(--surface-pressed);
   color: var(--text-inverse);
+}
+
+.settings-row--switch {
+  align-items: flex-start;
+}
+
+.settings-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-note {
+  margin: 0;
+  max-width: 52ch;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.6;
+}
+
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 40px;
+  height: 22px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--radius-pill);
+  background: var(--track);
+  cursor: pointer;
+}
+
+.switch:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-body);
+}
+
+.switch[aria-checked="true"] {
+  border-color: var(--surface-pressed);
+  background: var(--surface-pressed);
+}
+
+.switch[aria-checked="true"] .switch-thumb {
+  transform: translateX(18px);
+  background: var(--text-inverse);
 }
 
 .app-dialog {

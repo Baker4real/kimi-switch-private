@@ -20,7 +20,7 @@ crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调�
 1. **改完必须验证**：Rust 走 `cargo check --workspace && cargo test --workspace`；改了 `src-ui/` 再加 `npx tsc --noEmit && npm test && npm run build`；通过后再 `cargo build --release`。
 2. **凭证安全是最高优先级**：token 只能写用户本机私有文件；网络请求只允许发往 Kimi 官方域名（`auth.kimi.com` / `api.kimi.com`）；禁止引入遥测。
 3. **手动切换永远可用**：`swap` 不依赖额度查询和网络，原子写入 + 快照回滚的逻辑不得破坏。
-4. **token 刷新必须与官方客户端协调**：只能复用官方锁协议，不得自创并行刷新机制；refresh token 是一次性轮换，被拒绝后记录指纹并停止重试。
+4. **token 刷新必须与官方客户端协调**：有官方锁协议的平台只能复用官方锁，不得自创并行刷新机制；仅在无官方锁的平台组合（当前：Windows + TS 客户端），允许经「主动续期」开关（默认关）依赖官方 100ms 重读采纳机制做查询前轮换，前提是原子写回（先账号库后 live，写序见 ADR-0002）。refresh token 是一次性轮换，被拒绝后记录指纹并停止重试。
 5. 代码注释、doc comment 用中文；用户可见输出、错误文本用简洁中文（GUI）/英文（CLI 内部标识）。
 6. 不做 git 提交、推送、打 tag，除非用户明确要求。
 

@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::error::Error;
+use crate::error::{Error, QuotaFailure};
 use crate::model::{AccountId, Quota};
 use crate::provider::Provider;
-use crate::quota_cache::{QuotaCache, ValidEntry};
+use crate::quota_cache::{quota_failure_of, QuotaCache, ValidEntry};
 use crate::quota_query::query_quota_with_retry;
 use crate::settings::{self, Quota as QuotaSettings};
 
@@ -35,8 +35,9 @@ pub enum QuotaState {
     Ready(Vec<Quota>),
     /// 复用缓存：节流命中，或失败后的陈旧回退（见 [`QuotaSnapshot::stale`]）。
     Cached(Vec<Quota>),
-    /// 无可用额度。
-    Failed(String),
+    /// 无可用额度。携带结构化失败（种类 / HTTP 状态 / 文案），展示层按 `kind` 区分
+    /// 一般查询失败与凭证过期型 401（`CredentialExpired` → 「凭证待续期」），不嗅探文案。
+    Failed(QuotaFailure),
 }
 
 /// 查询一组账号的额度快照。
@@ -167,7 +168,7 @@ fn failed(id: &AccountId, error: Error, fetched_at: DateTime<Utc>) -> QuotaSnaps
         fetched_at,
         stale: false,
         membership: None,
-        state: QuotaState::Failed(error.to_string()),
+        state: QuotaState::Failed(quota_failure_of(&error)),
     }
 }
 
@@ -190,7 +191,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
 
-    use crate::error::{Error, Result};
+    use crate::error::{Error, QuotaFailureKind, Result};
     use crate::model::{QuotaStatus, QuotaWindow};
 
     struct ScriptedProvider {
@@ -413,6 +414,58 @@ mod tests {
         assert!(snaps[0].stale);
         assert!(matches!(snaps[0].state, QuotaState::Cached(_)));
         assert_eq!(cached_quotas(&snaps[0].state)[0].used, 1);
+    }
+
+    #[tokio::test]
+    async fn credential_expired_failure_keeps_typed_kind_on_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Err(Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                )),
+            )],
+        );
+
+        let snaps = run(provider, &["alice"], &path).await;
+
+        match &snaps[0].state {
+            QuotaState::Failed(failure) => {
+                assert_eq!(failure.kind, QuotaFailureKind::CredentialExpired);
+                assert_eq!(failure.status, Some(401));
+                assert!(failure.message.contains("凭证已过期"), "{failure}");
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_backoff_preserves_credential_expired_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        // 退避窗口内直接复用失败记录：类型化 kind 必须随缓存往返不丢。
+        let mut cache = QuotaCache::default();
+        cache.record_failure(
+            "kimi",
+            "alice",
+            &Error::quota_credential_expired("凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权"),
+        );
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(Duration::ZERO, &[("alice", Ok(vec![]))]);
+        let snaps = run(provider.clone(), &["alice"], &path).await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        match &snaps[0].state {
+            QuotaState::Failed(failure) => {
+                assert_eq!(failure.kind, QuotaFailureKind::CredentialExpired);
+                assert_eq!(failure.status, Some(401));
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

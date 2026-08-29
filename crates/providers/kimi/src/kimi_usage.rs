@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
 
+use crate::kimi_files;
+
 fn base_url() -> String {
     std::env::var("KIMI_CODE_BASE_URL")
         .unwrap_or_else(|_| "https://api.kimi.com/coding/v1".into())
@@ -111,6 +113,8 @@ pub fn parse_usages(body: &str, provider: &str, id: &AccountId) -> Vec<Quota> {
 }
 
 /// active 账号查询 401 时，按官方锁协议恢复一次令牌后只重试一次。
+/// 协调恢复不可用或已放弃、且 attempted access token 已过 JWT exp 时，
+/// 该 401 归入「凭证过期型 401」（见 `classify_unrecovered_401`），其余失败原样冒出。
 pub async fn fetch_quota_with_active_recovery(
     access_token: &str,
     account: &Account,
@@ -148,12 +152,26 @@ async fn fetch_quota_with_active_recovery_at(
                 crate::oauth::recover_active_401(access_token, account).await?
             };
             let Some(fresh_access) = recovered else {
-                return Err(error);
+                return Err(classify_unrecovered_401(error, access_token));
             };
             fetch_quota_at(&fresh_access, account, api_base).await
         }
         result => result,
     }
+}
+
+/// 「凭证过期型 401」的引导文案（issue #41）：卡片用它替代裸 401，给出可行动的恢复路径。
+/// 主动续期被拒（issue #44）复用同一文案，不新造。
+pub(crate) const CREDENTIAL_EXPIRED_GUIDANCE: &str =
+    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权";
+
+/// 协调恢复不可用或已放弃后的 401 归类：attempted access token 按 JWT exp 确证已过期 →
+/// 「凭证过期型 401」（引导文案替代裸 401）；无法确证过期 → 原样返回，类别与文案不变。
+fn classify_unrecovered_401(error: Error, attempted_access_token: &str) -> Error {
+    if error.http_status() == Some(401) && kimi_files::jwt_expired(attempted_access_token) {
+        return Error::quota_credential_expired(CREDENTIAL_EXPIRED_GUIDANCE);
+    }
+    error
 }
 
 async fn fetch_quota_at(
@@ -186,6 +204,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::MockServer;
+    use kimi_switch_core::error::QuotaFailureKind;
 
     const REAL: &str = r#"{
       "usage": {"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"},
@@ -301,6 +320,188 @@ mod tests {
         assert_eq!(server.finish().len(), 2);
     }
 
+    // --- 凭证过期型 401（issue #41）：协调恢复不可用/已放弃 + JWT exp 已过期 → 引导文案 ---
+
+    #[tokio::test]
+    async fn expired_token_401_with_abandoned_recovery_is_credential_expired() {
+        let temporary = tempfile::tempdir().unwrap();
+        let credentials = crate::paths::active_cred_path(temporary.path());
+        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        // access token 的 JWT exp 早已过去；官方拒绝刷新（invalid_grant）→ 协调恢复放弃。
+        let blob = credential_blob_with_exp("OLD", "R1", 1_000_000_000);
+        let old_access = extract_json_string(&blob, "access_token");
+        std::fs::write(&credentials, &blob).unwrap();
+        let server = MockServer::start(vec![
+            ("401 Unauthorized", r#"{"error":"expired"}"#),
+            ("401 Unauthorized", r#"{"error":"invalid_grant"}"#),
+        ]);
+
+        let err = fetch_quota_with_active_recovery_at(
+            &old_access,
+            &active_account(),
+            server.base_url(),
+            temporary.path(),
+            Some((
+                server.base_url(),
+                crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
+            )),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::CredentialExpired)
+        );
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.is_authentication_failure());
+        assert!(!err.is_retryable());
+        assert!(
+            err.to_string().contains(CREDENTIAL_EXPIRED_GUIDANCE),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("HTTP 401"),
+            "引导文案应替代裸 401：{err}"
+        );
+        // 恢复被拒绝不得覆盖 live 凭证。
+        assert_eq!(std::fs::read_to_string(credentials).unwrap(), blob);
+        // 确证走过了「查询 401 → 协调恢复被拒」完整路径。
+        assert_eq!(
+            server.finish(),
+            vec!["GET /usages HTTP/1.1", "POST /api/oauth/token HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpired_token_401_with_abandoned_recovery_keeps_http_kind() {
+        let temporary = tempfile::tempdir().unwrap();
+        let credentials = crate::paths::active_cred_path(temporary.path());
+        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        // exp 在未来（2126 年）→ 不能确证过期，协调恢复放弃后维持原类别与裸 401 文案。
+        let blob = credential_blob_with_exp("OLD", "R1", 4_000_000_000);
+        let old_access = extract_json_string(&blob, "access_token");
+        std::fs::write(&credentials, &blob).unwrap();
+        let server = MockServer::start(vec![
+            ("401 Unauthorized", r#"{"error":"expired"}"#),
+            ("401 Unauthorized", r#"{"error":"invalid_grant"}"#),
+        ]);
+
+        let err = fetch_quota_with_active_recovery_at(
+            &old_access,
+            &active_account(),
+            server.base_url(),
+            temporary.path(),
+            Some((
+                server.base_url(),
+                crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
+            )),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::Http)
+        );
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.to_string().contains("HTTP 401"), "{err}");
+        assert_eq!(std::fs::read_to_string(credentials).unwrap(), blob);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    /// F4 回归：停泊账号（active=false）+ 过期 JWT + usages 401 → 维持原 Http 类别
+    /// 裸 401，不进入「凭证过期型 401」归类（归类只服务当前账号的协调恢复兜底）。
+    #[tokio::test]
+    async fn parked_account_401_keeps_http_kind_and_skips_credential_expired() {
+        let temporary = tempfile::tempdir().unwrap();
+        let credentials = crate::paths::active_cred_path(temporary.path());
+        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        // access token 的 JWT exp 早已过去；若误入归类路径会被改写成引导文案。
+        let blob = credential_blob_with_exp("OLD", "R1", 1_000_000_000);
+        let old_access = extract_json_string(&blob, "access_token");
+        std::fs::write(&credentials, &blob).unwrap();
+        let server = MockServer::start(vec![("401 Unauthorized", r#"{"error":"expired"}"#)]);
+
+        let err = fetch_quota_with_active_recovery_at(
+            &old_access,
+            &parked_account(),
+            server.base_url(),
+            temporary.path(),
+            None, // 停泊账号本就不进协调恢复；显式 None 钉住
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::Http),
+            "停泊账号 401 不得改归类：{err}"
+        );
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.to_string().contains("HTTP 401"), "维持裸 401：{err}");
+        assert!(
+            !err.to_string().contains(CREDENTIAL_EXPIRED_GUIDANCE),
+            "不得出现凭证过期引导文案：{err}"
+        );
+        // 只打了 usages 一次：未尝试协调恢复（无 refresh 请求）。
+        assert_eq!(server.finish(), vec!["GET /usages HTTP/1.1"]);
+        assert_eq!(std::fs::read_to_string(credentials).unwrap(), blob);
+    }
+
+    #[test]
+    fn classify_unrecovered_401_requires_provable_expiry() {
+        // 过期 JWT → 归入凭证过期型 401。
+        let expired = credential_blob_with_exp("OLD", "R1", 1_000_000_000);
+        let expired_token = extract_json_string(&expired, "access_token");
+        let err =
+            classify_unrecovered_401(Error::quota_http(401, "kimi usages HTTP 401"), &expired_token);
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::CredentialExpired)
+        );
+        assert!(err.to_string().contains(CREDENTIAL_EXPIRED_GUIDANCE));
+
+        // 既有测试 blob 的 JWT 无 exp → 无法确证过期，维持裸 401。
+        let no_exp = credential_blob("OLD", "R1");
+        let no_exp_token = extract_json_string(&no_exp, "access_token");
+        let err =
+            classify_unrecovered_401(Error::quota_http(401, "kimi usages HTTP 401"), &no_exp_token);
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::Http)
+        );
+        assert!(err.to_string().contains("HTTP 401"));
+    }
+
+    #[test]
+    fn classify_never_touches_non_401_failures() {
+        let expired = credential_blob_with_exp("OLD", "R1", 1_000_000_000);
+        let token = extract_json_string(&expired, "access_token");
+        let err = classify_unrecovered_401(Error::quota_http(500, "kimi usages HTTP 500"), &token);
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::Http)
+        );
+        assert_eq!(err.http_status(), Some(500));
+        let err = classify_unrecovered_401(Error::quota_network("connection refused"), &token);
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::Network)
+        );
+    }
+
+    fn credential_blob_with_exp(access: &str, refresh: &str, exp: i64) -> String {
+        // payload = {"user_id":"u-123","client_id":"c-1","exp":<exp>}
+        let jwt = format!(
+            "{}-{access}",
+            crate::test_support::jwt_with_payload(&format!(
+                r#"{{"user_id":"u-123","client_id":"c-1","exp":{exp}}}"#
+            ))
+        );
+        format!(r#"{{"access_token":"{jwt}","refresh_token":"{refresh}","expires_at":0}}"#)
+    }
+
     fn credential_blob(access: &str, refresh: &str) -> String {
         // payload = {"user_id":"u-123","client_id":"c-1"}
         let jwt = format!("header.eyJ1c2VyX2lkIjoidS0xMjMiLCJjbGllbnRfaWQiOiJjLTEifQ.sig-{access}");
@@ -316,6 +517,13 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             extra: serde_json::Map::new(),
+        }
+    }
+
+    fn parked_account() -> Account {
+        Account {
+            active: false,
+            ..active_account()
         }
     }
 

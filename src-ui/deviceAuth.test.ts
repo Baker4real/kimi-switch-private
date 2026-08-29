@@ -16,6 +16,7 @@ function sampleSnapshot(): Snapshot {
     account_count: 0,
     urgent_count: 0,
     theme: "classic",
+    proactive_renewal: false,
     message: { text: "授权成功，已添加账号 u1", tone: "ok" },
   };
 }

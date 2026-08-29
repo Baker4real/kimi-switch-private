@@ -22,6 +22,9 @@
 //! [quota]
 //! fetch_timeout_ms = 20000
 //! fetch_retries = 1
+//!
+//! [proactive_renewal]
+//! enabled = false
 //! ```
 
 use std::path::Path;
@@ -41,6 +44,7 @@ pub struct Settings {
     pub token: Token,
     pub daemon: Daemon,
     pub beta: Beta,
+    pub proactive_renewal: ProactiveRenewal,
 }
 
 /// 自动切换段：serde 接受存量 `config.toml`，运行时零消费。
@@ -107,6 +111,18 @@ pub struct Beta {
     pub usage_cache_max_age_ms: i64,
 }
 
+/// 「当前账号主动续期」段（issue #42 设置壳 + issue #44 运行时消费；ADR-0003 第 2 条）。
+///
+/// 开启后，Kimi 当前账号额度查询在 access token 临期时主动轮换 live 凭证；
+/// 消费方每次直读 config.toml（不依赖全局缓存），GUI 设置页与 CLI `config` 同源。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProactiveRenewal {
+    /// 允许在 Windows 等无官方刷新锁的平台上，为当前账号主动续期 live 凭证。
+    /// 默认关闭；开启的残余风险是窄窗口内官方会话可能要求重新登录。
+    pub enabled: bool,
+}
+
 impl Default for AutoSwap {
     fn default() -> Self {
         Self {
@@ -158,6 +174,14 @@ impl Default for Beta {
     }
 }
 
+impl Default for ProactiveRenewal {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::PROACTIVE_RENEWAL_ENABLED,
+        }
+    }
+}
+
 // ----- 全局当前值 ------------------------------------------------------------
 
 static CURRENT: OnceLock<RwLock<Arc<Settings>>> = OnceLock::new();
@@ -205,6 +229,43 @@ pub fn load_from(path: &Path) -> Result<Arc<Settings>> {
 /// 直接替换全局当前值。测试与 CLI doctor 使用。
 pub fn install(settings: Arc<Settings>) {
     *cell().write().expect("settings rwlock poisoned") = settings;
+}
+
+/// 把「当前账号主动续期」开关写入 `<config_dir>/config.toml`，返回新快照。
+///
+/// 只落盘，不改全局当前值：CLI 启动时 [`reload_from_file`] 自然读到；
+/// GUI 每次快照经 [`load_from`] 直读文件，也不依赖全局缓存。
+pub fn set_proactive_renewal_enabled(enabled: bool) -> Result<Arc<Settings>> {
+    let path = AppPaths::resolve()?.config_file();
+    upsert_proactive_renewal(&path, enabled)
+}
+
+/// 读-改-写指定配置文件里的 `proactive_renewal.enabled`。
+///
+/// - 用 toml_edit 只动一个键，保留用户手写的注释、顺序与其它字段；
+/// - 落盘前先确认成品仍是一份合法 [`Settings`]（存量文件有拼错的键时直接报错、不动盘）；
+/// - tmp + rename 原子写入，与 registry / 凭证仓库同一写序；
+/// - 文件缺失视为空文档。
+fn upsert_proactive_renewal(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(Error::Config(format!("read {}: {e}", path.display()))),
+    };
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
+    if matches!(doc.get("proactive_renewal"), Some(item) if item.as_table_like().is_none()) {
+        // 存量同名键不是表（手误，反正也过不了 Settings 解析）；整体换成新表再落键。
+        doc["proactive_renewal"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["proactive_renewal"]["enabled"] = toml_edit::value(enabled);
+    let rendered = doc.to_string();
+    let parsed: Settings = toml::from_str(&rendered)?;
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, rendered)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(Arc::new(parsed))
 }
 
 #[cfg(test)]
@@ -288,5 +349,90 @@ usage_cache_max_age_ms = 4000
         assert_eq!(s.daemon.idle_poll_interval_ms, 3000);
         assert_eq!(s.beta.usage_cache_max_age_ms, 4000);
         assert_eq!(s.quota.fetch_retries, defaults::QUOTA_FETCH_RETRIES);
+    }
+
+    /// issue #42 验收 1：开关默认关闭（缺文件与空段都为 false）。
+    #[test]
+    fn proactive_renewal_defaults_off() {
+        assert!(!Settings::default().proactive_renewal.enabled);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert!(!s.proactive_renewal.enabled);
+    }
+
+    #[test]
+    fn proactive_renewal_section_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[proactive_renewal]\nenabled = true\n").unwrap();
+        let s = load_from(&path).unwrap();
+        assert!(s.proactive_renewal.enabled);
+        assert_eq!(s.quota.fetch_timeout_ms, defaults::QUOTA_FETCH_TIMEOUT_MS);
+    }
+
+    /// issue #42 验收 2：写回后重读得到同一值（持久化）。
+    #[test]
+    fn upsert_creates_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let s = upsert_proactive_renewal(&path, true).unwrap();
+        assert!(s.proactive_renewal.enabled);
+        let reread = load_from(&path).unwrap();
+        assert!(reread.proactive_renewal.enabled);
+        assert_eq!(reread.as_ref(), s.as_ref());
+    }
+
+    /// 写回只动一个键：手写注释、键顺序与其它字段原样保留。
+    #[test]
+    fn upsert_preserves_comments_and_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# 我的调优\n[auto_swap]\nthreshold = 0.5 # 别动\n",
+        )
+        .unwrap();
+        upsert_proactive_renewal(&path, true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# 我的调优"), "{raw}");
+        assert!(raw.contains("threshold = 0.5 # 别动"), "{raw}");
+        assert!(raw.contains("enabled = true"), "{raw}");
+        let s = load_from(&path).unwrap();
+        assert!(s.proactive_renewal.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+    }
+
+    #[test]
+    fn upsert_flips_existing_key_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[proactive_renewal]\n# 风险自负\nenabled = true\n").unwrap();
+        upsert_proactive_renewal(&path, false).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# 风险自负"), "{raw}");
+        assert!(raw.contains("enabled = false"), "{raw}");
+        assert!(!load_from(&path).unwrap().proactive_renewal.enabled);
+    }
+
+    /// 存量同名键不是表：整体换成新表，最终能按 Settings 解析。
+    #[test]
+    fn upsert_repairs_non_table_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "proactive_renewal = 1\n").unwrap();
+        upsert_proactive_renewal(&path, true).unwrap();
+        assert!(load_from(&path).unwrap().proactive_renewal.enabled);
+    }
+
+    /// 成品不再是合法 Settings（存量文件有拼错的键）时报错，且不动盘。
+    #[test]
+    fn upsert_rejects_invalid_settings_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "[auto_swap]\nfoo = 1\n";
+        std::fs::write(&path, original).unwrap();
+        let err = upsert_proactive_renewal(&path, true).unwrap_err().to_string();
+        assert!(err.contains("foo"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 }

@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
     Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
-    KeyringStore, Provider, Quota, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
+    KeyringStore, Provider, Quota, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow,
+    RemovedAccounts,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::KimiProvider;
@@ -57,6 +58,24 @@ impl Backend {
         Ok(())
     }
 
+    /// 直读 config.toml 里的「当前账号主动续期」开关；文件缺失/损坏都回落默认关。
+    pub fn load_proactive_renewal() -> bool {
+        AppPaths::resolve()
+            .and_then(|p| {
+                Ok(kimi_switch_core::settings::load_from(&p.config_file())?
+                    .proactive_renewal
+                    .enabled)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 持久化开关到 config.toml（保注释原子写），返回落盘后的生效值。
+    pub fn save_proactive_renewal(enabled: bool) -> Result<bool> {
+        let settings = kimi_switch_core::settings::set_proactive_renewal_enabled(enabled)
+            .context("写入设置失败")?;
+        Ok(settings.proactive_renewal.enabled)
+    }
+
     /// 扫本地 Kimi Code；当前激活账号没记录过就入库（已删除的有墓碑，跳过）。
     pub fn sync_local_active(&self) {
         let Ok(paths) = AppPaths::resolve() else {
@@ -86,6 +105,7 @@ impl Backend {
             current_label,
             accounts,
             theme: Self::load_theme(),
+            proactive_renewal: Self::load_proactive_renewal(),
             message,
         }
     }
@@ -315,9 +335,13 @@ where
 
 pub(crate) fn account_row(account: &Account, snapshot: &QuotaSnapshot) -> AccountRow {
     let membership = snapshot.membership.as_deref().map(prettify_membership);
-    let (quotas, error) = match &snapshot.state {
-        QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => (quota_views(quotas), None),
-        QuotaState::Failed(message) => (Vec::new(), Some(compact_error(message))),
+    let (quotas, error, credential_expired) = match &snapshot.state {
+        QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => (quota_views(quotas), None, false),
+        QuotaState::Failed(failure) => (
+            Vec::new(),
+            Some(compact_error(&failure.message)),
+            failure.kind == QuotaFailureKind::CredentialExpired,
+        ),
     };
     AccountRow {
         id: account.id.0.clone(),
@@ -326,6 +350,7 @@ pub(crate) fn account_row(account: &Account, snapshot: &QuotaSnapshot) -> Accoun
         membership,
         quotas,
         error,
+        credential_expired,
         cached_at: snapshot
             .stale
             .then(|| format_cached_at(snapshot.fetched_at)),

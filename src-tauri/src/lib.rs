@@ -81,6 +81,12 @@ fn set_theme(theme: String) -> Result<ThemeId, CommandError> {
     Ok(theme)
 }
 
+/// 「当前账号主动续期」开关（issue #42）：写 config.toml，返回落盘后的生效值。
+#[tauri::command]
+fn set_proactive_renewal(enabled: bool) -> Result<bool, CommandError> {
+    Backend::save_proactive_renewal(enabled).map_err(map_err)
+}
+
 pub fn run() {
     let backend = match Backend::new() {
         Ok(backend) => {
@@ -121,6 +127,7 @@ pub fn run() {
             cancel_device_auth,
             open_url,
             set_theme,
+            set_proactive_renewal,
         ])
         .run(tauri::generate_context!())
         .expect("error while running kimi-switch");

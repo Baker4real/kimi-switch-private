@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use kimi_switch_core::error::Result;
+use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::{Account, Quota};
 
 /// 从凭证 blob 解析出的最小元数据。所有可选字段最终可能进 registry.toml，
@@ -52,13 +52,55 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
     /// 从 blob 抽最小元数据。解析失败返回 `Default`（透传策略，不 panic）。
     fn parse_metadata(&self, blob: &str) -> BlobMetadata;
 
-    /// 刷新一个 blob，返回轮换后的完整 blob。仅对 parked 账号调用。
+    /// 刷新一个 blob，返回轮换后的完整 blob。对 parked 账号按需调用；
+    /// 当前账号仅在主动续期判定通过时调用（见 `proactive_renewal_wanted`）。
     async fn refresh(&self, blob: &str) -> Result<RefreshOutcome>;
-    /// 查询额度。`access_token` 由引擎保证是新鲜的（parked 已按需刷新）。
+    /// 查询额度。`access_token` 由引擎保证是新鲜的（parked 已按需刷新；
+    /// 当前账号开启主动续期时已按需轮换）。
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>>;
 
     /// 可选：在 store/live 都拿不到时，从 provider 私有 legacy 布局恢复 blob。默认无。
     fn recover_legacy(&self, _home: &Path, _account: &Account) -> Option<String> {
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // 当前账号主动续期（issue #44，ADR-0003 第 2 条）。
+    // 四个钩子的默认实现都是「不主动续期」：不提供该能力的 runtime 与
+    // 有官方锁协议的平台行为完全不变（维持官方锁协调）。机制（现读 live /
+    // 轮换 / 先库后 live 写回）在引擎里，runtime 只回答差异点。
+    // -----------------------------------------------------------------------
+
+    /// 查询前是否应主动轮换这份当前账号 blob。
+    ///
+    /// 实现须一次说清三件事：设置开关（issue #42）已开启、本平台组合**确定无**
+    /// 官方刷新锁协议（fail-closed：探测失败/不可解析/版本不识一律不放行）、
+    /// access token 已过期或剩余不足轮换窗口。默认 false。
+    async fn proactive_renewal_wanted(&self, blob: &str) -> bool {
+        let _ = blob;
+        false
+    }
+
+    /// DeadToken 纪律检查：该 blob 的 refresh token 是否已被官方拒绝在案
+    /// （指纹命中）。在案则停止重试。默认 false。
+    fn proactive_renewal_blocked(&self, home: &Path, blob: &str) -> bool {
+        let _ = (home, blob);
+        false
+    }
+
+    /// DeadToken 纪律处置：记录被拒 refresh token 的指纹（幂等）并停止重试；
+    /// 本地凭证不删除、不墓碑化。返回本次查询应呈现的错误——「凭证过期型 401」
+    /// 引导文案（issue #41）。
+    fn proactive_renewal_reject(&self, home: &Path, blob: &str) -> Result<Error> {
+        let _ = (home, blob);
+        Ok(Error::quota_credential_expired(
+            "proactive renewal rejected by the official client; re-authorize the account",
+        ))
+    }
+
+    /// 轮换成功收尾：refresh token 已轮换，清掉旧的拒止指纹。默认 no-op。
+    fn proactive_renewal_rotated(&self, home: &Path) -> Result<()> {
+        let _ = home;
+        Ok(())
     }
 }

@@ -12,6 +12,8 @@ export interface AccountRow {
   membership: string | null;
   quotas: QuotaView[];
   error: string | null;
+  /** 凭证待续期：凭证过期型 401。此时 error 是引导文案，不计告急、不按错误红渲染。 */
+  credential_expired: boolean;
   cached_at: string | null;
 }
 
@@ -26,6 +28,8 @@ export interface Snapshot {
   account_count: number;
   urgent_count: number;
   theme: ThemeId;
+  /** 「当前账号主动续期」开关（issue #42）：与 CLI 同源，来自 config.toml。 */
+  proactive_renewal: boolean;
   message: UiMessage | null;
 }
 
@@ -88,6 +92,8 @@ export function createApi(invokeFn: InvokeFn) {
     cancelDeviceAuth: () => call<void>("cancel_device_auth"),
     openUrl: (url: string) => call<void>("open_url", { url }),
     setTheme: (theme: ThemeId) => call<ThemeId>("set_theme", { theme }),
+    setProactiveRenewal: (enabled: boolean) =>
+      call<boolean>("set_proactive_renewal", { enabled }),
   };
 }
 

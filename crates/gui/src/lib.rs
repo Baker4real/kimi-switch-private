@@ -44,8 +44,10 @@ mod tests {
         assert_eq!(serde_json::to_value(QuotaTone::Full).unwrap(), "full");
     }
 
+    /// 告急新语义（issue #43）：只有用量窗口真实达到 ≥80% 才告急；
+    /// 任一额度查询失败（含凭证过期型 401）都不告急。
     #[test]
-    fn urgent_when_used_at_least_80_percent_or_error() {
+    fn urgent_only_when_usage_hits_threshold() {
         let quiet = AccountRow {
             id: "a".into(),
             label: "a".into(),
@@ -59,6 +61,7 @@ mod tests {
                 tone: QuotaTone::Warn,
             }],
             error: None,
+            credential_expired: false,
             cached_at: None,
         };
         assert!(!quiet.is_urgent());
@@ -75,12 +78,60 @@ mod tests {
         };
         assert!(hot.is_urgent());
 
+        // 一般查询失败：不告急。
         let failed = AccountRow {
             quotas: vec![],
             error: Some("额度查询失败".into()),
+            ..quiet.clone()
+        };
+        assert!(!failed.is_urgent());
+
+        // 凭证过期型 401 → 凭证待续期：同样不告急。
+        let pending = AccountRow {
+            quotas: vec![],
+            error: Some("凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权".into()),
+            credential_expired: true,
             ..quiet
         };
-        assert!(failed.is_urgent());
+        assert!(!pending.is_urgent());
+    }
+
+    /// 凭证过期型 401 经类型化 kind 映射为「凭证待续期」行，不靠嗅探文案（issue #43）。
+    #[test]
+    fn credential_expired_maps_to_pending_renewal_row() {
+        let account = sample_account("alice");
+        let snap = QuotaSnapshot {
+            account_id: account.id.clone(),
+            fetched_at: Utc::now(),
+            stale: false,
+            membership: None,
+            state: QuotaState::Failed(kimi_switch_core::QuotaFailure::credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            )),
+        };
+
+        let row = account_row(&account, &snap);
+
+        assert!(row.credential_expired);
+        assert_eq!(
+            row.error.as_deref(),
+            Some("凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权")
+        );
+        assert!(row.quotas.is_empty());
+        assert!(!row.is_urgent());
+
+        // 一般失败（如 429）只是查询失败，不进入凭证待续期。
+        let generic = QuotaSnapshot {
+            state: QuotaState::Failed(kimi_switch_core::QuotaFailure::http(
+                429,
+                "429 rate limited",
+            )),
+            ..snap
+        };
+        let row = account_row(&account, &generic);
+        assert!(!row.credential_expired);
+        assert_eq!(row.error.as_deref(), Some("429 rate limited"));
+        assert!(!row.is_urgent());
     }
 
     #[test]

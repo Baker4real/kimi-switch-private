@@ -4,6 +4,7 @@ import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { escapeHtml } from "./escape";
 import { accountDisplayName, parseAliasInput } from "./labels";
 import { quotaHtml } from "./quota";
+import { renewalSwitchView } from "./renewal";
 import { createAppStore } from "./store";
 import {
   parseMirroredTheme,
@@ -72,6 +73,14 @@ function applyMirroredTheme(): void {
   }
 }
 
+function paintProactiveRenewal(enabled: boolean): void {
+  const view = renewalSwitchView(enabled);
+  required<HTMLButtonElement>("renewal-toggle").setAttribute(
+    "aria-checked",
+    String(view.checked),
+  );
+}
+
 function showToast(text: string, isError = false): void {
   const toast = required<HTMLDivElement>("toast");
   toast.textContent = text;
@@ -114,7 +123,7 @@ function paintAccountCards(next: Snapshot): void {
           <span class="profile-title">${escapeHtml(row.label)}${row.active ? " · 当前" : ""}</span>
           <span class="profile-plan">${escapeHtml(row.membership ?? "")}</span>
         </div>
-        <div class="profile-quota-stack">${quotaHtml(row.quotas, row.error, row.cached_at)}</div>
+        <div class="profile-quota-stack">${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired)}</div>
         <div class="profile-card-actions">${cardActionButtons(row, busy)}</div>
       </article>`;
     })
@@ -125,11 +134,12 @@ function paintSnapshot(next: Snapshot): void {
   store.setSnapshot(next);
   setOverviewLoadError(false);
   applyTheme(next.theme);
+  paintProactiveRenewal(next.proactive_renewal);
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.label ?? "--";
   required<HTMLParagraphElement>("current-plan").textContent = current?.membership ?? "--";
   required<HTMLDivElement>("current-quota-panel").innerHTML = current
-    ? quotaHtml(current.quotas, current.error, current.cached_at)
+    ? quotaHtml(current.quotas, current.error, current.cached_at, current.credential_expired)
     : `<p class="quota-reset">暂无当前账号，请先切换。</p>`;
   required<HTMLElement>("metric-current").textContent = next.current_label;
   required<HTMLElement>("metric-total").textContent = String(next.account_count);
@@ -511,6 +521,17 @@ async function init(): Promise<void> {
   required<HTMLButtonElement>("theme-jade-night").addEventListener("click", async () => {
     const theme = await api.setTheme("jade-night");
     applyTheme(theme);
+  });
+  required<HTMLButtonElement>("renewal-toggle").addEventListener("click", async () => {
+    const toggle = required<HTMLButtonElement>("renewal-toggle");
+    const next = toggle.getAttribute("aria-checked") !== "true";
+    try {
+      const saved = await api.setProactiveRenewal(next);
+      paintProactiveRenewal(saved);
+      showToast(renewalSwitchView(saved).toast);
+    } catch (error) {
+      showToast(commandError(error).message, true);
+    }
   });
 
   wireDialogs();

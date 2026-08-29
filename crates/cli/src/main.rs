@@ -7,6 +7,8 @@
 //! - `kimi-switch swap <id|N>`  — 切换激活账号。原子写 + 快照回滚，不依赖网络/quota。
 //!   无参数时只打印编号列表，不做切换。
 //! - `kimi-switch rm <id|N>`    — 删除账号（registry + 凭证仓库 + 墓碑）。
+//! - `kimi-switch config`       — 打印生效配置（含 `proactive_renewal.enabled`，只读）。
+//!   与 GUI 设置页同源：都是 `<config_dir>/config.toml`。
 //!
 //! `<id>` 是账号 id（Kimi user_id）、label 或 `kimi/<id>`；`<N>` 是默认入口
 //! 显示的编号（1 起）。
@@ -58,6 +60,9 @@ enum Cmd {
         /// Account index (e.g. `1`), id, label, or `kimi/<id>`.
         id: String,
     },
+
+    /// Print the effective settings (read-only), as loaded from config.toml.
+    Config,
 }
 
 /// 进程级共享上下文：明文文件凭证仓库 + registry + Kimi provider。
@@ -135,6 +140,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Login { provider }) => login(&ctx, &provider),
         Some(Cmd::Swap { id }) => swap(&ctx, id.as_deref()).await,
         Some(Cmd::Rm { id }) => rm(&ctx, &id).await,
+        Some(Cmd::Config) => config(),
     }
 }
 
@@ -319,4 +325,31 @@ async fn rm(ctx: &AppContext, id_input: &str) -> Result<()> {
     )?;
     println!("removed kimi/{}", acc.id);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
+
+/// 打印生效配置（只读）。GUI 设置页与本命令读写同一 `config.toml`。
+fn config() -> Result<()> {
+    print!("{}", render_config()?);
+    Ok(())
+}
+
+/// 构造生效配置的 TOML 文本（与打印分离，便于测试断言内容）。
+fn render_config() -> Result<String> {
+    let current = settings::current();
+    toml::to_string_pretty(current.as_ref()).context("render effective settings")
+}
+
+#[cfg(test)]
+mod tests {
+    /// `config` 输出必须含主动续期段与开关键（issue #42 设置壳的 CLI 展示面）。
+    #[test]
+    fn config_output_contains_proactive_renewal_section() {
+        let text = super::render_config().unwrap();
+        assert!(text.contains("proactive_renewal"), "{text}");
+        assert!(text.contains("enabled"), "{text}");
+    }
 }

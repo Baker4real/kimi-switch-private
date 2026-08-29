@@ -15,17 +15,17 @@ function quota(partial: Partial<QuotaView> = {}): QuotaView {
 
 describe("quotaHtml", () => {
   it("查询失败时保持原文案且不含进度条", () => {
-    const html = quotaHtml([], `失败 <x>`, null);
+    const html = quotaHtml([], `失败 <x>`, null, false);
     expect(html).toBe(`<p class="quota-error">额度查询失败: 失败 &lt;x&gt;</p>`);
     expect(html).not.toContain("progressbar");
   });
 
   it("无额度窗口时输出 n/a", () => {
-    expect(quotaHtml([], null, null)).toBe(`<p class="quota-reset">额度: n/a</p>`);
+    expect(quotaHtml([], null, null, false)).toBe(`<p class="quota-reset">额度: n/a</p>`);
   });
 
   it("额度条带 progressbar 语义与窗口名、用量文字", () => {
-    const html = quotaHtml([quota()], null, null);
+    const html = quotaHtml([quota()], null, null, false);
     expect(html).toContain(`role="progressbar"`);
     expect(html).toContain(`aria-label="5 小时"`);
     expect(html).toContain(`aria-valuemin="0"`);
@@ -38,7 +38,7 @@ describe("quotaHtml", () => {
   });
 
   it("ratio 为空时不输出 aria-valuenow，条宽按 0", () => {
-    const html = quotaHtml([quota({ ratio: null, text: "n/a", reset: null })], null, null);
+    const html = quotaHtml([quota({ ratio: null, text: "n/a", reset: null })], null, null, false);
     expect(html).not.toContain("aria-valuenow");
     expect(html).toContain(`aria-valuetext="n/a"`);
     expect(html).toContain(`style="width:0%"`);
@@ -46,7 +46,7 @@ describe("quotaHtml", () => {
 
   it("四档压力 class 与 DTO tone 一致", () => {
     for (const tone of ["ok", "warn", "high", "full"] as const) {
-      expect(quotaHtml([quota({ tone })], null, null)).toContain(`quota-fill--${tone}`);
+      expect(quotaHtml([quota({ tone })], null, null, false)).toContain(`quota-fill--${tone}`);
     }
   });
 
@@ -55,6 +55,7 @@ describe("quotaHtml", () => {
       [quota({ window: `5"h`, text: `a<b>`, reset: `c&d` })],
       null,
       null,
+      false,
     );
     expect(html).toContain(`aria-label="5&quot;h"`);
     expect(html).toContain(`aria-valuetext="a&lt;b&gt;"`);
@@ -64,8 +65,35 @@ describe("quotaHtml", () => {
   });
 
   it("有 cached_at 时追加灰字时间", () => {
-    const html = quotaHtml([], "超时", "缓存于 12:00");
+    const html = quotaHtml([], "超时", "缓存于 12:00", false);
     expect(html).toContain(`额度查询失败: 超时`);
     expect(html).toContain(`<p class="quota-cached">缓存于 12:00</p>`);
+  });
+
+  it("凭证待续期用独立状态行而非错误红", () => {
+    const html = quotaHtml(
+      [],
+      "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+      null,
+      true,
+    );
+    expect(html).toBe(
+      `<p class="quota-expired">凭证待续期 · 凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权</p>`,
+    );
+    expect(html).not.toContain("quota-error");
+    expect(html).not.toContain("额度查询失败");
+    expect(html).not.toContain("progressbar");
+  });
+
+  it("凭证待续期文案同样转义", () => {
+    const html = quotaHtml([], `过期 <x>`, null, true);
+    expect(html).toContain(`凭证待续期 · 过期 &lt;x&gt;`);
+    expect(html).not.toContain(`<x>`);
+  });
+
+  it("credential_expired 为 false 时仍是查询失败样式", () => {
+    const html = quotaHtml([], "凭证已过期", null, false);
+    expect(html).toContain(`quota-error`);
+    expect(html).toContain(`额度查询失败: 凭证已过期`);
   });
 });

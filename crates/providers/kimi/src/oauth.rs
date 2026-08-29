@@ -31,6 +31,21 @@ pub(crate) enum RefreshLockProtocol {
     TypeScriptDirectory,
 }
 
+/// 官方刷新锁探测的三态结论（F1）。旧缓存值 `Option<RefreshLockProtocol>` 的 None
+/// 同时混着「确定无锁」与「探测失败/不可解析/超时」，主动续期门必须区分两者：
+/// 只有**确定无锁**才允许不经官方锁自创轮换；探测不确定一律 fail-closed。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LockProbeOutcome {
+    /// 确定存在可用的官方刷新锁协议（协调恢复走它）。
+    Locked(RefreshLockProtocol),
+    /// 确定无官方刷新锁：Windows + TS 0.x（官方 win32 直接放弃锁，见 ADR-0003）、
+    /// Python 1.x 早于 1.31（协调锁尚未引入），或用户用 KIMI_DISABLE_OAUTH_LOCK
+    /// 显式关闭了目录锁。
+    NoLock,
+    /// 探测失败、输出不可解析或主版本太新（2.x+）不识：不能确证无锁。
+    Unknown,
+}
+
 /// 解析 OAuth host：`KIMI_CODE_OAUTH_HOST` > `https://auth.kimi.com`。
 pub(crate) fn oauth_host() -> String {
     std::env::var("KIMI_CODE_OAUTH_HOST")
@@ -149,34 +164,73 @@ pub async fn recover_active_401(
 }
 
 async fn installed_kimi_refresh_lock_protocol() -> Option<RefreshLockProtocol> {
-    // `kimi --version` 实测可到数秒；同一进程内协议不会变，缓存避免每次 401 自愈都再付一次代价，
-    // 也降低被外层 quota fetch timeout 中途取消的概率。
-    static CACHED: OnceLock<Option<RefreshLockProtocol>> = OnceLock::new();
+    match installed_kimi_lock_probe().await {
+        LockProbeOutcome::Locked(protocol) => Some(protocol),
+        // 协调恢复的 fail-safe 语义逐点不变：确定无锁与探测不确定都不自愈。
+        LockProbeOutcome::NoLock | LockProbeOutcome::Unknown => None,
+    }
+}
+
+/// 探测本机 Kimi CLI 的刷新锁协议（三态，进程内缓存一次）。
+/// `kimi --version` 实测可到数秒；同一进程内协议不会变，缓存避免每次 401 自愈都再付一次代价，
+/// 也降低被外层 quota fetch timeout 中途取消的概率。
+async fn installed_kimi_lock_probe() -> LockProbeOutcome {
+    static CACHED: OnceLock<LockProbeOutcome> = OnceLock::new();
     if let Some(cached) = CACHED.get() {
         return *cached;
     }
     let probed = tokio::task::spawn_blocking(|| {
-        Command::new("kimi")
+        let Some(output) = Command::new("kimi")
             .arg("--version")
             .output()
             .ok()
             .filter(|output| output.status.success())
-            .and_then(|output| {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                lock_protocol_from_version_output(&stdout)
-                    .or_else(|| lock_protocol_from_version_output(&stderr))
-            })
-            .and_then(|protocol| {
-                protocol_with_lock_setting(
-                    protocol,
-                    std::env::var("KIMI_DISABLE_OAUTH_LOCK").as_deref() == Ok("1"),
-                )
-            })
+        else {
+            // 进程拉不起 / 非零退出：探测失败，不能确证无锁（fail-closed）。
+            return LockProbeOutcome::Unknown;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 找锁这一段与原实现逐点一致：stdout → stderr，找到后再过禁用开关。
+        let found = lock_protocol_from_version_output(&stdout)
+            .or_else(|| lock_protocol_from_version_output(&stderr));
+        let lock_disabled = std::env::var("KIMI_DISABLE_OAUTH_LOCK").as_deref() == Ok("1");
+        match found {
+            Some(protocol) => match protocol_with_lock_setting(protocol, lock_disabled) {
+                Some(protocol) => LockProbeOutcome::Locked(protocol),
+                // 用户用 KIMI_DISABLE_OAUTH_LOCK 显式关闭目录锁：确定无锁可用。
+                None => LockProbeOutcome::NoLock,
+            },
+            // 没有任何一路给出锁协议：区分「读到确定无锁的版本组合」与
+            // 「读不出 / 版本不识」（后者 fail-closed，不臆断无锁）。
+            None if provably_lock_free(&stdout) || provably_lock_free(&stderr) => {
+                LockProbeOutcome::NoLock
+            }
+            None => LockProbeOutcome::Unknown,
+        }
     })
     .await
-    .unwrap_or(None);
+    .unwrap_or(LockProbeOutcome::Unknown);
     *CACHED.get_or_init(|| probed)
+}
+
+/// 这路版本输出是否**确证**无官方刷新锁：能解析出版本，且该版本/平台组合确定无锁——
+/// Windows 上 TS 0.x（官方 `process.platform === "win32"` 直接放弃锁，见 ADR-0003）、
+/// Python 1.x 早于 1.31（协调锁尚未引入）。输出不可解析、旧 Python 0.x 前缀噪音、
+/// 2.x+ 主版本不识 → false（不确定；主动续期门据此 fail-closed，不放行）。
+fn provably_lock_free(output: &str) -> bool {
+    let trimmed = output.trim();
+    let Some(version) = parse_version(trimmed) else {
+        return false;
+    };
+    if version.0 == 0
+        && (trimmed.split_whitespace().count() != 1 || trimmed != format_version(version))
+    {
+        return false;
+    }
+    // `lock_protocol_for_version` 为 None 的版本里，只有 0.x（仅 Windows）与
+    // 1.x < 1.31 是确定无锁；2.x+ 主版本不识 → 不确定。
+    version.0 <= 1 && lock_protocol_for_version(version).is_none()
 }
 
 fn protocol_with_lock_setting(
@@ -621,6 +675,91 @@ fn atomic_private_write(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 当前账号主动续期（issue #44，ADR-0003 第 2 条）：无官方锁平台查询前轮换
+// ---------------------------------------------------------------------------
+
+/// 主动续期判定（薄壳，只做 IO；纯判定在 [`proactive_renewal_wanted_decision`]）：
+/// 开关（issue #42）开启 + 本平台组合**确定无**官方刷新锁协议
+/// + access token 已过期或剩余不足 60 秒。任一不满足都不碰 live；
+/// 有官方锁的平台维持官方锁协调（`recover_active_401`）不变。
+/// 锁探测 fail-closed（F1）：探测失败/不可解析/版本不识一律视为可能有锁，不放行。
+pub(crate) async fn proactive_renewal_wanted(blob: &str) -> bool {
+    // 开关关闭时不付探测代价（`kimi --version` 实测可达数秒）。
+    if !proactive_renewal_setting_enabled() {
+        return false;
+    }
+    let lock_probe = installed_kimi_lock_probe().await;
+    let exp = extract_access_token(blob)
+        .as_deref()
+        .and_then(kimi_files::jwt_exp_claim);
+    proactive_renewal_wanted_decision(true, lock_probe, exp, chrono::Utc::now().timestamp())
+}
+
+/// 主动续期门的纯判定（开关 × 锁探测三态 × exp 临期）：无 IO、无 `OnceLock`，可重复测试。
+/// fail-closed：只有「确定无锁」([`LockProbeOutcome::NoLock`]) 才放行；`Unknown`
+/// （探测失败/不可解析/版本不识）与 `Locked` 一样不放行。exp 语义与
+/// [`kimi_files::exp_needs_renewal`] 完全一致：已过期或剩余不足 60 秒；None → false。
+pub(crate) fn proactive_renewal_wanted_decision(
+    setting_on: bool,
+    lock_probe: LockProbeOutcome,
+    exp: Option<i64>,
+    now: i64,
+) -> bool {
+    setting_on && lock_probe == LockProbeOutcome::NoLock && kimi_files::exp_needs_renewal(exp, now)
+}
+
+/// 开关直读 config.toml：GUI 进程从不 reload 全局设置（issue #42 提示），
+/// 消费方统一现读文件。文件缺失/解析失败一律视为关闭（安全方向）。
+fn proactive_renewal_setting_enabled() -> bool {
+    let Ok(paths) = kimi_switch_core::paths::AppPaths::resolve() else {
+        return false;
+    };
+    match kimi_switch_core::settings::load_from(&paths.config_file()) {
+        Ok(settings) => settings.proactive_renewal.enabled,
+        Err(error) => {
+            tracing::warn!(err = %error, "proactive renewal setting unreadable; treating as disabled");
+            false
+        }
+    }
+}
+
+/// DeadToken 纪律检查：blob 的 refresh token 指纹已在案（曾被官方 invalid_grant
+/// 拒绝）→ 停止重试。与协调恢复路径共用同一指纹文件与哈希。
+pub(crate) fn proactive_renewal_blocked(home: &Path, blob: &str) -> bool {
+    let Some(refresh) = extract_refresh_token(blob) else {
+        return false;
+    };
+    let Ok(recorded) = std::fs::read_to_string(paths::dead_refresh_fingerprint_path(home)) else {
+        return false;
+    };
+    recorded.trim() == refresh_fingerprint(&refresh)
+}
+
+/// DeadToken 纪律处置：记录被拒 refresh token 的指纹（幂等）并停止重试；
+/// 本地凭证不删除、不墓碑化。返回本次查询应呈现的「凭证过期型 401」引导错误
+/// （文案复用 issue #41，不新造）。
+pub(crate) fn proactive_renewal_reject(home: &Path, blob: &str) -> Result<Error> {
+    if let Some(refresh) = extract_refresh_token(blob) {
+        atomic_private_write(
+            &paths::dead_refresh_fingerprint_path(home),
+            &refresh_fingerprint(&refresh),
+        )?;
+    }
+    Ok(Error::quota_credential_expired(
+        crate::kimi_usage::CREDENTIAL_EXPIRED_GUIDANCE,
+    ))
+}
+
+/// 轮换成功收尾：refresh 已轮换，旧拒止指纹作废清除（与协调恢复写回路径同款）。
+pub(crate) fn proactive_renewal_rotated(home: &Path) -> Result<()> {
+    match std::fs::remove_file(paths::dead_refresh_fingerprint_path(home)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn refresh_fingerprint(refresh_token: &str) -> String {
     format!("{:x}", Sha256::digest(refresh_token.as_bytes()))
 }
@@ -660,6 +799,46 @@ mod tests {
         }
         #[cfg(windows)]
         assert_eq!(lock_protocol_for_version((0, 28, 1)), None);
+    }
+
+    /// F1：探测结论必须区分「确定无锁」与「不确定」——只有前者允许主动续期放行。
+    #[test]
+    fn provably_lock_free_distinguishes_determined_from_unknown() {
+        // 输出不可解析 / 旧 Python 0.x 前缀噪音 → 不确定（绝不许当成无锁放行）。
+        assert!(!provably_lock_free("garbage"));
+        assert!(!provably_lock_free("kimi-cli 0.28.1"));
+        // 2.x+ 主版本不识 → 不确定（fail-closed，不臆断无锁）。
+        assert!(!provably_lock_free("2.0.0"));
+        // Python 1.x 早于 1.31（协调锁尚未引入）→ 确定无锁。
+        assert!(provably_lock_free("kimi 1.30.9"));
+        // TS 0.x：仅 Windows 确定无锁（ADR-0003）；Unix 有 proper-lockfile 目录锁。
+        #[cfg(windows)]
+        assert!(provably_lock_free("0.28.1"));
+        #[cfg(not(windows))]
+        assert!(!provably_lock_free("0.28.1"));
+    }
+
+    /// F1/F2：续期门纯判定钉住全部分支（无 IO、无 OnceLock，进程内可重复测）。
+    #[test]
+    fn proactive_renewal_wanted_decision_pins_all_branches() {
+        let wanted = proactive_renewal_wanted_decision;
+        let no_lock = LockProbeOutcome::NoLock;
+        let unknown = LockProbeOutcome::Unknown;
+        let locked = LockProbeOutcome::Locked(RefreshLockProtocol::PythonFile);
+        // 开关关 → false（其余条件再满足也不放行）。
+        assert!(!wanted(false, no_lock, Some(1000), 2000));
+        // 确定有锁 → false（红线方向：有锁平台走官方锁协调，不自创并行刷新）。
+        assert!(!wanted(true, locked, Some(1000), 2000));
+        // 探测不确定 → false（F1 fail-closed：探测失败/不可解析/版本不识都不放行）。
+        assert!(!wanted(true, unknown, Some(1000), 2000));
+        // 开关开 + 确定无锁 + 已过期（now >= exp）→ true。
+        assert!(wanted(true, no_lock, Some(1000), 2000));
+        // 剩余不足 60 秒 → true。
+        assert!(wanted(true, no_lock, Some(2059), 2000));
+        // 恰好剩 60 秒 → false（沿用 `jwt_needs_renewal` 既有边界：不足 60 秒才轮换）。
+        assert!(!wanted(true, no_lock, Some(2060), 2000));
+        // exp 无法确证（None）→ false：不能确证临期就不消耗一次性 refresh token。
+        assert!(!wanted(true, no_lock, None, 2000));
     }
 
     #[cfg(not(windows))]
@@ -964,5 +1143,47 @@ mod tests {
             last_used_at: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    /// 主动续期的 DeadToken 纪律（issue #44）：与协调恢复共用同一指纹文件与哈希，
+    /// 拒绝后记录在案 → 停止重试 → 成功轮换后清除。全平台可跑（不触碰锁）。
+    #[test]
+    fn proactive_renewal_reject_records_fingerprint_and_blocks_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let blob = r#"{"access_token":"a","refresh_token":"R1"}"#;
+
+        assert!(!proactive_renewal_blocked(home, blob));
+        let err = proactive_renewal_reject(home, blob).unwrap();
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(kimi_switch_core::error::QuotaFailureKind::CredentialExpired)
+        );
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.is_authentication_failure());
+        assert!(!err.is_retryable());
+        assert!(
+            err.to_string()
+                .contains(crate::kimi_usage::CREDENTIAL_EXPIRED_GUIDANCE),
+            "复用 #41 引导文案，不新造：{err}"
+        );
+        let recorded =
+            std::fs::read_to_string(paths::dead_refresh_fingerprint_path(home)).unwrap();
+        assert_eq!(recorded, refresh_fingerprint("R1"));
+        assert!(!recorded.contains("R1"), "指纹不得含 token 原文");
+        assert!(proactive_renewal_blocked(home, blob), "指纹在案 → 停止重试");
+        // 其他 refresh token 不在案。
+        assert!(!proactive_renewal_blocked(
+            home,
+            r#"{"access_token":"a","refresh_token":"R2"}"#
+        ));
+        // 轮换成功收尾清除指纹；重复清除是 no-op。
+        proactive_renewal_rotated(home).unwrap();
+        assert!(!paths::dead_refresh_fingerprint_path(home).exists());
+        proactive_renewal_rotated(home).unwrap();
+        // 无 refresh token 的 blob：不写指纹，仍给出引导错误。
+        let err = proactive_renewal_reject(home, r#"{"access_token":"a"}"#).unwrap();
+        assert_eq!(err.http_status(), Some(401));
+        assert!(!paths::dead_refresh_fingerprint_path(home).exists());
     }
 }

@@ -485,11 +485,16 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
         let account = self.require_account(id)?;
         let mut raw = self.raw_blob_for_account(&account)?;
 
-        // parked 账号：access token 大概率过期，先按需刷新（active 账号不刷）。
-        if !account.active {
-            if let Some(fresh) = self.refresh_parked_if_needed(&account, &raw).await? {
-                raw = fresh;
+        if account.active {
+            // 当前账号主动续期（issue #44）：仅当 runtime 判定该轮换
+            // （开关开启 + 本平台无官方锁 + access token 临期）才介入；
+            // 否则与旧版行为一致——不主动轮换，401 走协调恢复/凭证过期归类。
+            if self.runtime.proactive_renewal_wanted(&raw).await {
+                raw = self.renew_active_proactively(&account, raw).await?;
             }
+        } else if let Some(fresh) = self.refresh_parked_if_needed(&account, &raw).await? {
+            // parked 账号：access token 大概率过期，先按需刷新。
+            raw = fresh;
         }
         let access = extract_access_token(&raw).ok_or_else(|| {
             Error::quota_missing_credential(
@@ -497,6 +502,67 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
             )
         })?;
         self.runtime.fetch_quota(&access, &account).await
+    }
+}
+
+impl<A: FileBlobRuntime> FileBlobProvider<A> {
+    /// 当前账号主动续期（issue #44，ADR-0003 第 2 条）：查询前轮换临期 live 凭证并写回。
+    /// 仅当 runtime 报告 [`FileBlobRuntime::proactive_renewal_wanted`] 时由 `query_quota` 调用。
+    ///
+    /// 写序遵守 ADR-0002：账号库为唯一真本，先落账号库槽位，再原子写 live（tmp+rename，
+    /// 沿用现有 swap 写序）。轮换被官方拒绝（invalid_grant）时记录指纹并停止重试，
+    /// 本地凭证不删除不墓碑化，本次查询按「凭证过期型 401」（issue #41）呈现。
+    ///
+    /// 如实收录：live 原子写失败（本地 IO）**不是**可恢复窗口。live 保持旧内容，
+    /// 但下一次当前账号查询会经 [`Self::raw_blob_for_account`] 把旧 live 无条件回灌
+    /// 库槽位，销毁新轮换 refresh token 的唯一副本；此后轮换必被官方 invalid_grant
+    /// 拒绝，收敛到凭证过期型 401 + 指纹停试，需用户按引导重新授权
+    /// （ADR-0002 修订明文接受「窗口期一律以 live 为准」，ADR-0003 已接受边界）。
+    async fn renew_active_proactively(&self, account: &Account, raw: String) -> Result<String> {
+        // 即用即读：轮换前现读 live 文件（官方即用即读，我们也即用即读），
+        // 把与官方轮换的竞态窗口压到最小，不用查询开始时的旧副本。
+        let Some(live) = self.read_live_if_matches(account) else {
+            // live 读不出或已改属其他账号：不碰 live 与账号库，沿用原凭证查询。
+            return Ok(raw);
+        };
+        if extract_access_token(&live).as_deref() != extract_access_token(&raw).as_deref() {
+            // 官方已抢先轮换（与官方 100ms 重读采纳机制同款）：直接采纳最新 live，
+            // 顺手回灌账号库保持真本新鲜；本次查询不再消耗 refresh token。
+            // 回灌只是顺手保鲜：库写失败不应让手握有效 live 的查询整体失败，
+            // 与 `raw_blob_for_account` 的回灌容错（`let _ =`）一致。
+            let _ = self.store.set(
+                self.runtime.id(),
+                account.id.0.as_str(),
+                self.runtime.store_field(),
+                &live,
+            );
+            return Ok(live);
+        }
+        // DeadToken 纪律：指纹在案 → 停止重试，本次查询按凭证过期呈现。
+        if self.runtime.proactive_renewal_blocked(&self.home, &live) {
+            return Err(self.runtime.proactive_renewal_reject(&self.home, &live)?);
+        }
+        match self.runtime.refresh(&live).await? {
+            RefreshOutcome::Rotated(new_blob) => {
+                // ADR-0002 写序：先落账号库槽位，再原子写 live。live 写失败时
+                // live 保持旧内容不被破坏——但此窗口不可恢复（如实收录，见函数 doc）：
+                // 下一次当前账号查询的 live 回灌会销毁库中新凭证副本，随后收敛到
+                // invalid_grant → 记指纹停试 → 凭证过期型 401 引导重新授权。
+                self.store.set(
+                    self.runtime.id(),
+                    account.id.0.as_str(),
+                    self.runtime.store_field(),
+                    &new_blob,
+                )?;
+                Self::write_blob(&self.live_path(), &new_blob)?;
+                self.runtime.proactive_renewal_rotated(&self.home)?;
+                Ok(new_blob)
+            }
+            RefreshOutcome::DeadToken => {
+                Err(self.runtime.proactive_renewal_reject(&self.home, &live)?)
+            }
+            RefreshOutcome::Unsupported => Ok(live),
+        }
     }
 }
 
@@ -566,7 +632,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    use kimi_switch_core::error::ReauthError;
+    use kimi_switch_core::error::{QuotaFailureKind, ReauthError};
     use kimi_switch_core::FileStore;
 
     #[derive(Clone, Copy)]
@@ -585,6 +651,10 @@ mod tests {
         /// 默认 "dedup_key"；部分测试覆盖成非默认名，模拟 Beta 把去重键落在
         /// 一个迁移前就存在、不叫 "dedup_key" 的字段名下。
         dedup_extra_key: &'static str,
+        /// 主动续期门（issue #44）：默认 false = 开关关闭/有锁平台，当前账号不轮换。
+        proactive_wanted: bool,
+        /// 模拟官方在判定期间抢先改写 live：wanted 判定时把 live 改成这份 blob。
+        official_live_during_wanted: Option<String>,
     }
 
     impl FakeRuntime {
@@ -600,6 +670,15 @@ mod tests {
                 last_access_token: Mutex::new(None),
                 legacy_blob: None,
                 dedup_extra_key: "dedup_key",
+                proactive_wanted: false,
+                official_live_during_wanted: None,
+            }
+        }
+
+        fn with_proactive(home: PathBuf, refresh_behavior: RefreshBehavior) -> Self {
+            Self {
+                proactive_wanted: true,
+                ..Self::with_behavior(home, refresh_behavior)
             }
         }
 
@@ -667,6 +746,38 @@ mod tests {
         }
         fn recover_legacy(&self, _home: &Path, _account: &Account) -> Option<String> {
             self.legacy_blob.clone()
+        }
+
+        async fn proactive_renewal_wanted(&self, _blob: &str) -> bool {
+            if let Some(blob) = &self.official_live_during_wanted {
+                // 模拟官方 100ms 采纳：判定期间 live 已被官方改写成新凭证。
+                fs::write(self.live_cred_path(&self.home), blob).unwrap();
+            }
+            self.proactive_wanted
+        }
+
+        // 测试版 DeadToken 纪律：指纹文件 = home/fake-dead-refresh，内容直接是
+        // refresh token 原文（测试不需要哈希）。
+        fn proactive_renewal_blocked(&self, home: &Path, blob: &str) -> bool {
+            let Ok(recorded) = fs::read_to_string(home.join("fake-dead-refresh")) else {
+                return false;
+            };
+            extract_refresh_token(blob).as_deref() == Some(recorded.trim())
+        }
+
+        fn proactive_renewal_reject(&self, home: &Path, blob: &str) -> Result<Error> {
+            if let Some(refresh) = extract_refresh_token(blob) {
+                fs::write(home.join("fake-dead-refresh"), refresh)?;
+            }
+            Ok(Error::quota_credential_expired("凭证已过期（fake 引导）"))
+        }
+
+        fn proactive_renewal_rotated(&self, home: &Path) -> Result<()> {
+            match fs::remove_file(home.join("fake-dead-refresh")) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         }
     }
 
@@ -1376,6 +1487,244 @@ mod tests {
         assert_eq!(
             p.test_store_get("u1").unwrap(),
             r#"{"uid":"u1","access_token":"OLD"}"#
+        );
+    }
+
+    // --- query_quota：当前账号主动续期（issue #44，ADR-0003 第 2 条）---
+
+    /// 三分支之「轮换成功」：runtime 判定临期 → 查询前先轮换，新 blob 先落库再写回
+    /// live，查询使用轮换后的 access token，写回后账号库与 live 一致。
+    #[tokio::test]
+    async fn proactive_renewal_rotates_before_query_and_writes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old).unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("ROTATED"),
+            "查询必须使用轮换后的 access token"
+        );
+        let rotated = r#"{"uid":"u1","access_token":"ROTATED"}"#;
+        assert_eq!(p.test_store_get("u1").unwrap(), rotated, "新凭证必须落账号库");
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            rotated,
+            "新凭证必须写回 live，写回后账号库与 live 一致"
+        );
+    }
+
+    /// ADR-0002 写序钉住「先库后 live」：live 原子写失败时，账号库必须已是新凭证、
+    /// live 保持旧凭证不被破坏（注入手法同重授权 live 写失败测试）。
+    ///
+    /// 注意此窗口**不可恢复**（如实收录，消除「可恢复」误导）：live 写失败后，下一次
+    /// 当前账号查询会经 `raw_blob_for_account` 把旧 live 无条件回灌库槽位，新轮换
+    /// refresh token 的唯一副本即被销毁；此后轮换必被官方 invalid_grant 拒绝 →
+    /// 记指纹停试 → 收敛到凭证过期型 401，需用户按引导重新授权。该语义是 ADR-0002
+    /// 修订「窗口期一律以 live 为准」的明文接受行为；本测试只钉失败瞬间的落库/落盘
+    /// 状态，不暗示任何可恢复性。
+    #[tokio::test]
+    async fn proactive_renewal_live_write_failure_leaves_store_new_and_live_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old).unwrap();
+
+        // 注入 live 写失败：把 write_blob 的 tmp 目标预制为目录，迫使 fs::write 失败。
+        let tmp_target = p
+            .test_live_path()
+            .with_extension(format!("tmp.{}", std::process::id()));
+        fs::create_dir_all(&tmp_target).unwrap();
+
+        p.query_quota(&account.id).await.unwrap_err();
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            r#"{"uid":"u1","access_token":"ROTATED"}"#,
+            "先库后 live：live 写失败时账号库必须已是新凭证"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            old,
+            "live 原子写失败不得破坏旧登录文件"
+        );
+    }
+
+    /// 三分支之「被拒停试」：轮换被官方拒绝 → 记录指纹、停止重试、本地凭证不动、
+    /// 本次查询按「凭证过期型 401」呈现；再次查询指纹在案 → 不再发起轮换。
+    #[tokio::test]
+    async fn proactive_renewal_dead_token_records_fingerprint_and_stops_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Dead);
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old).unwrap();
+
+        let err = p.query_quota(&account.id).await.unwrap_err();
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::CredentialExpired),
+            "被拒后本次查询按「凭证过期型 401」（issue #41）呈现"
+        );
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.is_authentication_failure());
+        assert!(!err.is_retryable());
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_to_string(p.test_home().join("fake-dead-refresh")).unwrap(),
+            "R1",
+            "被拒 refresh token 的指纹必须记录在案"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            old,
+            "本地 live 凭证不删除不墓碑化"
+        );
+        assert_eq!(p.test_store_get("u1").unwrap(), old, "账号库凭证保持不动");
+
+        // 停止重试：再次查询不再发起轮换请求，错误呈现不变。
+        let err = p.query_quota(&account.id).await.unwrap_err();
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            1,
+            "指纹在案必须停止重试"
+        );
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::CredentialExpired)
+        );
+    }
+
+    /// 三分支之「开关关闭」：wanted=false 时与现版本行为一致——不轮换，
+    /// live 与账号库不动，用原 access token 查询。
+    #[tokio::test]
+    async fn proactive_renewal_off_behaves_like_current_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old).unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("OLD")
+        );
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), old);
+        assert_eq!(p.test_store_get("u1").unwrap(), old);
+    }
+
+    /// 官方在判定期间抢先轮换：采纳最新 live（顺手回灌账号库保持真本新鲜），
+    /// 本次不再消耗 refresh token 重复轮换。
+    #[tokio::test]
+    async fn proactive_renewal_adopts_live_when_official_rotated_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let official = r#"{"uid":"u1","refresh_token":"R9","access_token":"OFFICIAL"}"#;
+        runtime.official_live_during_wanted = Some(official.into());
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old).unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            0,
+            "官方已轮换则不重复消耗 refresh token"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("OFFICIAL"),
+            "查询改用官方刚轮换的最新凭证"
+        );
+        assert_eq!(p.test_store_get("u1").unwrap(), official, "采纳后回灌账号库");
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), official);
+    }
+
+    /// live 在判定期间改属其他账号：放弃主动续期——不写 live、不改账号库、不轮换。
+    #[tokio::test]
+    async fn proactive_renewal_aborts_when_live_switches_to_another_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let other_live = r#"{"uid":"u2","refresh_token":"R2","access_token":"A2"}"#;
+        runtime.official_live_during_wanted = Some(other_live.into());
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old).unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("OLD"),
+            "沿用原凭证查询，成败由既有 401 协调恢复/归类路径兜底"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            other_live,
+            "live 已改属其他账号时不得改写"
+        );
+        assert_eq!(p.test_store_get("u1").unwrap(), old, "账号库保持不动");
+    }
+
+    /// 轮换成功收尾：旧拒止指纹（对应更早前被拒、已作废的 refresh）随之清除。
+    #[tokio::test]
+    async fn proactive_renewal_success_clears_stale_dead_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old).unwrap();
+        // 旧指纹对应已作废的 R0，不命中当前 R1，不阻塞本次轮换。
+        fs::write(p.test_home().join("fake-dead-refresh"), "R0").unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert!(
+            !p.test_home().join("fake-dead-refresh").exists(),
+            "成功轮换后旧指纹作废清除"
         );
     }
 }

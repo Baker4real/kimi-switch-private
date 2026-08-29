@@ -19,9 +19,13 @@ export function quotaHtml(
   quotas: QuotaView[],
   error: string | null,
   cachedAt: string | null,
+  credentialExpired: boolean,
 ): string {
   let body: string;
-  if (error) {
+  if (error && credentialExpired) {
+    // 凭证待续期是凭证生命周期状态，不是查询故障：不按错误红渲染。
+    body = `<p class="quota-expired">凭证待续期 · ${escapeHtml(error)}</p>`;
+  } else if (error) {
     body = `<p class="quota-error">额度查询失败: ${escapeHtml(error)}</p>`;
   } else if (quotas.length === 0) {
     body = `<p class="quota-reset">额度: n/a</p>`;

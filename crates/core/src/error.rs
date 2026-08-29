@@ -14,6 +14,9 @@ pub enum QuotaFailureKind {
     Http,
     Network,
     MissingCredential,
+    /// 凭证过期型 401：收到 401 且 access token 已过 JWT exp、协调恢复不可用或已放弃。
+    /// 鉴权失败 / 不可重试语义由 `status = 401` 承载，与裸 401 一致；展示层用引导文案替代裸 401。
+    CredentialExpired,
     #[default]
     Other,
 }
@@ -56,6 +59,15 @@ impl QuotaFailure {
         Self {
             kind: QuotaFailureKind::MissingCredential,
             status: None,
+            message: message.as_ref().to_string(),
+        }
+    }
+
+    /// 凭证过期型 401：状态固定 401，分类走 `kind`，与文案无关。
+    pub fn credential_expired(message: impl AsRef<str>) -> Self {
+        Self {
+            kind: QuotaFailureKind::CredentialExpired,
+            status: Some(401),
             message: message.as_ref().to_string(),
         }
     }
@@ -181,6 +193,10 @@ impl Error {
 
     pub fn quota_missing_credential(message: impl AsRef<str>) -> Self {
         Self::QuotaFetch(QuotaFailure::missing_credential(message))
+    }
+
+    pub fn quota_credential_expired(message: impl AsRef<str>) -> Self {
+        Self::QuotaFetch(QuotaFailure::credential_expired(message))
     }
 
     pub fn quota_other(message: impl AsRef<str>) -> Self {
@@ -361,6 +377,39 @@ mod tests {
         let err = Error::quota_missing_credential("schema may have changed");
         assert!(err.is_authentication_failure());
         assert_eq!(err.http_status(), None);
+    }
+
+    #[test]
+    fn credential_expired_401_keeps_401_semantics() {
+        let err = Error::quota_credential_expired("凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权");
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.is_authentication_failure());
+        assert!(!err.is_retryable());
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::CredentialExpired)
+        );
+    }
+
+    #[test]
+    fn credential_expired_kind_survives_serde_roundtrip() {
+        let failure = QuotaFailure::credential_expired("guidance");
+        let json = serde_json::to_string(&failure).unwrap();
+        assert!(json.contains("credential_expired"), "{json}");
+        let back: QuotaFailure = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, QuotaFailureKind::CredentialExpired);
+        assert_eq!(back.status, Some(401));
+    }
+
+    #[test]
+    fn attempt_count_preserves_credential_expired_kind() {
+        let err = Error::quota_credential_expired("guidance").with_attempt_count(3);
+        assert_eq!(
+            err.quota_failure().map(|f| f.kind),
+            Some(QuotaFailureKind::CredentialExpired)
+        );
+        assert_eq!(err.http_status(), Some(401));
+        assert!(err.to_string().contains("after 3 attempts"));
     }
 
     #[test]

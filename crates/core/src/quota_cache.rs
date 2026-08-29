@@ -47,7 +47,7 @@ pub struct FailureEntry {
 
 impl FailureEntry {
     fn from_error(error: &Error, consecutive: u32) -> Self {
-        let failure = persist_quota_failure(error);
+        let failure = quota_failure_of(error);
         Self {
             failed_at: Utc::now(),
             consecutive,
@@ -227,7 +227,8 @@ fn cache_key(provider: &str, account_id: &str) -> String {
     format!("{provider}::{account_id}")
 }
 
-fn persist_quota_failure(error: &Error) -> QuotaFailure {
+/// 把任意 [`Error`] 归约成额度失败载荷（分类 / HTTP 状态 / 文案），持久化与展示共用。
+pub(crate) fn quota_failure_of(error: &Error) -> QuotaFailure {
     match error {
         Error::QuotaFetch(failure) => failure.clone(),
         Error::Provider(failure) => QuotaFailure {

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kimi_switch_core::error::Result;
+use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::{Account, AccountRegistry, CredentialStore, Quota};
 use kimi_switch_engine::{BlobMetadata, FileBlobProvider, FileBlobRuntime, RefreshOutcome};
 
@@ -39,6 +39,20 @@ impl FileBlobRuntime for KimiRuntime {
     }
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>> {
         kimi_usage::fetch_quota_with_active_recovery(access_token, account).await
+    }
+
+    // 当前账号主动续期（issue #44）：判定与 DeadToken 纪律在 oauth，机制在引擎。
+    async fn proactive_renewal_wanted(&self, blob: &str) -> bool {
+        oauth::proactive_renewal_wanted(blob).await
+    }
+    fn proactive_renewal_blocked(&self, home: &Path, blob: &str) -> bool {
+        oauth::proactive_renewal_blocked(home, blob)
+    }
+    fn proactive_renewal_reject(&self, home: &Path, blob: &str) -> Result<Error> {
+        oauth::proactive_renewal_reject(home, blob)
+    }
+    fn proactive_renewal_rotated(&self, home: &Path) -> Result<()> {
+        oauth::proactive_renewal_rotated(home)
     }
 }
 
@@ -105,5 +119,26 @@ mod test_support {
                 .into_inner()
                 .unwrap()
         }
+    }
+
+    /// 测试用 JWT 构造：payload 经最小 base64url（无 padding）编码，拼成 header.payload.sig。
+    pub fn jwt_with_payload(payload: &str) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut encoded = String::new();
+        for chunk in payload.as_bytes().chunks(3) {
+            let b0 = u32::from(chunk[0]);
+            let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+            let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            encoded.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            encoded.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            if chunk.len() > 1 {
+                encoded.push(ALPHABET[(n >> 6) as usize & 63] as char);
+            }
+            if chunk.len() > 2 {
+                encoded.push(ALPHABET[n as usize & 63] as char);
+            }
+        }
+        format!("header.{encoded}.sig")
     }
 }
