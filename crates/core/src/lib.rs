@@ -1,4 +1,4 @@
-//! kimi-switch 核心：数据模型 + Provider 抽象 + 凭证仓库 + 路径与配置。
+//! kimi-switch 核心：数据模型、Provider、凭证仓库、额度快照、路径与配置。
 
 pub mod account_registry;
 pub mod audit;
