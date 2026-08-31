@@ -1,4 +1,6 @@
 /target
+/target-verifier/
+/target-verify-47/
 /dist
 /node_modules
 /src-tauri/gen/schemas

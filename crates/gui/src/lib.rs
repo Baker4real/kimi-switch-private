@@ -250,8 +250,33 @@ mod tests {
 
         let row = account_row(&account, &snap);
 
-        assert_eq!(row.membership.as_deref(), Some("Advanced"));
+        assert_eq!(row.membership.as_deref(), Some("Allegro"));
         assert!(row.cached_at.is_none());
+    }
+
+    #[test]
+    fn membership_uses_official_kimi_plan_names() {
+        let account = sample_account("alice");
+        let snap = |level: &str| QuotaSnapshot {
+            account_id: account.id.clone(),
+            fetched_at: Utc::now(),
+            stale: false,
+            membership: Some(level.into()),
+            state: QuotaState::Ready(vec![sample_quota("alice", None, None)]),
+        };
+
+        assert_eq!(
+            account_row(&account, &snap("LEVEL_INTERMEDIATE"))
+                .membership
+                .as_deref(),
+            Some("Allegretto")
+        );
+        assert_eq!(
+            account_row(&account, &snap("LEVEL_ADVANCED"))
+                .membership
+                .as_deref(),
+            Some("Allegro")
+        );
     }
 
     #[tokio::test]
@@ -269,13 +294,13 @@ mod tests {
         assert!(first
             .iter()
             .all(|row| row.error.is_none() && !row.quotas.is_empty()));
-        assert_eq!(first[0].membership.as_deref(), Some("Advanced"));
+        assert_eq!(first[0].membership.as_deref(), Some("Allegro"));
         assert!(first.iter().all(|row| row.cached_at.is_none()));
 
         let second = collect_account_rows(provider.clone(), &accounts, &cache_path).await;
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert_eq!(second[0].quotas[0].text, first[0].quotas[0].text);
-        assert_eq!(second[0].membership.as_deref(), Some("Advanced"));
+        assert_eq!(second[0].membership.as_deref(), Some("Allegro"));
         assert!(second.iter().all(|row| row.cached_at.is_none()));
     }
 

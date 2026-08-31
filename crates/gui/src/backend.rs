@@ -366,12 +366,24 @@ fn format_cached_at(fetched_at: chrono::DateTime<chrono::Utc>) -> String {
     )
 }
 
+/// 将 `/usages` 的 `user.membership.level` 转成官网档位名。
+///
+/// 已与 `/me` 的 `user_level_name` 核对：`LEVEL_INTERMEDIATE` → Allegretto，
+/// `LEVEL_ADVANCED` → Allegro。未知档位仍去掉 `LEVEL_` 后首字母大写。
 fn prettify_membership(level: &str) -> String {
     let stripped = level.strip_prefix("LEVEL_").unwrap_or(level);
-    let mut chars = stripped.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
-        None => stripped.to_string(),
+    match stripped.to_ascii_uppercase().as_str() {
+        "INTERMEDIATE" => "Allegretto".to_string(),
+        "ADVANCED" => "Allegro".to_string(),
+        _ => {
+            let mut chars = stripped.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+                None => stripped.to_string(),
+            }
+        }
     }
 }
 

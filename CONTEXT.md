@@ -65,5 +65,5 @@ _Avoid_: OAuth 登录（对用户）, device login
 _Avoid_: 续命, 重新登录, 换绑
 
 **会员等级**:
-官方返回的订阅档位展示名（如 Intermediate、Advanced），只用于辨认账号。
-_Avoid_: 套餐, plan
+官网订阅档位名（如 Allegretto、Allegro）。`/usages` 给的是 `LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 等内部枚举，GUI 展示层映射成官网名，只用于辨认账号。
+_Avoid_: 套餐, plan；用户可见文案不要写 Intermediate / Advanced
