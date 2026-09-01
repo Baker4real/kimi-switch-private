@@ -1,3 +1,18 @@
+---
+type: reference
+title: Triage Labels
+tags: [github, labels, triage]
+intent: Map skill triage roles to this repo's GitHub category and state labels.
+documents:
+  config_keys:
+    - bug
+    - enhancement
+    - needs-triage
+    - needs-info
+    - ready-for-agent
+    - ready-for-human
+    - wontfix
+---
 # Triage Labels
 
 The skills speak in terms of two category roles and five state roles. This file maps those roles to the actual label strings used in this repo's issue tracker. Every triaged issue should carry exactly one category label and one state label.

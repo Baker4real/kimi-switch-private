@@ -1,3 +1,12 @@
+---
+type: reference
+title: Domain Docs
+tags: [domain, glossary, adr]
+intent: Tell engineering skills which CONTEXT.md and ADRs to read before exploring.
+documents:
+  symbols:
+    - CONTEXT.md
+---
 # Domain Docs
 
 How the engineering skills should consume this repo's domain documentation when exploring the codebase.

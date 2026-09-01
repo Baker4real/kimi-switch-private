@@ -49,4 +49,5 @@ GitHub Issues 写在 `Baker4real/kimi-switch-private`；`gh` 必须带 `-R`，�
 ### Domain docs
 
 single-context：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/domain.md`.
+ownership / endpoint / extra 键 / agent 文档查找：仓库 OKF（`.okf-frontmatter.json`，含 `docs/agents/`）。
 

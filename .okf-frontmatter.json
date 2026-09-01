@@ -1,0 +1,9 @@
+{
+  "include": ["README.md", "CONTEXT.md", "docs/**/*.md"],
+  "exclude": [],
+  "allowed_types": ["wiki-chapter", "adr", "index", "reference", "report", "readme"],
+  "link_validation": "strict",
+  "link_resolution": {
+    "profile": "github"
+  }
+}

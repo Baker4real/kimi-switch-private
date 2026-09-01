@@ -1,3 +1,17 @@
+---
+type: adr
+title: Windows 当前账号额度查询 401 与主动续期
+status: accepted
+tags: [windows, token, "401"]
+intent: Record credential-expired 401 guidance and opt-in Windows proactive renewal.
+documents:
+  endpoints:
+    - POST /api/oauth/token
+  config_keys:
+    - proactive_renewal.enabled
+  symbols:
+    - proactive_renewal_wanted
+---
 # Windows 当前账号额度查询 401：引导兜底 + 可选主动续期
 
 当前账号额度查询只读 live 凭证、刻意不续期，而官方 TS 客户端在 Windows 上没有任何刷新锁（`process.platform === "win32"` 直接放弃），`lock_protocol_for_version` 据此返回 `None`；叠加 access token 仅 15 分钟寿命与官方懒刷新（闲置不刷），当前账号在 GUI 里 401 是常态，停泊账号因查询前必轮换而不受影响。2026-08-29 与用户确认修复取方案 C：

@@ -1,3 +1,12 @@
+---
+type: reference
+title: Issue tracker
+tags: [github, issues, private]
+intent: Route GitHub issue and PR operations to Baker4real/kimi-switch-private.
+documents:
+  config_keys:
+    - Baker4real/kimi-switch-private
+---
 # Issue tracker: GitHub
 
 Issues and PRDs for this repo live as GitHub issues on **Baker4real/kimi-switch-private**. Use the `gh` CLI for all operations.

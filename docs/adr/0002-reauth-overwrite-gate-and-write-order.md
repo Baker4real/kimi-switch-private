@@ -1,3 +1,13 @@
+---
+type: adr
+title: 按卡重授权的身份门与写序
+status: accepted
+tags: [reauth, write-order]
+intent: Record the reauth identity gate and store-before-live write order.
+documents:
+  symbols:
+    - replace_account_blob
+---
 # 按卡重授权：凭证覆盖的身份门与写序
 
 按卡重新授权（issue #3，2026-08-27 实现）复用设备码授权流程，但目标是一张已存在的账号卡，而不是收进新身份。凭证覆盖落在 `FileBlobProvider::replace_account_blob`，两条决策约束它：

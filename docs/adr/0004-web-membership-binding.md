@@ -1,3 +1,20 @@
+---
+type: adr
+title: 绑定网页登录的凭证分离与身份门
+status: accepted
+tags: [membership, www, bind-web]
+intent: Record www.kimi.com GetSubscription binding, identity gate, and extra keys.
+documents:
+  endpoints:
+    - POST /apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription
+  config_keys:
+    - membership_next_billing_time
+    - membership_current_end_time
+    - web
+  symbols:
+    - write_membership_extra
+    - WEB_STORE_FIELD
+---
 # 绑定网页登录：会员到期读取的凭证分离与身份门
 
 「会员到期」指官方付费档位对这张账号失效的那一天。这份数据只存在于网页消费者

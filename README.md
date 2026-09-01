@@ -1,3 +1,9 @@
+---
+type: readme
+title: kimi-switch
+tags: [product, gui, cli]
+intent: Install and use the Kimi Code account switcher GUI and CLI.
+---
 # kimi-switch · Kimi 换号器
 
 [Kimi Code](https://www.kimi.com/) 多账号管理工具：浏览器授权添加账号、一键切换、额度一目了然。

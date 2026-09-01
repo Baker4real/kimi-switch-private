@@ -1,3 +1,19 @@
+---
+type: reference
+title: kimi-switch 领域词汇
+tags: [glossary, nickname, display-name, quota]
+intent: Define ubiquitous language for accounts, official nicknames, display names, swap, and quota.
+documents:
+  endpoints:
+    - GET /coding/v1/me
+    - GET /coding/v1/usages
+  config_keys:
+    - official_nickname
+  symbols:
+    - display_name
+    - EXTRA_OFFICIAL_NICKNAME
+    - persist_official_nickname
+---
 # kimi-switch
 
 本机 Kimi Code 多账号库：把多个官方登录身份收进本地，手动把其中一个写成正在使用的凭证。
