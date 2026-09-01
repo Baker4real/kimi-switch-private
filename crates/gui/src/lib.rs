@@ -27,11 +27,11 @@ mod tests {
     use kimi_switch_kimi::web_membership::WebBinding;
 
     use crate::backend::{
-        account_row, account_for_notice, attach_skip_message, auth_success_message,
+        account_for_notice, account_row, account_row_at, attach_skip_message, auth_success_message,
         bind_web_success_message, bind_web_user_message, cached_membership_plan,
         collect_account_rows, delete_success_message, import_success_message,
-        reauth_success_message, rename_success_message, swap_failure_message,
-        swap_success_message, WebMembershipRefresh,
+        reauth_success_message, rename_success_message, swap_failure_message, swap_success_message,
+        WebMembershipRefresh,
     };
 
     #[test]
@@ -64,6 +64,7 @@ mod tests {
             active: false,
             membership: None,
             membership_expiry: None,
+            membership_remaining_days: None,
             membership_expiry_hint: false,
             quotas: vec![QuotaView {
                 window: "5小时".into(),
@@ -820,6 +821,78 @@ mod tests {
         assert!(!row.official_nickname_known);
     }
 
+    /// 剩余天数跟展示日走（#61）：有到期日才有值；刷新失败跟着缓存日期；
+    /// 会员到期不改变额度告急。hint 布尔语义保持现测。
+    #[test]
+    fn account_row_membership_remaining_days_follows_display_day() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        let ready_snap = |level: &str, used: u64, limit: u64| QuotaSnapshot {
+            account_id: AccountId("alice".into()),
+            fetched_at: Utc::now(),
+            stale: false,
+            membership: Some(level.into()),
+            state: QuotaState::Ready(vec![Quota {
+                used,
+                limit,
+                ..sample_quota("alice", None, None)
+            }]),
+        };
+
+        let mut bound = sample_account("alice");
+        bound.extra.insert(
+            "membership_current_end_time".into(),
+            serde_json::Value::String("2027-08-28T00:00:00Z".into()),
+        );
+        bound.extra.insert(
+            "membership_next_billing_time".into(),
+            serde_json::Value::String("2027-08-27T01:25:37.930341Z".into()),
+        );
+
+        let row = account_row_at(&bound, &ready_snap("LEVEL_INTERMEDIATE", 1, 100), None, now);
+        assert_eq!(row.membership_expiry.as_deref(), Some("2027-08-27"));
+        assert_eq!(row.membership_remaining_days, Some(360));
+        assert!(!row.membership_expiry_hint);
+        assert!(!row.is_urgent());
+
+        let unbound = sample_account("alice");
+        let row = account_row_at(&unbound, &ready_snap("LEVEL_ADVANCED", 1, 100), None, now);
+        assert_eq!(row.membership_expiry, None);
+        assert_eq!(row.membership_remaining_days, None);
+        assert!(row.membership_expiry_hint);
+
+        let failed: kimi_switch_core::Result<WebBinding> =
+            Err(kimi_switch_core::Error::provider("web down"));
+        let row = account_row_at(
+            &bound,
+            &ready_snap("LEVEL_INTERMEDIATE", 1, 100),
+            Some(&failed),
+            now,
+        );
+        assert_eq!(row.membership_expiry.as_deref(), Some("2027-08-27"));
+        assert_eq!(row.membership_remaining_days, Some(360));
+        assert!(row.membership_expiry_hint, "刷新失败 hint 仍亮");
+        assert!(!row.is_urgent());
+
+        let expired_now = Utc.with_ymd_and_hms(2027, 8, 30, 0, 0, 0).unwrap();
+        let row = account_row_at(
+            &bound,
+            &ready_snap("LEVEL_INTERMEDIATE", 1, 100),
+            None,
+            expired_now,
+        );
+        assert_eq!(row.membership_remaining_days, Some(-3));
+        assert!(!row.is_urgent(), "会员过期本身不告急");
+
+        let hot = account_row_at(
+            &bound,
+            &ready_snap("LEVEL_INTERMEDIATE", 80, 100),
+            None,
+            expired_now,
+        );
+        assert_eq!(hot.membership_remaining_days, Some(-3));
+        assert!(hot.is_urgent(), "告急仍只看用量窗口");
+    }
+
     fn snapshot_message_of(
         accounts: Vec<AccountRow>,
         reason: QuotaCollectReason,
@@ -1024,8 +1097,7 @@ mod tests {
     #[test]
     fn import_auth_toast_uses_persisted_official_nickname_not_raw_id() {
         let dir = tempfile::tempdir().unwrap();
-        let registry =
-            kimi_switch_core::AccountRegistry::new(dir.path().join("registry.toml"));
+        let registry = kimi_switch_core::AccountRegistry::new(dir.path().join("registry.toml"));
         let account = sample_account("acc-1");
         registry.upsert(account.clone()).unwrap();
         assert_eq!(
@@ -1034,13 +1106,8 @@ mod tests {
             "persist 前内存 Account 仍是裸 id"
         );
 
-        kimi_switch_core::persist_official_nickname(
-            &registry,
-            "kimi",
-            &account.id,
-            "Forever",
-        )
-        .unwrap();
+        kimi_switch_core::persist_official_nickname(&registry, "kimi", &account.id, "Forever")
+            .unwrap();
 
         let for_toast = account_for_notice(&registry, account);
         assert_eq!(import_success_message(&for_toast), "已导入账号 Forever");

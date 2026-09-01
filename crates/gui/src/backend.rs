@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    display_name, membership_expiry_from_extra, official_nickname_known, prettify_membership,
-    Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
-    KeyringStore, Provider, Quota, QuotaCollectReason, QuotaCollectStats, QuotaFailureKind,
-    QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts, WEB_STORE_FIELD,
+    display_name, membership_expiry_from_extra, membership_remaining_days, official_nickname_known,
+    prettify_membership, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
+    CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
+    QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
+    WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
@@ -482,8 +483,8 @@ const MEMBERSHIP_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// 超时 15s；join 阶段另受 [`MEMBERSHIP_JOIN_BUDGET`] 总预算约束，网页挂起
 /// 不得拖死整次刷新），缓存日历日无论新旧（含已过期）都请求；Scheduled（启动
 /// 加载 / 静默收集 / swap / import / 绑定等操作后再列）完全不发网页请求。会员
-/// 刷新失败只降级为行内绑定提示（日期 + 提示共存），不影响额度行、不计告急、
-/// 不置凭证待续期、不产生 toast。
+/// 刷新失败只降级为行内绑定提示（日期 + hint 共存），不影响额度行、不计告急、
+/// 不置凭证待续期。后端快照不写会员 toast；GUI 用户点刷新后自行聚合瞬时提示。
 pub(crate) async fn collect_account_rows<P>(
     provider: Arc<P>,
     membership: Option<Arc<dyn WebMembershipRefresh>>,
@@ -537,15 +538,17 @@ where
         });
     }
 
+    let now = chrono::Utc::now();
     let rows = accounts
         .iter()
         .zip(outcome.snapshots.iter())
         .enumerate()
         .map(|(idx, (account, snapshot))| {
-            account_row(
+            account_row_at(
                 account,
                 snapshot,
                 refreshed.get(idx).and_then(|outcome| outcome.as_ref()),
+                now,
             )
         })
         .collect();
@@ -676,6 +679,16 @@ pub(crate) fn bind_web_user_message(error: &kimi_switch_core::Error) -> String {
     }
 }
 
+/// 组装单行展示 DTO（时钟取组装时刻的 UTC now）。测试便捷包装。
+#[cfg(test)]
+pub(crate) fn account_row(
+    account: &Account,
+    snapshot: &QuotaSnapshot,
+    membership_refresh: Option<&kimi_switch_core::Result<WebBinding>>,
+) -> AccountRow {
+    account_row_at(account, snapshot, membership_refresh, chrono::Utc::now())
+}
+
 /// 组装单行展示 DTO。
 ///
 /// `membership_refresh` 是本次用户发起刷新中该账号的会员刷新结果（#52）：
@@ -683,11 +696,14 @@ pub(crate) fn bind_web_user_message(error: &kimi_switch_core::Error) -> String {
 /// - `Some(Ok(..))` = 刷新成功：行内直接用新到期日（extra 已由管道写回），
 ///   订阅无到期数据时日期为 `None` 并回到绑定弱提示（与绑定语义一致）；
 /// - `Some(Err(..))` = 刷新失败（缓存降级）：行内保留 extra 缓存旧日期，
-///   且绑定提示再现——**日期与提示共存**，网页失败不单独把日期藏起来。
-pub(crate) fn account_row(
+///   且 hint 再现——**日期与 hint 共存**，网页失败不单独把日期藏起来。
+///
+/// `now` 是组装这批账号行时的 UTC 时钟，转到东八区日期后算剩余天数。
+pub(crate) fn account_row_at(
     account: &Account,
     snapshot: &QuotaSnapshot,
     membership_refresh: Option<&kimi_switch_core::Result<WebBinding>>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> AccountRow {
     let membership = snapshot.membership.as_deref().map(prettify_membership);
     // 到期日基线来自账号 extra（绑定 / 上次成功刷新写入）；刷新成功时用刚拿到
@@ -699,8 +715,12 @@ pub(crate) fn account_row(
     };
     // 档位在且（无到期日，或本次用户发起刷新中会员获取失败）→ 绑定弱提示；
     // 可与日期共存（#52 缓存降级）。档位缺失（无额度数据）保持现状不强加。
+    // hint 布尔算法不变：有档位且（无到期日或本次刷新会员获取失败）。
     let membership_expiry_hint =
         membership.is_some() && (membership_expiry.is_none() || membership_refresh_failed);
+    let membership_remaining_days = membership_expiry
+        .as_deref()
+        .and_then(|day| membership_remaining_days(day, now));
     let (quotas, error, credential_expired, cached_at) = match &snapshot.state {
         QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => (
             quota_views(quotas),
@@ -722,6 +742,7 @@ pub(crate) fn account_row(
         active: account.active,
         membership,
         membership_expiry,
+        membership_remaining_days,
         membership_expiry_hint,
         quotas,
         error,

@@ -16,7 +16,7 @@
 //! 两个键都是扁平可选字符串；缺失、类型不符或解析失败一律按「无到期日」处理，
 //! 展示层回退到绑定弱提示，而不是错误状态。
 
-use chrono::{DateTime, FixedOffset, SecondsFormat, Timelike, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Timelike, Utc};
 
 /// extra 键：下次扣费瞬间（官网 `nextBillingTime`），RFC3339 UTC 字符串。
 pub const EXTRA_NEXT_BILLING_TIME: &str = "membership_next_billing_time";
@@ -76,6 +76,22 @@ pub fn format_membership_expiry(
     } else {
         Some(calendar_day_east8(current))
     }
+}
+
+/// 会员剩余天数：`N = 到期展示日 − 今天`，两边都是东八区日历日。
+///
+/// - 正整数：还没到期
+/// - `0`：今天到期
+/// - 负整数：已过期 `|N|` 天
+///
+/// `expiry_day` 必须是 [`format_membership_expiry`] 产出的 `YYYY-MM-DD`，
+/// 禁止拿原始 RFC3339 瞬间（例如 `currentEndTime=2027-08-28T00:00:00Z`）
+/// 的东八区日历日去减——#49 实抓会差一天。`now` 由调用方注入（组装账号行
+/// 快照时的 UTC now），测试可冻结。解析失败返回 `None`（不画剩余天数）。
+pub fn membership_remaining_days(expiry_day: &str, now: DateTime<Utc>) -> Option<i32> {
+    let expiry = NaiveDate::parse_from_str(expiry_day, "%Y-%m-%d").ok()?;
+    let today = now.with_timezone(&east8()).date_naive();
+    i32::try_from((expiry - today).num_days()).ok()
 }
 
 /// 从账号 extra 读出到期瞬间并格式化为东八区日历日。
@@ -240,7 +256,10 @@ mod tests {
     fn malformed_extra_values_degrade_to_none() {
         let mut extra = extra_with(&[(EXTRA_NEXT_BILLING_TIME, "not-a-timestamp")]);
         assert_eq!(membership_expiry_from_extra(&extra), None);
-        extra.insert(EXTRA_CURRENT_END_TIME.into(), serde_json::Value::Bool(false));
+        extra.insert(
+            EXTRA_CURRENT_END_TIME.into(),
+            serde_json::Value::Bool(false),
+        );
         assert_eq!(membership_expiry_from_extra(&extra), None);
     }
 
@@ -258,7 +277,10 @@ mod tests {
         pairs
             .iter()
             .map(|(key, value)| {
-                ((*key).to_string(), serde_json::Value::String((*value).to_string()))
+                (
+                    (*key).to_string(),
+                    serde_json::Value::String((*value).to_string()),
+                )
             })
             .collect()
     }
@@ -291,7 +313,10 @@ mod tests {
             extra.get(EXTRA_NEXT_BILLING_TIME).and_then(|v| v.as_str()),
             Some("2027-08-27T01:25:37.930341Z")
         );
-        assert_eq!(membership_expiry_from_extra(&extra).as_deref(), Some("2027-08-27"));
+        assert_eq!(
+            membership_expiry_from_extra(&extra).as_deref(),
+            Some("2027-08-27")
+        );
     }
 
     /// 只动两个 membership 键：既有其他键原样保留。
@@ -318,7 +343,10 @@ mod tests {
         );
         // nextBillingTime 传 None → 旧值被移除（重新绑定后旧日期不得残留）。
         assert!(extra.get(EXTRA_NEXT_BILLING_TIME).is_none());
-        assert_eq!(membership_expiry_from_extra(&extra).as_deref(), Some("2027-08-27"));
+        assert_eq!(
+            membership_expiry_from_extra(&extra).as_deref(),
+            Some("2027-08-27")
+        );
     }
 
     /// 两个瞬间都 None：两个键一并移除（回到「无到期日」）。
@@ -332,5 +360,70 @@ mod tests {
         assert!(extra.get(EXTRA_CURRENT_END_TIME).is_none());
         assert!(extra.get(EXTRA_NEXT_BILLING_TIME).is_none());
         assert_eq!(membership_expiry_from_extra(&extra), None);
+    }
+
+    // --- 剩余天数（issue #61）：N = 到期展示日 − 今天，两边都是东八区日历日 ---
+
+    /// #49 实抓展示日 2027-08-27，冻结东八区今天 2026-09-01 → 剩余 360 天。
+    /// 期望值是独立算出的字面量，不在测试里重做日期减法。
+    #[test]
+    fn remaining_days_uses_display_day_not_current_end_east8_day() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        assert_eq!(
+            membership_remaining_days("2027-08-27", now),
+            Some(360),
+            "必须消费展示日 2027-08-27"
+        );
+        // 陷阱：currentEndTime=2027-08-28T00:00:00Z 的东八区日历日是 2027-08-28，
+        // 用它去减会多一天。函数禁止走这条路。
+        assert_eq!(
+            calendar_day_east8("2027-08-28T00:00:00Z".parse().unwrap()),
+            "2027-08-28"
+        );
+        assert_eq!(
+            membership_remaining_days("2027-08-28", now),
+            Some(361),
+            "若误用 currentEndTime 的东八区日会得到 361"
+        );
+        assert_ne!(
+            membership_remaining_days("2027-08-27", now),
+            membership_remaining_days("2027-08-28", now)
+        );
+    }
+
+    #[test]
+    fn remaining_days_zero_when_expiry_is_today_east8() {
+        // UTC 零点 = 东八区当天上午，日历日仍是 2027-08-27。
+        let now = Utc.with_ymd_and_hms(2027, 8, 27, 0, 0, 0).unwrap();
+        assert_eq!(membership_remaining_days("2027-08-27", now), Some(0));
+    }
+
+    #[test]
+    fn remaining_days_negative_when_expiry_already_passed() {
+        let now = Utc.with_ymd_and_hms(2027, 8, 30, 0, 0, 0).unwrap();
+        assert_eq!(membership_remaining_days("2027-08-27", now), Some(-3));
+    }
+
+    /// 时钟按东八区日历日，不是 UTC 日期：UTC 15:59 仍是东八区前一天。
+    #[test]
+    fn remaining_days_today_is_east8_calendar_not_utc_date() {
+        let expiry = "2027-08-27";
+        // UTC 2026-08-31 16:00 = 东八区 2026-09-01 00:00 → 与 09-01 零点同一天。
+        let east8_new_day = Utc.with_ymd_and_hms(2026, 8, 31, 16, 0, 0).unwrap();
+        assert_eq!(membership_remaining_days(expiry, east8_new_day), Some(360));
+        // UTC 2026-08-31 15:59 = 东八区 2026-08-31 23:59 → 还多一天。
+        let still_aug_31 = Utc.with_ymd_and_hms(2026, 8, 31, 15, 59, 59).unwrap();
+        assert_eq!(membership_remaining_days(expiry, still_aug_31), Some(361));
+    }
+
+    #[test]
+    fn remaining_days_none_when_display_day_malformed() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        assert_eq!(membership_remaining_days("not-a-date", now), None);
+        assert_eq!(
+            membership_remaining_days("2027-08-28T00:00:00Z", now),
+            None,
+            "禁止拿原始 RFC3339 瞬间当展示日"
+        );
     }
 }

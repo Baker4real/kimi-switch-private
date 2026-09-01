@@ -3,8 +3,8 @@ import { api, commandError, type Snapshot } from "./api";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { escapeHtml } from "./escape";
 import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
-import { bindWebButtonHtml, membershipPlanHtml } from "./membership";
-import { quotaHtml } from "./quota";
+import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
+import { runUserQuotaRefresh } from "./membershipToast";
 import { renewalSwitchView } from "./renewal";
 import { createAppStore } from "./store";
 import {
@@ -126,7 +126,7 @@ function paintAccountCards(next: Snapshot): void {
           <span class="profile-title">${escapeHtml(accountCardTitle(row))}</span>
           <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, busy)}</span>
         </div>
-        <div class="profile-quota-stack">${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired)}</div>
+        <div class="profile-quota-stack">${quotaStackHtml(row)}</div>
         <div class="profile-card-actions">${cardActionButtons(row, busy)}</div>
       </article>`;
     })
@@ -162,7 +162,7 @@ function paintSnapshot(next: Snapshot): void {
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
   paintCurrentPlan(next);
   required<HTMLDivElement>("current-quota-panel").innerHTML = current
-    ? quotaHtml(current.quotas, current.error, current.cached_at, current.credential_expired)
+    ? quotaStackHtml(current)
     : `<p class="quota-reset">暂无当前账号，请先切换。</p>`;
   required<HTMLElement>("metric-current").textContent = next.current_label;
   required<HTMLElement>("metric-total").textContent = String(next.account_count);
@@ -293,7 +293,7 @@ async function runSilentQuotaQuery(): Promise<void> {
     }
     applySnapshot({ ...next, message: null }, generation);
   } catch {
-    // 静默失败不 toast；有上次成功快照则条留在当前界面
+    // 静默失败不 toast；有上次成功快照则条留在当前界面。静默列出不弹会员 toast。
   } finally {
     silentInFlight = false;
     lastSnapshotAt = Date.now();
@@ -322,6 +322,24 @@ async function runAction(label: string, action: () => Promise<Snapshot>): Promis
   }
 }
 
+/** 两个「刷新」按钮专用：列出成功后再弹会员失败 toast。启动 / 静默 / 定时不走这里。 */
+async function refreshQuotas(): Promise<void> {
+  if (store.get().busy) {
+    return;
+  }
+  setBusy(true, "正在刷新额度…");
+  const generation = reserveUserSnapshotGeneration();
+  try {
+    await runUserQuotaRefresh({
+      list: () => api.listAccounts(true),
+      applySnapshot: (snapshot) => applySnapshot(snapshot, generation),
+      toast: (text, isError = false) => showToast(text, isError),
+    });
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function loadInitialSnapshot(): Promise<void> {
   if (store.get().busy) {
     return;
@@ -330,6 +348,7 @@ async function loadInitialSnapshot(): Promise<void> {
   const generation = reserveUserSnapshotGeneration();
   try {
     const initial = await api.listAccounts();
+    // 启动加载不是用户点「刷新」，不弹会员有效期 toast。
     applySnapshot(initial, generation);
   } catch (error) {
     showToast(commandError(error).message, true);
@@ -581,10 +600,10 @@ async function init(): Promise<void> {
     void runAction("正在导入…", () => api.importCurrent());
   });
   required<HTMLButtonElement>("refresh-button").addEventListener("click", () => {
-    void runAction("正在刷新额度…", () => api.listAccounts(true));
+    void refreshQuotas();
   });
   required<HTMLButtonElement>("library-refresh-button").addEventListener("click", () => {
-    void runAction("正在刷新额度…", () => api.listAccounts(true));
+    void refreshQuotas();
   });
   required<HTMLButtonElement>("overview-retry-button").addEventListener("click", () => {
     void loadInitialSnapshot();
