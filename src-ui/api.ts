@@ -17,7 +17,7 @@ export interface AccountRow {
    * 前端只拼中文，不解析日期。 */
   membership_remaining_days: number | null;
   /** 当前会员周期天数（到期展示日 − currentStartTime，东八区日历日）。
-   * 会员轨道「已度过比例」的分母；开始键缺失或坏数据为 null（不画填充）。 */
+   * 会员轨道「已度过比例」的分母；开始键缺失或坏数据为 null（前端按档位近似回退）。 */
   membership_period_days: number | null;
   /** 档位在且（无到期日，或本次刷新中会员获取失败）。布尔算法由后端计算。
    * GUI：无日期 →「绑定后可显示有效期」+「绑定」；有日期的刷新失败态 → 无常驻提示句、「重新绑定」。 */

@@ -92,10 +92,25 @@ function remainingPercent(remaining: number, period: number): number {
   return Math.round(Math.max(0, Math.min(100, raw)) * 10) / 10;
 }
 
+/** 档位近似的周期天数：老绑定没有周期起点键时的回退分母。
+ * Allegretto 按年、其余已知档位按月；与真实计费方式可能不符，重新绑定后
+ * 即被 currentStartTime 的真实值取代。未知档位返回 null（不画填充）。 */
+function fallbackPeriodDays(membership: string): number | null {
+  switch (membership) {
+    case "Allegretto":
+      return 365;
+    case "Allegro":
+    case "Andante":
+    case "Moderato":
+      return 30;
+    default:
+      return null;
+  }
+}
+
 /** 额度 stack 顶部的会员轨道：有档位且有到期日（含剩余天数，0 与负数也算）才画。
- * 填充=已度过比例（朝到期日推进，周期来自 currentStartTime 的真实日历天数，
- * 最后一天走满；不是用量压力），四档 tone 仍按剩余天数。
- * 周期缺失（旧绑定未刷新出开始键）只降级为空槽不画填充，徽章与日期照常。 */
+ * 填充=已度过比例（朝到期日推进：真实周期来自 currentStartTime 的日历天数，
+ * 缺失时按档位近似回退），最后一天走满；不是用量压力，四档 tone 仍按剩余天数。 */
 export function membershipTrackHtml(row: MembershipTrackFields): string {
   if (
     row.membership == null ||
@@ -110,7 +125,9 @@ export function membershipTrackHtml(row: MembershipTrackFields): string {
   const period =
     row.membership_period_days != null && row.membership_period_days > 0
       ? row.membership_period_days
-      : null;
+      : row.membership != null
+        ? fallbackPeriodDays(row.membership)
+        : null;
   const width =
     period == null ? null : remainingPercent(row.membership_remaining_days, period);
   const fill =

@@ -198,8 +198,26 @@ describe("membershipTrackHtml", () => {
     expect(expired).toContain(`style="width:100%"`);
   });
 
-  it("周期缺失（旧绑定未刷新出开始键）不画填充，徽章与日期照常", () => {
-    const html = membershipTrackHtml(trackFields({ membership_period_days: null }));
+  it("周期缺失回退档位近似：Allegretto 按 365、Allegro 按 30", () => {
+    const allegretto = membershipTrackHtml(trackFields({ membership_period_days: null }));
+    expect(allegretto).toContain(`class="quota-fill quota-fill--ok"`);
+    expect(allegretto).toContain(`style="width:1.4%"`);
+    const allegro = membershipTrackHtml(
+      trackFields({
+        membership: "Allegro",
+        membership_period_days: null,
+        membership_remaining_days: 18,
+        membership_expiry: "2026-09-20",
+      }),
+    );
+    expect(allegro).toContain(`style="width:40%"`);
+    expect(allegro).toContain(`aria-valuenow="40"`);
+  });
+
+  it("未知档位且无周期数据：不画填充，徽章与日期照常", () => {
+    const html = membershipTrackHtml(
+      trackFields({ membership: "Mystery", membership_period_days: null }),
+    );
     expect(html).not.toContain("progressbar");
     expect(html).not.toContain("quota-fill");
     expect(html).not.toContain("style=\"width");
@@ -208,13 +226,13 @@ describe("membershipTrackHtml", () => {
     expect(html).toContain(`<span class="quota-reset">2027-08-27</span>`);
   });
 
-  it("非法周期（0 或负数）等同缺失，不画填充", () => {
-    expect(membershipTrackHtml(trackFields({ membership_period_days: 0 }))).not.toContain(
+  it("非法周期（0 或负数）等同缺失，走档位回退", () => {
+    expect(membershipTrackHtml(trackFields({ membership_period_days: 0 }))).toContain(
       "quota-fill",
     );
-    expect(membershipTrackHtml(trackFields({ membership_period_days: -5 }))).not.toContain(
-      "quota-fill",
-    );
+    expect(
+      membershipTrackHtml(trackFields({ membership: "Allegro", membership_period_days: -5 })),
+    ).toContain("quota-fill");
   });
 
   it("转义到期日", () => {
