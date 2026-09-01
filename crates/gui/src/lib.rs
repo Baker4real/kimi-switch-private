@@ -65,6 +65,7 @@ mod tests {
             membership: None,
             membership_expiry: None,
             membership_remaining_days: None,
+            membership_period_days: None,
             membership_expiry_hint: false,
             quotas: vec![QuotaView {
                 window: "5小时".into(),
@@ -402,12 +403,14 @@ mod tests {
     fn bind_web_success_message_follows_expiry_text() {
         let with_expiry = bind_web_success_message(&kimi_switch_kimi::web_membership::WebBinding {
             expiry_text: Some("2027-08-27".into()),
+            period_days: None,
         });
         assert_eq!(with_expiry.text, "绑定成功，有效期至 2027-08-27");
         assert_eq!(with_expiry.tone, "ok");
 
         let without = bind_web_success_message(&kimi_switch_kimi::web_membership::WebBinding {
             expiry_text: None,
+            period_days: None,
         });
         assert_eq!(without.text, "绑定成功，暂无会员到期信息");
         assert_eq!(without.tone, "ok");
@@ -773,7 +776,10 @@ mod tests {
         };
 
         // 刷新成功、订阅无到期数据：extra 旧日期被清，行内无日期 + 弱提示。
-        let ok_without_expiry = Ok(WebBinding { expiry_text: None });
+        let ok_without_expiry = Ok(WebBinding {
+            expiry_text: None,
+            period_days: None,
+        });
         let row = account_row(&bound, &snap, Some(&ok_without_expiry));
         assert_eq!(row.membership_expiry, None);
         assert!(row.membership_expiry_hint);
@@ -783,6 +789,7 @@ mod tests {
         // 刷新成功、有新日期：用新值且不给提示（不等下次列出）。
         let ok_with_expiry = Ok(WebBinding {
             expiry_text: Some("2030-01-02".into()),
+            period_days: None,
         });
         let row = account_row(&bound, &snap, Some(&ok_with_expiry));
         assert_eq!(row.membership_expiry.as_deref(), Some("2030-01-02"));
@@ -1277,6 +1284,7 @@ mod tests {
                     self.calls.fetch_add(1, Ordering::SeqCst);
                     Some(Ok(WebBinding {
                         expiry_text: expiry.map(str::to_string),
+                        period_days: None,
                     }))
                 }
                 MembershipScript::Fail(status) => {

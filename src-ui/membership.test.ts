@@ -108,6 +108,7 @@ function trackFields(
     membership: "Allegretto",
     membership_expiry: "2027-08-27",
     membership_remaining_days: 360,
+    membership_period_days: 365,
     ...partial,
   };
 }
@@ -155,15 +156,24 @@ describe("membershipTrackHtml", () => {
     expect(html).toContain(`aria-label="会员 已过期 3 天 有效期至 2027-08-27"`);
   });
 
-  it("剩余时间走进度条：填充=剩余/365 封顶，progressbar 语义完整", () => {
+  it("填充=已度过比例（周期−剩余）/周期，progressbar 语义完整", () => {
     const html = membershipTrackHtml(trackFields());
+    // 周期 365、剩余 360 → 已度过 5/365 = 1.4%。
     expect(html).toContain(`role="progressbar"`);
     expect(html).toContain(`aria-valuemin="0"`);
     expect(html).toContain(`aria-valuemax="100"`);
-    expect(html).toContain(`aria-valuenow="99"`);
+    expect(html).toContain(`aria-valuenow="1"`);
     expect(html).toContain(`aria-valuetext="会员 剩余 360 天 有效期至 2027-08-27"`);
     expect(html).toContain(`class="quota-fill quota-fill--ok"`);
-    expect(html).toContain(`style="width:98.6%"`);
+    expect(html).toContain(`style="width:1.4%"`);
+  });
+
+  it("月付周期按真实天数走：周期 30、剩 19 → 36.7%", () => {
+    const html = membershipTrackHtml(
+      trackFields({ membership_period_days: 30, membership_remaining_days: 19 }),
+    );
+    expect(html).toContain(`style="width:36.7%"`);
+    expect(html).toContain(`aria-valuenow="37"`);
   });
 
   it("填充档位随剩余天数换色：31 ok / 30、8 warn / 7、1 high / 0 与负 full", () => {
@@ -180,14 +190,31 @@ describe("membershipTrackHtml", () => {
     expect(toneOf(-3)).toBe("full");
   });
 
-  it("剩余 0 与负数填充宽度为 0，超一年封顶 100%", () => {
-    const zero = membershipTrackHtml(trackFields({ membership_remaining_days: 0 }));
-    expect(zero).toContain(`style="width:0%"`);
+  it("周期最后一天走满 100%，过期后保持满条", () => {
+    const last = membershipTrackHtml(trackFields({ membership_remaining_days: 0 }));
+    expect(last).toContain(`style="width:100%"`);
+    expect(last).toContain(`aria-valuenow="100"`);
     const expired = membershipTrackHtml(trackFields({ membership_remaining_days: -3 }));
-    expect(expired).toContain(`style="width:0%"`);
-    const over = membershipTrackHtml(trackFields({ membership_remaining_days: 400 }));
-    expect(over).toContain(`style="width:100%"`);
-    expect(over).toContain(`aria-valuenow="100"`);
+    expect(expired).toContain(`style="width:100%"`);
+  });
+
+  it("周期缺失（旧绑定未刷新出开始键）不画填充，徽章与日期照常", () => {
+    const html = membershipTrackHtml(trackFields({ membership_period_days: null }));
+    expect(html).not.toContain("progressbar");
+    expect(html).not.toContain("quota-fill");
+    expect(html).not.toContain("style=\"width");
+    expect(html).toContain(`<span class="quota-value">剩余 360 天</span>`);
+    expect(html).toContain(`title="会员 剩余 360 天 有效期至 2027-08-27"`);
+    expect(html).toContain(`<span class="quota-reset">2027-08-27</span>`);
+  });
+
+  it("非法周期（0 或负数）等同缺失，不画填充", () => {
+    expect(membershipTrackHtml(trackFields({ membership_period_days: 0 }))).not.toContain(
+      "quota-fill",
+    );
+    expect(membershipTrackHtml(trackFields({ membership_period_days: -5 }))).not.toContain(
+      "quota-fill",
+    );
   });
 
   it("转义到期日", () => {
@@ -239,6 +266,7 @@ describe("quotaStackHtml", () => {
       membership: null,
       membership_expiry: "2027-08-27",
       membership_remaining_days: 360,
+      membership_period_days: 365,
       quotas: [quota()],
       error: null,
       cached_at: null,

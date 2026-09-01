@@ -32,9 +32,10 @@ pub use error::{
     ReauthError, Result,
 };
 pub use membership_expiry::{
-    format_membership_expiry, membership_expiry_from_extra, membership_remaining_days,
-    prettify_membership, write_membership_extra, EXTRA_CURRENT_END_TIME, EXTRA_NEXT_BILLING_TIME,
-    WEB_STORE_FIELD,
+    format_membership_expiry, membership_expiry_from_extra, membership_period_days,
+    membership_remaining_days, membership_start_from_extra, prettify_membership,
+    write_membership_extra, EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME,
+    EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
 };
 pub use model::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
 pub use provider::Provider;

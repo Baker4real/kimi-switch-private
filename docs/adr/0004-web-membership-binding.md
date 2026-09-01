@@ -10,6 +10,7 @@ documents:
   config_keys:
     - membership_next_billing_time
     - membership_current_end_time
+    - membership_current_start_time
     - web
   symbols:
     - write_membership_extra
@@ -62,8 +63,10 @@ extra，默认列表即出现「有效期至」。展示格式化与读侧 schem
 
 5. **为何 `expireTime` 不是会员到期**：`GetSubscription` 响应里的
    `balances[].expireTime` 是各额度余额的月度重置周期，额度重置日与会员到期
-   是两件事；一律忽略（解析只读 `subscription.currentEndTime` /
-   `nextBillingTime`，夹具含 `expireTime` 干扰项并由测试钉住）。同理
+   是两件事；一律忽略（解析只读 `subscription.currentStartTime` /
+   `currentEndTime` / `nextBillingTime`，夹具含 `expireTime` 干扰项并由测试
+   钉住；`currentStartTime` 为会员轨道已度过比例提供真实周期长度，月付/年付
+   不按档位猜测）。同理
    `goods.title` / `membershipLevel` 仅核对参考，不落库——档位展示仍以
    `/usages` 的 `user.membership.level` 为准，避免两处数据源打架。
 

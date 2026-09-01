@@ -12,9 +12,12 @@
 //!   对应官网接口的 `nextBillingTime`（如 `"2027-08-27T01:25:37.930341Z"`）。
 //! - [`EXTRA_CURRENT_END_TIME`]：当前会员周期结束瞬间，RFC3339 UTC 字符串，
 //!   对应官网接口的 `currentEndTime`（如 `"2027-08-28T00:00:00Z"`）。
+//! - [`EXTRA_CURRENT_START_TIME`]：当前会员周期开始瞬间，RFC3339 UTC 字符串，
+//!   对应官网接口的 `currentStartTime`（如 `"2026-08-28T00:00:00Z"`）。
 //!
-//! 两个键都是扁平可选字符串；缺失、类型不符或解析失败一律按「无到期日」处理，
-//! 展示层回退到绑定弱提示，而不是错误状态。
+//! 三个键都是扁平可选字符串；缺失、类型不符或解析失败一律按「无到期日」处理，
+//! 展示层回退到绑定弱提示，而不是错误状态。开始键只供会员轨道算周期长度
+//! （已度过比例的分母），缺失只降级为「不画填充」，不影响到期日展示。
 
 use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Timelike, Utc};
 
@@ -22,6 +25,8 @@ use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Timelike, Utc};
 pub const EXTRA_NEXT_BILLING_TIME: &str = "membership_next_billing_time";
 /// extra 键：当前会员周期结束瞬间（官网 `currentEndTime`），RFC3339 UTC 字符串。
 pub const EXTRA_CURRENT_END_TIME: &str = "membership_current_end_time";
+/// extra 键：当前会员周期开始瞬间（官网 `currentStartTime`），RFC3339 UTC 字符串。
+pub const EXTRA_CURRENT_START_TIME: &str = "membership_current_start_time";
 
 /// 凭证仓库中网页消费者 token 的字段名（issue #50，ADR-0004）。
 ///
@@ -94,6 +99,44 @@ pub fn membership_remaining_days(expiry_day: &str, now: DateTime<Utc>) -> Option
     i32::try_from((expiry - today).num_days()).ok()
 }
 
+/// 会员周期天数：`N = 到期展示日 − 周期开始日`，两边都是东八区日历日。
+///
+/// 会员轨道「已度过比例」的分母：已度过 = 周期天数 − 剩余天数，周期最后一天
+/// 剩余为 0、比例恰为 100%。月付/年付不用按档位猜——官网订阅响应自带
+/// `currentStartTime`，周期长度直接由真实数据得出。开始日晚于等于到期展示日
+/// 等坏数据返回 `None`（不画填充）。
+pub fn membership_period_days(start: DateTime<Utc>, expiry_day: &str) -> Option<i32> {
+    let start_day = start.with_timezone(&east8()).date_naive();
+    let expiry = NaiveDate::parse_from_str(expiry_day, "%Y-%m-%d").ok()?;
+    let days = i32::try_from((expiry - start_day).num_days()).ok()?;
+    if days > 0 {
+        Some(days)
+    } else {
+        None
+    }
+}
+
+/// 从账号 extra 读出当前会员周期开始瞬间。
+///
+/// 与 [`membership_expiry_from_extra`] 同一读侧宽容：键缺失、类型不符或解析
+/// 失败返回 `None`（轨道不画填充，不是错误状态）。
+pub fn membership_start_from_extra(
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<DateTime<Utc>> {
+    parse_extra_instant(extra, EXTRA_CURRENT_START_TIME)
+}
+
+fn parse_extra_instant(
+    extra: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<DateTime<Utc>> {
+    extra
+        .get(key)
+        .and_then(|value| value.as_str())
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|instant| instant.with_timezone(&Utc))
+}
+
 /// 从账号 extra 读出到期瞬间并格式化为东八区日历日。
 ///
 /// 键缺失、值不是字符串或不是合法 RFC3339 瞬间都返回 `None`（读侧宽容：
@@ -101,34 +144,29 @@ pub fn membership_remaining_days(expiry_day: &str, now: DateTime<Utc>) -> Option
 pub fn membership_expiry_from_extra(
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    let parse_instant = |key: &str| -> Option<DateTime<Utc>> {
-        extra
-            .get(key)
-            .and_then(|value| value.as_str())
-            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-            .map(|instant| instant.with_timezone(&Utc))
-    };
     format_membership_expiry(
-        parse_instant(EXTRA_CURRENT_END_TIME),
-        parse_instant(EXTRA_NEXT_BILLING_TIME),
+        parse_extra_instant(extra, EXTRA_CURRENT_END_TIME),
+        parse_extra_instant(extra, EXTRA_NEXT_BILLING_TIME),
     )
 }
 
-/// 绑定网页登录的写侧辅助：把两个会员瞬间写进 extra（issue #50，ADR-0004）。
+/// 绑定网页登录的写侧辅助：把三个会员瞬间写进 extra（issue #50，ADR-0004）。
 ///
 /// 契约（与读侧 schema 对齐）：
-/// - **只动两个 membership 键**，保留 dedup / scope 等其他既有键——调用方
+/// - **只动三个 membership 键**，保留 dedup / scope 等其他既有键——调用方
 ///   必须走「读出 Account → 改 extra → registry upsert」路径，不得整体重建 extra；
 /// - `None` 的瞬间移除对应键：重新绑定后旧日期不得残留（比如会员已到期）；
 /// - 值格式化为 RFC3339 UTC 字符串（AutoSi 精度：整秒无小数、亚秒保留实际位数，
-///   与官网响应字面量一致），读侧 [`membership_expiry_from_extra`] 原样可读。
+///   与官网响应字面量一致），读侧按原样解析。
 ///
 /// 展示文本（东八区日历日）由调用方用 [`format_membership_expiry`] 自行计算。
 pub fn write_membership_extra(
     extra: &mut serde_json::Map<String, serde_json::Value>,
+    current_start_time: Option<DateTime<Utc>>,
     current_end_time: Option<DateTime<Utc>>,
     next_billing_time: Option<DateTime<Utc>>,
 ) {
+    write_instant(extra, EXTRA_CURRENT_START_TIME, current_start_time);
     write_instant(extra, EXTRA_CURRENT_END_TIME, current_end_time);
     write_instant(extra, EXTRA_NEXT_BILLING_TIME, next_billing_time);
 }
@@ -299,12 +337,22 @@ mod tests {
     /// （AutoSi：整秒无小数、亚秒保留实际位数）。
     #[test]
     fn write_membership_extra_roundtrips_captured_sample() {
+        let current_start = "2026-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let current_end = "2027-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let next_billing = "2027-08-27T01:25:37.930341Z"
             .parse::<DateTime<Utc>>()
             .unwrap();
         let mut extra = serde_json::Map::new();
-        write_membership_extra(&mut extra, Some(current_end), Some(next_billing));
+        write_membership_extra(
+            &mut extra,
+            Some(current_start),
+            Some(current_end),
+            Some(next_billing),
+        );
+        assert_eq!(
+            extra.get(EXTRA_CURRENT_START_TIME).and_then(|v| v.as_str()),
+            Some("2026-08-28T00:00:00Z")
+        );
         assert_eq!(
             extra.get(EXTRA_CURRENT_END_TIME).and_then(|v| v.as_str()),
             Some("2027-08-28T00:00:00Z")
@@ -319,7 +367,7 @@ mod tests {
         );
     }
 
-    /// 只动两个 membership 键：既有其他键原样保留。
+    /// 只动三个 membership 键：既有其他键原样保留。
     #[test]
     fn write_membership_extra_preserves_unrelated_keys() {
         let mut extra = extra_with(&[("dedup_key", "stable-id"), ("scope", "kimi-code")]);
@@ -328,7 +376,7 @@ mod tests {
             serde_json::Value::String("2026-01-01T00:00:00Z".into()),
         );
         let current_end = "2027-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        write_membership_extra(&mut extra, Some(current_end), None);
+        write_membership_extra(&mut extra, None, Some(current_end), None);
         assert_eq!(
             extra.get("dedup_key").and_then(|v| v.as_str()),
             Some("stable-id")
@@ -343,23 +391,73 @@ mod tests {
         );
         // nextBillingTime 传 None → 旧值被移除（重新绑定后旧日期不得残留）。
         assert!(extra.get(EXTRA_NEXT_BILLING_TIME).is_none());
+        // currentStartTime 传 None → 旧值同样移除。
+        assert!(extra.get(EXTRA_CURRENT_START_TIME).is_none());
         assert_eq!(
             membership_expiry_from_extra(&extra).as_deref(),
             Some("2027-08-27")
         );
     }
 
-    /// 两个瞬间都 None：两个键一并移除（回到「无到期日」）。
+    /// 三个瞬间都 None：三个键一并移除（回到「无到期日」）。
     #[test]
-    fn write_membership_extra_removes_both_keys_when_both_none() {
+    fn write_membership_extra_removes_all_keys_when_all_none() {
         let mut extra = extra_with(&[
+            (EXTRA_CURRENT_START_TIME, "2026-08-28T00:00:00Z"),
             (EXTRA_CURRENT_END_TIME, "2027-08-28T00:00:00Z"),
             (EXTRA_NEXT_BILLING_TIME, "2027-08-27T01:25:37.930341Z"),
         ]);
-        write_membership_extra(&mut extra, None, None);
+        write_membership_extra(&mut extra, None, None, None);
+        assert!(extra.get(EXTRA_CURRENT_START_TIME).is_none());
         assert!(extra.get(EXTRA_CURRENT_END_TIME).is_none());
         assert!(extra.get(EXTRA_NEXT_BILLING_TIME).is_none());
         assert_eq!(membership_expiry_from_extra(&extra), None);
+    }
+
+    // --- 周期天数与开始键（会员轨道已度过比例的分母） ---
+
+    /// 实抓样例：开始 2026-08-28（东八区日历日），展示到期日 2027-08-27 → 364 天。
+    /// 期望值是独立算出的字面量，不在测试里重做日期减法。
+    #[test]
+    fn period_days_from_captured_sample_is_display_day_span() {
+        let start = "2026-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(membership_period_days(start, "2027-08-27"), Some(364));
+    }
+
+    /// 月付周期：2026-08-21 → 展示到期日 2026-09-20 = 30 天。
+    #[test]
+    fn period_days_monthly_cycle_is_calendar_days() {
+        let start = "2026-08-21T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(membership_period_days(start, "2026-09-20"), Some(30));
+    }
+
+    #[test]
+    fn period_days_rejects_bad_ranges_and_bad_expiry() {
+        let start = "2026-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        // 开始日等于或晚于展示到期日：坏数据，不画填充。
+        assert_eq!(membership_period_days(start, "2026-08-28"), None);
+        assert_eq!(membership_period_days(start, "2026-08-27"), None);
+        // 展示日不是合法 YYYY-MM-DD。
+        assert_eq!(membership_period_days(start, "not-a-date"), None);
+    }
+
+    #[test]
+    fn start_from_extra_reads_and_degrades() {
+        let mut extra = extra_with(&[(
+            EXTRA_CURRENT_START_TIME,
+            "2026-08-28T00:00:00Z",
+        )]);
+        let start = membership_start_from_extra(&extra);
+        assert_eq!(start, Some("2026-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap()));
+        // 非法瞬间 → 宽容降级为 None。
+        extra.insert(
+            EXTRA_CURRENT_START_TIME.into(),
+            serde_json::Value::String("yesterday".into()),
+        );
+        assert_eq!(membership_start_from_extra(&extra), None);
+        // 键缺失 → None。
+        let empty = serde_json::Map::new();
+        assert_eq!(membership_start_from_extra(&empty), None);
     }
 
     // --- 剩余天数（issue #61）：N = 到期展示日 − 今天，两边都是东八区日历日 ---

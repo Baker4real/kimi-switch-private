@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    display_name, membership_expiry_from_extra, membership_remaining_days, official_nickname_known,
+    display_name, membership_expiry_from_extra, membership_period_days,
+    membership_remaining_days, membership_start_from_extra, official_nickname_known,
     prettify_membership, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
     CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
     QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
@@ -721,6 +722,16 @@ pub(crate) fn account_row_at(
     let membership_remaining_days = membership_expiry
         .as_deref()
         .and_then(|day| membership_remaining_days(day, now));
+    // 周期天数与到期日同一基线：刷新成功用刚拿到的值，缓存降级/未刷新读 extra。
+    // 刷新成功但新订阅缺开始键时不回退旧 extra——旧开始配新到期日会算错周期。
+    let membership_period_days = match membership_refresh {
+        Some(Ok(binding)) => binding.period_days,
+        _ => membership_expiry.as_deref().and_then(|day| {
+            membership_start_from_extra(&account.extra)
+                .and_then(|start| membership_period_days(start, day))
+                .map(i64::from)
+        }),
+    };
     let (quotas, error, credential_expired, cached_at) = match &snapshot.state {
         QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => (
             quota_views(quotas),
@@ -743,6 +754,7 @@ pub(crate) fn account_row_at(
         membership,
         membership_expiry,
         membership_remaining_days,
+        membership_period_days,
         membership_expiry_hint,
         quotas,
         error,

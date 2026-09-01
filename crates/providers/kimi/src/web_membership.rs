@@ -16,7 +16,7 @@
 //!    **忽略 `balances[].expireTime` 与一切月度周期字段**——它们是额度余额
 //!    的有效期，不是会员到期（ADR-0004）；`goods.title` / `membershipLevel`
 //!    仅核对，不落库、不覆盖 `/usages` 档位展示；
-//! 5. 按 #49 schema 写 extra：读出 Account → 只动两个 membership 键 →
+//! 5. 按 #49 schema 写 extra：读出 Account → 只动三个 membership 键 →
 //!    registry upsert（保留 dedup / scope 等既有键，绝不整体重建）；
 //! 6. 返回展示用到期日（`format_membership_expiry`，东八区日历日）。
 //!
@@ -36,7 +36,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use kimi_switch_core::error::{Error, Result};
-use kimi_switch_core::membership_expiry::{format_membership_expiry, write_membership_extra};
+use kimi_switch_core::membership_expiry::{
+    format_membership_expiry, membership_period_days, write_membership_extra,
+};
 use kimi_switch_core::{AccountId, AccountRegistry, CredentialStore, WEB_STORE_FIELD};
 
 use crate::PROVIDER_ID;
@@ -54,6 +56,20 @@ pub struct WebBinding {
     /// 展示用到期日（东八区 `YYYY-MM-DD`，如 `2027-08-27`）；订阅无到期
     /// 数据时 `None`（展示层回退绑定弱提示）。
     pub expiry_text: Option<String>,
+    /// 当前会员周期天数（到期展示日 − `currentStartTime` 的东八区日历日）；
+    /// 开始瞬间或到期数据缺失时 `None`（会员轨道不画填充）。
+    pub period_days: Option<i64>,
+}
+
+/// 由开始瞬间与到期展示日折算周期天数；任一缺失返回 `None`。
+fn binding_period_days(
+    current_start: Option<DateTime<Utc>>,
+    expiry_text: &Option<String>,
+) -> Option<i64> {
+    current_start
+        .zip(expiry_text.as_deref())
+        .and_then(|(start, day)| membership_period_days(start, day))
+        .map(i64::from)
 }
 
 /// 对目标账号绑定网页登录（生产入口，固定 [`MEMBERSHIP_BASE_URL`]）。
@@ -102,7 +118,8 @@ pub(crate) async fn bind_web_at(
 
     let payload = get_subscription_at(base_url, web_token).await?;
 
-    // 只读两个会员瞬间；balances[].expireTime 与月度周期字段一律忽略（ADR-0004）。
+    // 只读三个会员瞬间；balances[].expireTime 等其余字段一律忽略（ADR-0004）。
+    let current_start = read_instant(&payload, "/subscription/currentStartTime");
     let current_end = read_instant(&payload, "/subscription/currentEndTime");
     let next_billing = read_instant(&payload, "/subscription/nextBillingTime");
 
@@ -118,11 +135,14 @@ pub(crate) async fn bind_web_at(
             });
         }
     };
-    write_membership_extra(&mut fresh.extra, current_end, next_billing);
+    write_membership_extra(&mut fresh.extra, current_start, current_end, next_billing);
     registry.upsert(fresh)?;
 
+    let expiry_text = format_membership_expiry(current_end, next_billing);
+    let period_days = binding_period_days(current_start, &expiry_text);
     Ok(WebBinding {
-        expiry_text: format_membership_expiry(current_end, next_billing),
+        expiry_text,
+        period_days,
     })
 }
 
@@ -170,7 +190,8 @@ pub(crate) async fn refresh_web_membership_at(
         })?;
 
     let payload = get_subscription_at(base_url, &web_token).await?;
-    // 只读两个会员瞬间（口径与绑定一致，ADR-0004）。
+    // 只读三个会员瞬间（口径与绑定一致，ADR-0004）。
+    let current_start = read_instant(&payload, "/subscription/currentStartTime");
     let current_end = read_instant(&payload, "/subscription/currentEndTime");
     let next_billing = read_instant(&payload, "/subscription/nextBillingTime");
 
@@ -182,11 +203,14 @@ pub(crate) async fn refresh_web_membership_at(
             id: target.to_string(),
         }
     })?;
-    write_membership_extra(&mut fresh.extra, current_end, next_billing);
+    write_membership_extra(&mut fresh.extra, current_start, current_end, next_billing);
     registry.upsert(fresh)?;
 
+    let expiry_text = format_membership_expiry(current_end, next_billing);
+    let period_days = binding_period_days(current_start, &expiry_text);
     Ok(WebBinding {
-        expiry_text: format_membership_expiry(current_end, next_billing),
+        expiry_text,
+        period_days,
     })
 }
 
@@ -249,7 +273,8 @@ mod tests {
     use crate::test_support::{jwt_with_payload, MockServer};
     use chrono::Utc;
     use kimi_switch_core::membership_expiry::{
-        membership_expiry_from_extra, EXTRA_CURRENT_END_TIME, EXTRA_NEXT_BILLING_TIME,
+        membership_expiry_from_extra, EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME,
+        EXTRA_NEXT_BILLING_TIME,
     };
     use kimi_switch_core::{Account, FileStore};
 
@@ -346,7 +371,8 @@ mod tests {
         }
 
         /// 预置「已绑定」账号（#52 刷新路径夹具）：网页凭证已写、extra 带旧
-        /// 到期数据（日历日 2026-08-27，已过期），等价于绑定后过了一段时间。
+        /// 到期数据（日历日 2026-08-27，已过期）与旧周期开始键，
+        /// 等价于绑定后过了一段时间。
         fn seed_bound(&self, id: &str) -> Account {
             self.seed(id);
             let web_token = token_for(id);
@@ -354,6 +380,10 @@ mod tests {
                 .set("kimi", id, WEB_STORE_FIELD, &web_token)
                 .unwrap();
             let mut bound = self.bound_account(id);
+            bound.extra.insert(
+                EXTRA_CURRENT_START_TIME.into(),
+                serde_json::Value::String("2025-08-28T00:00:00Z".into()),
+            );
             bound.extra.insert(
                 EXTRA_CURRENT_END_TIME.into(),
                 serde_json::Value::String("2026-08-28T00:00:00Z".into()),
@@ -371,8 +401,9 @@ mod tests {
         jwt_with_payload(&format!(r#"{{"sub":"{id}"}}"#))
     }
 
-    /// 绑定成功：网页 field 写入、Code blob 不动、extra 两键写入且保留既有键、
+    /// 绑定成功：网页 field 写入、Code blob 不动、extra 三键写入且保留既有键、
     /// 到期日来自 nextBillingTime（不是 balances.expireTime 的 2026-09-28）、
+    /// 周期天数来自 currentStartTime、
     /// 取消续费但 active 的订阅照常给日期且不产生取消语义、请求带 Connect 协议头。
     #[tokio::test]
     async fn bind_success_writes_web_field_extra_and_returns_expiry() {
@@ -387,6 +418,8 @@ mod tests {
 
         // 到期日：nextBillingTime 2027-08-27（东八区日历日），不是干扰项 2026-09-28。
         assert_eq!(binding.expiry_text.as_deref(), Some("2027-08-27"));
+        // 周期天数：开始日 2026-08-28 → 展示到期日 2027-08-27 = 364 天。
+        assert_eq!(binding.period_days, Some(364));
 
         // 网页凭证独立 field；Code blob 原样。
         assert_eq!(
@@ -398,9 +431,13 @@ mod tests {
             Some(r#"{"uid":"u1","access_token":"A1"}"#)
         );
 
-        // extra：两个 membership 键写入（字面量与官网响应一致），既有键保留，
+        // extra：三个 membership 键写入（字面量与官网响应一致），既有键保留，
         // 不落任何取消/档位语义。
         let bound = h.bound_account("u1");
+        assert_eq!(
+            bound.extra.get(EXTRA_CURRENT_START_TIME).and_then(|v| v.as_str()),
+            Some("2026-08-28T00:00:00Z")
+        );
         assert_eq!(
             bound.extra.get(EXTRA_CURRENT_END_TIME).and_then(|v| v.as_str()),
             Some("2027-08-28T00:00:00Z")
@@ -605,6 +642,10 @@ mod tests {
         .await
         .unwrap();
         assert!(h.bound_account("u1").extra.contains_key(EXTRA_NEXT_BILLING_TIME));
+        assert!(h
+            .bound_account("u1")
+            .extra
+            .contains_key(EXTRA_CURRENT_START_TIME));
 
         let second_server = MockServer::start(vec![("200 OK", CURRENT_END_ONLY_FIXTURE)]);
         let binding = bind_web_at(
@@ -621,6 +662,10 @@ mod tests {
         assert!(
             !extra.contains_key(EXTRA_NEXT_BILLING_TIME),
             "旧 nextBillingTime 不得残留：{extra:?}"
+        );
+        assert!(
+            !extra.contains_key(EXTRA_CURRENT_START_TIME),
+            "旧 currentStartTime 不得残留：{extra:?}"
         );
         assert_eq!(
             extra.get(EXTRA_CURRENT_END_TIME).and_then(|v| v.as_str()),
@@ -661,8 +706,9 @@ mod tests {
 
     // --- 仅刷新路径（issue #52）---
 
-    /// 刷新成功：重写 extra 两个键（旧日期换新、既有键保留）、网页凭证不动、
+    /// 刷新成功：重写 extra 三个键（旧日期换新、既有键保留）、网页凭证不动、
     /// 只请求一次、返回新到期展示日；缓存的旧日期已过期也照样请求（触发口径）。
+    /// 新订阅无 currentStartTime → 旧开始键移除、周期天数为 None。
     #[tokio::test]
     async fn refresh_rewrites_extra_and_keeps_web_field() {
         let h = Harness::new();
@@ -679,10 +725,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(binding.expiry_text.as_deref(), Some("2028-08-27"));
+        // 新订阅无 currentStartTime：周期天数缺省、旧开始键不残留。
+        assert_eq!(binding.period_days, None);
         let bound = h.bound_account("u1");
         assert_eq!(
             bound.extra.get(EXTRA_CURRENT_END_TIME).and_then(|v| v.as_str()),
             Some("2028-08-28T00:00:00Z")
+        );
+        assert!(
+            !bound.extra.contains_key(EXTRA_CURRENT_START_TIME),
+            "旧 currentStartTime 不得残留：{:?}",
+            bound.extra
         );
         assert!(
             !bound.extra.contains_key(EXTRA_NEXT_BILLING_TIME),
@@ -709,7 +762,7 @@ mod tests {
         );
     }
 
-    /// 刷新后订阅已无到期数据：成功也清掉两个键（回到「无到期日」，不残留旧日期）。
+    /// 刷新后订阅已无到期数据：成功也清掉三个键（回到「无到期日」，不残留旧日期）。
     #[tokio::test]
     async fn refresh_success_without_dates_clears_stale_expiry() {
         let h = Harness::new();
@@ -726,7 +779,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(binding.expiry_text, None);
+        assert_eq!(binding.period_days, None);
         let extra = h.bound_account("u1").extra;
+        assert!(!extra.contains_key(EXTRA_CURRENT_START_TIME));
         assert!(!extra.contains_key(EXTRA_CURRENT_END_TIME));
         assert!(!extra.contains_key(EXTRA_NEXT_BILLING_TIME));
         assert_eq!(membership_expiry_from_extra(&extra), None);

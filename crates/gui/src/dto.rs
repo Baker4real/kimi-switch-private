@@ -147,6 +147,9 @@ pub struct AccountRow {
     /// 正=剩余、0=今天到期、负=已过期天数。GUI 只拼中文，不解析日期。
     /// 会员到期不影响额度告急。
     pub membership_remaining_days: Option<i32>,
+    /// 当前会员周期天数：`到期展示日 − currentStartTime 的东八区日历日`。
+    /// 会员轨道「已度过比例」的分母；开始键缺失或坏数据为 `None`（不画填充）。
+    pub membership_period_days: Option<i64>,
     /// 档位在且（无到期日，或本次用户发起刷新中会员获取失败）。布尔算法不变。
     /// GUI：无到期日 →「绑定后可显示有效期」+「绑定」；有到期日的刷新失败态 →
     /// 不写常驻提示句，按钮改为「重新绑定」。档位缺失时为 `false`。

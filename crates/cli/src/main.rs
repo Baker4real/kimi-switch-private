@@ -563,7 +563,12 @@ mod tests {
             .parse::<chrono::DateTime<chrono::Utc>>()
             .unwrap();
         let mut extra = serde_json::Map::new();
-        kimi_switch_core::write_membership_extra(&mut extra, Some(current_end), Some(next_billing));
+        kimi_switch_core::write_membership_extra(
+            &mut extra,
+            None,
+            Some(current_end),
+            Some(next_billing),
+        );
         assert_eq!(
             super::membership_status_text(Some("LEVEL_ADVANCED"), &extra).as_deref(),
             Some("Allegro 有效期至 2027-08-27")

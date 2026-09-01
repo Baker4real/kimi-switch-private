@@ -58,6 +58,7 @@ export interface MembershipTrackFields {
   membership: string | null;
   membership_expiry: string | null;
   membership_remaining_days: number | null;
+  membership_period_days: number | null;
 }
 
 function remainingBadge(days: number): string {
@@ -69,10 +70,6 @@ function remainingBadge(days: number): string {
   }
   return `已过期 ${-days} 天`;
 }
-
-/** 会员轨道填充的年度参照：本地只有到期日与剩余天数，无会员开始日，
- * 按剩余天数 / 365 折算占比（封顶 100%，0 与负数条为空）。 */
-const MEMBERSHIP_YEAR_DAYS = 365;
 
 /** 剩余 >30 天绿、8–30 天黄、1–7 天橙、0 与负数红，与额度条四档 tone 同一套视觉语言。 */
 function remainingTone(days: number): Tone {
@@ -88,14 +85,17 @@ function remainingTone(days: number): Tone {
   return "ok";
 }
 
-/** 占比保留 1 位小数，避免 HTML 里出现无限小数。 */
-function remainingPercent(days: number): number {
-  const raw = Math.max(0, Math.min(100, (days / MEMBERSHIP_YEAR_DAYS) * 100));
-  return Math.round(raw * 10) / 10;
+/** 已度过比例（%）：（周期天数 − 剩余天数）/ 周期天数，保留 1 位小数。
+ * 周期最后一天剩余为 0 → 恰为 100%；过期后按满条处理（封顶 100%）。 */
+function remainingPercent(remaining: number, period: number): number {
+  const raw = ((period - remaining) / period) * 100;
+  return Math.round(Math.max(0, Math.min(100, raw)) * 10) / 10;
 }
 
 /** 额度 stack 顶部的会员轨道：有档位且有到期日（含剩余天数，0 与负数也算）才画。
- * 借用额度行外形与四档 tone；填充=剩余时间占比（年度参照），不是用量压力。 */
+ * 填充=已度过比例（朝到期日推进，周期来自 currentStartTime 的真实日历天数，
+ * 最后一天走满；不是用量压力），四档 tone 仍按剩余天数。
+ * 周期缺失（旧绑定未刷新出开始键）只降级为空槽不画填充，徽章与日期照常。 */
 export function membershipTrackHtml(row: MembershipTrackFields): string {
   if (
     row.membership == null ||
@@ -107,13 +107,24 @@ export function membershipTrackHtml(row: MembershipTrackFields): string {
   const badge = remainingBadge(row.membership_remaining_days);
   const date = row.membership_expiry;
   const sentence = `会员 ${badge} 有效期至 ${date}`;
-  const width = remainingPercent(row.membership_remaining_days);
-  const tone = remainingTone(row.membership_remaining_days);
+  const period =
+    row.membership_period_days != null && row.membership_period_days > 0
+      ? row.membership_period_days
+      : null;
+  const width =
+    period == null ? null : remainingPercent(row.membership_remaining_days, period);
+  const fill =
+    width == null
+      ? ""
+      : `<div class="quota-fill quota-fill--${remainingTone(row.membership_remaining_days)}" style="width:${width}%"></div>`;
+  const progressAttrs =
+    width == null
+      ? ""
+      : ` role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(width)}" aria-valuetext="${escapeHtml(sentence)}"`;
   return `<div class="quota-row">
         <span class="quota-label">会员</span>
-        <div class="quota-track" role="progressbar" aria-label="${escapeHtml(sentence)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(width)}" aria-valuetext="${escapeHtml(sentence)}" title="${escapeHtml(sentence)}">
-          <div class="quota-fill quota-fill--${tone}" style="width:${width}%"></div>
-          <span class="quota-value">${escapeHtml(badge)}</span>
+        <div class="quota-track"${progressAttrs} title="${escapeHtml(sentence)}" aria-label="${escapeHtml(sentence)}">
+          ${fill}<span class="quota-value">${escapeHtml(badge)}</span>
         </div>
         <span class="quota-reset">${escapeHtml(date)}</span>
       </div>`;
