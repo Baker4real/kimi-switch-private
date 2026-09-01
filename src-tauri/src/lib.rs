@@ -5,7 +5,7 @@ compile_error!("生产构建不能走 Vite devUrl，请启用 feature custom-pro
 
 use std::sync::Arc;
 
-use kimi_switch_gui::{Backend, CommandError, Snapshot, ThemeId};
+use kimi_switch_gui::{Backend, CommandError, QuotaCollectReason, Snapshot, ThemeId};
 use tauri::{Manager, State};
 
 struct AppState {
@@ -17,9 +17,18 @@ fn map_err(err: anyhow::Error) -> CommandError {
 }
 
 /// 列出账号并 collect 额度（节流）。启动加载、静默查询、刷新按钮共用这一条。
+/// `user_initiated` 缺省为计划内；点「刷新」传 true 走用户发起的额度查询。
 #[tauri::command]
-async fn list_accounts(state: State<'_, AppState>) -> Result<Snapshot, CommandError> {
-    Ok(state.backend.snapshot(None).await)
+async fn list_accounts(
+    state: State<'_, AppState>,
+    user_initiated: Option<bool>,
+) -> Result<Snapshot, CommandError> {
+    let reason = if user_initiated.unwrap_or(false) {
+        QuotaCollectReason::UserInitiated
+    } else {
+        QuotaCollectReason::Scheduled
+    };
+    Ok(state.backend.snapshot(None, reason).await)
 }
 
 #[tauri::command]
@@ -67,6 +76,17 @@ async fn complete_device_auth(state: State<'_, AppState>) -> Result<Snapshot, Co
 #[tauri::command]
 fn cancel_device_auth(state: State<'_, AppState>) {
     state.backend.cancel_device_auth();
+}
+
+/// 绑定网页登录（issue #51）：`token` 由前端绑定对话框粘贴传入，只发给 #50 的
+/// kimi 管道（域名固定 www.kimi.com），不落日志、不进返回的 Snapshot。
+#[tauri::command]
+async fn bind_web_account(
+    state: State<'_, AppState>,
+    id: String,
+    token: String,
+) -> Result<Snapshot, CommandError> {
+    state.backend.bind_web(&id, &token).await.map_err(map_err)
 }
 
 #[tauri::command]
@@ -125,6 +145,7 @@ pub fn run() {
             start_device_auth,
             complete_device_auth,
             cancel_device_auth,
+            bind_web_account,
             open_url,
             set_theme,
             set_proactive_renewal,

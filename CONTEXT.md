@@ -67,3 +67,11 @@ _Avoid_: 续命, 重新登录, 换绑
 **会员等级**:
 官网订阅档位名（如 Allegretto、Allegro）。`/usages` 给的是 `LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 等内部枚举，GUI 展示层映射成官网名，只用于辨认账号。
 _Avoid_: 套餐, plan；用户可见文案不要写 Intermediate / Advanced
+
+**会员到期**:
+官方付费档位对这张账号失效的那一天。过了这天该账号不再处于当前会员等级。
+_Avoid_: 账号过期, 登录过期, 套餐到期, 额度重置, 会员月度周期结束
+
+**绑定网页登录**:
+为某张账号提供 Kimi 网页消费者登录，只为读取该卡的会员到期。和设备码授权、重新授权不是同一件事。
+_Avoid_: 绑 cookie, 同步订阅, 网页 OAuth（对用户）

@@ -8,12 +8,22 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::defaults;
 use crate::error::{Error, QuotaFailure};
 use crate::model::{AccountId, Quota};
 use crate::provider::Provider;
 use crate::quota_cache::{quota_failure_of, QuotaCache, ValidEntry};
 use crate::quota_query::query_quota_with_retry;
 use crate::settings::{self, Quota as QuotaSettings};
+
+/// 额度快照收集原因：决定成功缓存的节流窗口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaCollectReason {
+    /// 计划内列出（启动、静默、CLI、import/swap 后再列出）：90s 成功节流。
+    Scheduled,
+    /// 用户点「刷新」发起的额度查询：5s 连点窗口。
+    UserInitiated,
+}
 
 /// 单个账号的额度快照。
 #[derive(Debug, Clone)]
@@ -40,23 +50,74 @@ pub enum QuotaState {
     Failed(QuotaFailure),
 }
 
+/// 一次额度收集里各账号为何跳过或真正发起了查询。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaCollectStats {
+    /// 真正向 Provider 发起额度查询的账号数。
+    pub queried: usize,
+    /// 成功缓存仍在节流窗内而跳过。
+    pub skipped_success_throttle: usize,
+    /// 因 429 退避跳过。
+    pub skipped_rate_limit: usize,
+    /// 因鉴权失败或凭证待续期退避跳过。
+    pub skipped_auth: usize,
+}
+
+/// 额度快照与跳过统计。GUI 用统计决定用户发起时要不要带提示。
+#[derive(Debug, Clone)]
+pub struct QuotaCollectOutcome {
+    pub snapshots: Vec<QuotaSnapshot>,
+    pub stats: QuotaCollectStats,
+}
+
 /// 查询一组账号的额度快照。
 ///
-/// 内部读缓存、按当前配置做 90s 节流与失败退避、并发查询（含超时重试）、陈旧回退并写回缓存。
+/// 内部读缓存、按收集原因做成功节流、失败退避、并发查询（含超时重试）、陈旧回退并写回缓存。
+/// [`QuotaCollectReason::Scheduled`] 用配置里的最小间隔（默认 90s）；
+/// [`QuotaCollectReason::UserInitiated`] 用 5s 连点窗口。
+/// 失败退避：429 与鉴权（401/403/凭证待续期）两种原因都不打网；
+/// 超时/网络等 [`Error::is_retryable`] 失败仅计划内跳过，用户发起会再查。
 pub async fn collect<P>(
     provider: Arc<P>,
     provider_id: &str,
     account_ids: &[AccountId],
     cache_path: &Path,
+    reason: QuotaCollectReason,
 ) -> Vec<QuotaSnapshot>
+where
+    P: Provider + 'static,
+{
+    collect_detailed(provider, provider_id, account_ids, cache_path, reason)
+        .await
+        .snapshots
+}
+
+/// 同 [`collect`]，额外返回跳过/查询统计。
+pub async fn collect_detailed<P>(
+    provider: Arc<P>,
+    provider_id: &str,
+    account_ids: &[AccountId],
+    cache_path: &Path,
+    reason: QuotaCollectReason,
+) -> QuotaCollectOutcome
 where
     P: Provider + 'static,
 {
     let cfg = settings::current().quota.clone();
     let mut cache = QuotaCache::load(cache_path);
-    let out = collect_with(provider, provider_id, account_ids, &mut cache, &cfg).await;
+    let (snapshots, stats) =
+        collect_with(provider, provider_id, account_ids, &mut cache, &cfg, reason).await;
     cache.save(cache_path);
-    out
+    QuotaCollectOutcome { snapshots, stats }
+}
+
+fn success_throttle(reason: QuotaCollectReason, cfg: &QuotaSettings) -> Duration {
+    match reason {
+        QuotaCollectReason::Scheduled => Duration::from_millis(cfg.min_refresh_interval_ms),
+        QuotaCollectReason::UserInitiated => {
+            Duration::from_millis(defaults::QUOTA_USER_INITIATED_MIN_INTERVAL_MS)
+        }
+    }
 }
 
 async fn collect_with<P>(
@@ -65,17 +126,21 @@ async fn collect_with<P>(
     account_ids: &[AccountId],
     cache: &mut QuotaCache,
     cfg: &QuotaSettings,
-) -> Vec<QuotaSnapshot>
+    reason: QuotaCollectReason,
+) -> (Vec<QuotaSnapshot>, QuotaCollectStats)
 where
     P: Provider + 'static,
 {
     let min_refresh = Duration::from_millis(cfg.min_refresh_interval_ms);
+    let success_throttle = success_throttle(reason, cfg);
     let backoff_cap = Duration::from_millis(cfg.failure_backoff_max_ms);
     let mut out: Vec<Option<QuotaSnapshot>> = vec![None; account_ids.len()];
     let mut jobs = Vec::new();
+    let mut stats = QuotaCollectStats::default();
 
     for (idx, id) in account_ids.iter().enumerate() {
-        if let Some(entry) = cache.fresh(provider_id, &id.0, min_refresh) {
+        if let Some(entry) = cache.fresh(provider_id, &id.0, success_throttle) {
+            stats.skipped_success_throttle += 1;
             out[idx] = Some(from_cache(id, entry, false));
             continue;
         }
@@ -83,13 +148,26 @@ where
             cache.in_failure_backoff(provider_id, &id.0, min_refresh, backoff_cap)
         {
             let error = failure.as_error();
-            let failed_at = failure.failed_at;
-            out[idx] = Some(match cache.get(provider_id, &id.0) {
-                Some(entry) if !error.is_authentication_failure() => from_cache(id, entry, true),
-                _ => failed(id, error, failed_at),
-            });
-            continue;
+            // 用户点「刷新」时，可重试失败（超时/网络等）忽略退避再打一次；
+            // 429 与鉴权失败两种原因都继续跳过。
+            let retry_now = reason == QuotaCollectReason::UserInitiated
+                && error.is_retryable()
+                && !error.is_authentication_failure();
+            if !retry_now {
+                if error.http_status() == Some(429) {
+                    stats.skipped_rate_limit += 1;
+                } else if error.is_authentication_failure() {
+                    stats.skipped_auth += 1;
+                }
+                let failed_at = failure.failed_at;
+                out[idx] = Some(match cache.get(provider_id, &id.0) {
+                    Some(entry) if !error.is_authentication_failure() => from_cache(id, entry, true),
+                    _ => failed(id, error, failed_at),
+                });
+                continue;
+            }
         }
+        stats.queried += 1;
         jobs.push((idx, id.clone()));
     }
 
@@ -138,7 +216,8 @@ where
         }
     }
 
-    out.into_iter()
+    let snapshots = out
+        .into_iter()
         .enumerate()
         .map(|(idx, item)| {
             item.unwrap_or_else(|| {
@@ -149,7 +228,8 @@ where
                 )
             })
         })
-        .collect()
+        .collect();
+    (snapshots, stats)
 }
 
 fn from_cache(id: &AccountId, entry: ValidEntry, stale: bool) -> QuotaSnapshot {
@@ -296,7 +376,14 @@ mod tests {
         names: &[&str],
         cache_path: &Path,
     ) -> Vec<QuotaSnapshot> {
-        collect(provider, "kimi", &ids(names), cache_path).await
+        collect(
+            provider,
+            "kimi",
+            &ids(names),
+            cache_path,
+            QuotaCollectReason::Scheduled,
+        )
+        .await
     }
 
     fn cached_quotas(state: &QuotaState) -> &[Quota] {
@@ -331,6 +418,147 @@ mod tests {
         assert!(matches!(snaps[0].state, QuotaState::Cached(_)));
         assert_eq!(cached_quotas(&snaps[0].state)[0].used, 1);
         assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_INTERMEDIATE"));
+    }
+
+    #[tokio::test]
+    async fn user_initiated_queries_when_success_cache_is_10s_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.set(
+            "kimi",
+            "alice",
+            vec![sample("alice", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        cache.age_success("kimi", "alice", ChronoDuration::seconds(10));
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
+        let snaps = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!snaps[0].stale);
+        assert!(matches!(snaps[0].state, QuotaState::Ready(_)));
+        assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
+
+        let written = QuotaCache::load(&path);
+        let entry = written.get("kimi", "alice").expect("success cache rewritten");
+        assert!(Utc::now() - entry.cached_at < ChronoDuration::seconds(2));
+        assert_eq!(entry.quotas[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
+    }
+
+    #[tokio::test]
+    async fn user_initiated_skips_query_when_success_cache_is_1s_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.set(
+            "kimi",
+            "alice",
+            vec![sample("alice", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        cache.age_success("kimi", "alice", ChronoDuration::seconds(1));
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
+        let snaps = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(!snaps[0].stale);
+        assert!(matches!(snaps[0].state, QuotaState::Cached(_)));
+        assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_INTERMEDIATE"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_skips_query_when_success_cache_is_10s_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.set(
+            "kimi",
+            "alice",
+            vec![sample("alice", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        cache.age_success("kimi", "alice", ChronoDuration::seconds(10));
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
+        let snaps = run(provider.clone(), &["alice"], &path).await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(!snaps[0].stale);
+        assert!(matches!(snaps[0].state, QuotaState::Cached(_)));
+        assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_INTERMEDIATE"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_skips_within_90s_after_user_initiated_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.set(
+            "kimi",
+            "alice",
+            vec![sample("alice", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        cache.age_success("kimi", "alice", ChronoDuration::seconds(10));
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
+        let first = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(first[0].state, QuotaState::Ready(_)));
+
+        let second = run(provider.clone(), &["alice"], &path).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!second[0].stale);
+        assert!(matches!(second[0].state, QuotaState::Cached(_)));
+        assert_eq!(second[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
     }
 
     #[tokio::test]
@@ -528,5 +756,265 @@ mod tests {
         assert!(matches!(snaps[0].state, QuotaState::Cached(_)));
         assert_eq!(snaps[1].membership.as_deref(), Some("LEVEL_ADVANCED"));
         assert!(matches!(snaps[1].state, QuotaState::Ready(_)));
+    }
+
+    #[tokio::test]
+    async fn user_initiated_queries_during_retryable_failure_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.record_failure("kimi", "alice", &Error::quota_timeout());
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
+        let snaps = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!snaps[0].stale);
+        assert!(matches!(snaps[0].state, QuotaState::Ready(_)));
+        assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_skips_query_during_retryable_failure_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.record_failure("kimi", "alice", &Error::quota_timeout());
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
+        let snaps = run(provider.clone(), &["alice"], &path).await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        match &snaps[0].state {
+            QuotaState::Failed(failure) => {
+                assert_eq!(failure.kind, QuotaFailureKind::Timeout);
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_initiated_retryable_success_clears_failure_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.record_failure("kimi", "alice", &Error::quota_timeout());
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[("alice", Ok(vec![sample("alice", None, None)]))],
+        );
+        let _ = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        let written = QuotaCache::load(&path);
+        assert!(written
+            .in_failure_backoff(
+                "kimi",
+                "alice",
+                Duration::from_secs(90),
+                Duration::from_secs(900),
+            )
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn user_initiated_skips_query_during_429_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.set("kimi", "alice", vec![sample("alice", None, None)]);
+        cache.age_success("kimi", "alice", ChronoDuration::minutes(5));
+        cache.record_failure("kimi", "alice", &Error::quota_http(429, "429 rate limited"));
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
+        let snaps = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(snaps[0].stale);
+        assert!(matches!(snaps[0].state, QuotaState::Cached(_)));
+        assert_eq!(cached_quotas(&snaps[0].state)[0].used, 1);
+    }
+
+    #[tokio::test]
+    async fn user_initiated_skips_query_during_credential_expired_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.record_failure(
+            "kimi",
+            "alice",
+            &Error::quota_credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            ),
+        );
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(Duration::ZERO, &[("alice", Ok(vec![]))]);
+        let snaps = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        match &snaps[0].state {
+            QuotaState::Failed(failure) => {
+                assert_eq!(failure.kind, QuotaFailureKind::CredentialExpired);
+                assert_eq!(failure.status, Some(401));
+            }
+            other => panic!("expected failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_initiated_queries_due_accounts_and_keeps_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.set(
+            "kimi",
+            "alice",
+            vec![sample("alice", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        cache.age_success("kimi", "alice", ChronoDuration::seconds(10));
+        cache.set(
+            "kimi",
+            "bob",
+            vec![sample("bob", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        cache.age_success("kimi", "bob", ChronoDuration::seconds(1));
+        let mut carol_cached = sample("carol", Some("LEVEL_INTERMEDIATE"), None);
+        carol_cached.used = 3;
+        cache.set("kimi", "carol", vec![carol_cached]);
+        cache.age_success("kimi", "carol", ChronoDuration::minutes(5));
+        cache.record_failure("kimi", "carol", &Error::quota_http(429, "429 rate limited"));
+        cache.save(&path);
+
+        let mut alice_fresh = sample("alice", Some("LEVEL_ADVANCED"), None);
+        alice_fresh.used = 42;
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[
+                ("alice", Ok(vec![alice_fresh])),
+                ("bob", Ok(vec![sample("bob", Some("LEVEL_ADVANCED"), None)])),
+                (
+                    "carol",
+                    Ok(vec![sample("carol", Some("LEVEL_ADVANCED"), None)]),
+                ),
+            ],
+        );
+        let snaps = collect(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice", "bob", "carol"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(snaps[0].state, QuotaState::Ready(_)));
+        assert_eq!(cached_quotas(&snaps[0].state)[0].used, 42);
+        assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
+        assert!(!snaps[1].stale);
+        assert!(matches!(snaps[1].state, QuotaState::Cached(_)));
+        assert_eq!(snaps[1].membership.as_deref(), Some("LEVEL_INTERMEDIATE"));
+        assert_eq!(cached_quotas(&snaps[1].state)[0].used, 1);
+        assert!(snaps[2].stale);
+        assert!(matches!(snaps[2].state, QuotaState::Cached(_)));
+        assert_eq!(cached_quotas(&snaps[2].state)[0].used, 3);
+        assert_eq!(snaps[2].membership.as_deref(), Some("LEVEL_INTERMEDIATE"));
+    }
+
+    #[tokio::test]
+    async fn collect_stats_classify_user_initiated_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.set(
+            "kimi",
+            "alice",
+            vec![sample("alice", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        cache.age_success("kimi", "alice", ChronoDuration::seconds(1));
+        cache.record_failure("kimi", "bob", &Error::quota_http(429, "429 rate limited"));
+        cache.record_failure(
+            "kimi",
+            "carol",
+            &Error::quota_credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            ),
+        );
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[
+                ("alice", Ok(vec![])),
+                ("bob", Ok(vec![])),
+                ("carol", Ok(vec![])),
+            ],
+        );
+        let outcome = collect_detailed(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice", "bob", "carol"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.stats.queried, 0);
+        assert_eq!(outcome.stats.skipped_success_throttle, 1);
+        assert_eq!(outcome.stats.skipped_rate_limit, 1);
+        assert_eq!(outcome.stats.skipped_auth, 1);
     }
 }

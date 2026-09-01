@@ -4,6 +4,7 @@ pub mod account_registry;
 pub mod audit;
 pub mod defaults;
 pub mod error;
+pub mod membership_expiry;
 pub mod model;
 pub mod paths;
 pub mod provider;
@@ -22,13 +23,20 @@ pub mod time;
 pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
 pub use error::{
-    Error, ProviderFailure, ProviderKind, QuotaFailure, QuotaFailureKind, ReauthError, Result,
+    BindWebError, Error, ProviderFailure, ProviderKind, QuotaFailure, QuotaFailureKind, ReauthError,
+    Result,
+};
+pub use membership_expiry::{
+    format_membership_expiry, membership_expiry_from_extra, prettify_membership,
+    write_membership_extra, EXTRA_CURRENT_END_TIME, EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
 };
 pub use model::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
 pub use provider::Provider;
 pub use quota_cache::{CachedEntry, QuotaCache, ValidEntry};
 pub use quota_query::query_quota_with_retry;
-pub use quota_snapshot::{QuotaSnapshot, QuotaState};
+pub use quota_snapshot::{
+    QuotaCollectOutcome, QuotaCollectReason, QuotaCollectStats, QuotaSnapshot, QuotaState,
+};
 pub use remove_account::remove_account;
 pub use removed::RemovedAccounts;
 pub use store::{CredentialStore, FileStore, KeyringStore};

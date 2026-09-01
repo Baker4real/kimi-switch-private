@@ -6,7 +6,11 @@
 //!   （`~/.kimi-code/credentials/kimi-code.json`）。
 //! - `kimi-switch swap <id|N>`  — 切换激活账号。原子写 + 快照回滚，不依赖网络/quota。
 //!   无参数时只打印编号列表，不做切换。
-//! - `kimi-switch rm <id|N>`    — 删除账号（registry + 凭证仓库 + 墓碑）。
+//! - `kimi-switch rm <id|N>`    — 删除账号（registry + 凭证仓库 + 墓碑；网页会员
+//!   凭证与会员到期 extra 一并清理）。
+//! - `kimi-switch bind-web <id|N>` — 绑定网页登录（issue #50，ADR-0004）：从 stdin
+//!   读网页 token（TTY 隐藏回显，**没有 `--token` 旗标**），身份门通过后把会员
+//!   到期写进账号 extra，默认列表即可见「有效期至」。
 //! - `kimi-switch config`       — 打印生效配置（含 `proactive_renewal.enabled`，只读）。
 //!   与 GUI 设置页同源：都是 `<config_dir>/config.toml`。
 //!
@@ -19,8 +23,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    settings, Account, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
-    KeyringStore, Provider, Quota, QuotaState, QuotaWindow, RemovedAccounts,
+    membership_expiry_from_extra, prettify_membership, settings, Account, AccountRegistry,
+    AuditEvent, AuditLog, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaState,
+    QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 
@@ -57,6 +62,12 @@ enum Cmd {
 
     /// Remove <id|N> from the registry and credential store.
     Rm {
+        /// Account index (e.g. `1`), id, label, or `kimi/<id>`.
+        id: String,
+    },
+
+    /// Bind the web login of <id|N> to show membership expiry (reads token from stdin).
+    BindWeb {
         /// Account index (e.g. `1`), id, label, or `kimi/<id>`.
         id: String,
     },
@@ -140,6 +151,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Login { provider }) => login(&ctx, &provider),
         Some(Cmd::Swap { id }) => swap(&ctx, id.as_deref()).await,
         Some(Cmd::Rm { id }) => rm(&ctx, &id).await,
+        Some(Cmd::BindWeb { id }) => bind_web(&ctx, &id).await,
         Some(Cmd::Config) => config(),
     }
 }
@@ -163,14 +175,24 @@ async fn status(ctx: &AppContext) -> Result<()> {
     let cache_path = AppPaths::resolve()?.quota_cache_file();
     let ids: Vec<_> = accounts.iter().map(|account| account.id.clone()).collect();
     let snapshots =
-        kimi_switch_core::quota_snapshot::collect(ctx.kimi.clone(), "kimi", &ids, &cache_path)
-            .await;
+        kimi_switch_core::quota_snapshot::collect(
+            ctx.kimi.clone(),
+            "kimi",
+            &ids,
+            &cache_path,
+            kimi_switch_core::QuotaCollectReason::Scheduled,
+        )
+        .await;
 
-    // 4. 渲染。CLI 仍不打印会员等级；节流命中不标 stale，失败回落标 `(stale)`。
+    // 4. 渲染。账号 id 旁带档位名与会员到期（extra 有 → `有效期至 <日期>`；
+    //    无 → 绑定弱提示）；节流命中不标 stale，失败回落标 `(stale)`。
     println!("kimi");
     for (idx, (account, snapshot)) in accounts.iter().zip(snapshots.iter()).enumerate() {
         let n = idx + 1;
         let star = if account.active { "*" } else { " " };
+        let plan_text = membership_status_text(snapshot.membership.as_deref(), &account.extra)
+            .map(|plan| format!(" {plan}"))
+            .unwrap_or_default();
         let quota_text = match &snapshot.state {
             QuotaState::Failed(error) => format!("quota: {error}"),
             QuotaState::Ready(quotas) | QuotaState::Cached(quotas) if snapshot.stale => {
@@ -178,9 +200,23 @@ async fn status(ctx: &AppContext) -> Result<()> {
             }
             QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => format_quotas(quotas),
         };
-        println!("  {star} {n:>2}  {:<24} {quota_text}", account.id);
+        println!("  {star} {n:>2}  {:<24}{plan_text} {quota_text}", account.id);
     }
     Ok(())
+}
+
+/// 账号行的会员档位段（issue #49）：档位名 + `有效期至 <东八区日期>`
+/// （extra 有到期瞬间）或 `bind web login to show expiry`（绑定弱提示）。
+/// 档位缺失（无额度数据）时返回 `None`，该行保持现状，不强加提示。
+fn membership_status_text(
+    membership: Option<&str>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let name = prettify_membership(membership?);
+    Some(match membership_expiry_from_extra(extra) {
+        Some(expiry) => format!("{name} 有效期至 {expiry}"),
+        None => format!("{name} bind web login to show expiry"),
+    })
 }
 
 /// 扫本地 `~/.kimi-code`；当前账号没记录过就入库（已存在则对齐 active）。墓碑命中或未登录则跳过。
@@ -328,6 +364,82 @@ async fn rm(ctx: &AppContext, id_input: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// bind-web
+// ---------------------------------------------------------------------------
+
+/// 绑定网页登录（issue #50，ADR-0004）。token 只从 stdin 读（TTY 隐藏回显），
+/// **没有 `--token` 旗标**（命令行参数会进 shell 历史与进程列表）。
+/// 管道在 kimi 适配器：身份门（JWT `sub` 回退 `user_id` 比对账号 id）失败时
+/// 英文报错、库存不动；成功后账号 extra 带会员到期，默认列表可见「有效期至」。
+async fn bind_web(ctx: &AppContext, id_input: &str) -> Result<()> {
+    let acc = resolve_account(ctx, id_input)?;
+    let web_token = read_web_token_from_stdin()?;
+
+    let outcome = kimi_switch_kimi::web_membership::bind_web(
+        ctx.registry.as_ref(),
+        ctx.store.as_ref(),
+        &acc.id,
+        &web_token,
+    )
+    .await;
+
+    match outcome {
+        Ok(binding) => {
+            ctx.audit
+                .append(AuditEvent::ok("bind-web", "kimi", Some(acc.id.0.as_str())));
+            match binding.expiry_text.as_deref() {
+                // 到期日与默认列表同一口径（#49 format_membership_expiry，东八区日历日）。
+                Some(expiry) => println!("bind-web → kimi/{} (membership valid until {expiry})", acc.id),
+                None => println!("bind-web → kimi/{} (no membership end time found)", acc.id),
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // 管道保证错误文案英文且不含 token。
+            ctx.audit.append(AuditEvent::err(
+                "bind-web",
+                "kimi",
+                Some(acc.id.0.as_str()),
+                &e.to_string(),
+            ));
+            Err(anyhow::Error::from(e).context(format!("bind-web kimi/{} failed", acc.id)))
+        }
+    }
+}
+
+/// 从 stdin 读网页 token：TTY 下用 [`dialoguer::Password`] 隐藏回显；
+/// 非 TTY（管道 / 重定向）按行读取（脚本与测试走这条路径）。
+/// 空输入视为失败——没有 token 就没有绑定。
+fn read_web_token_from_stdin() -> Result<String> {
+    use std::io::IsTerminal;
+
+    let raw = if std::io::stdin().is_terminal() {
+        dialoguer::Password::new()
+            .with_prompt("Paste web token (hidden; from www.kimi.com)")
+            .interact()
+            .context("read web token from terminal")?
+    } else {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("read web token from stdin")?;
+        line
+    };
+    normalize_web_token(raw)
+}
+
+/// 规整 stdin 读到的 token：去首尾空白（含换行）；空输入视为失败。
+fn normalize_web_token(raw: String) -> Result<String> {
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("no web token provided on stdin");
+    }
+    Ok(token)
+}
+
+// ---------------------------------------------------------------------------
 // config
 // ---------------------------------------------------------------------------
 
@@ -351,5 +463,94 @@ mod tests {
         let text = super::render_config().unwrap();
         assert!(text.contains("proactive_renewal"), "{text}");
         assert!(text.contains("enabled"), "{text}");
+    }
+
+    /// 会员档位段（issue #49）：extra 有到期瞬间 → 档位名 + `有效期至 <实抓日期>`；
+    /// 档位在但无到期 → 绑定弱提示（不是错误）；档位缺失 → None 保持现状。
+    #[test]
+    fn membership_status_text_binds_expiry_or_hint() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "membership_current_end_time".into(),
+            serde_json::Value::String("2027-08-28T00:00:00Z".into()),
+        );
+        extra.insert(
+            "membership_next_billing_time".into(),
+            serde_json::Value::String("2027-08-27T01:25:37.930341Z".into()),
+        );
+        assert_eq!(
+            super::membership_status_text(Some("LEVEL_INTERMEDIATE"), &extra).as_deref(),
+            Some("Allegretto 有效期至 2027-08-27")
+        );
+
+        // 档位在但没绑定网页登录：弱提示。
+        assert_eq!(
+            super::membership_status_text(Some("LEVEL_ADVANCED"), &serde_json::Map::new())
+                .as_deref(),
+            Some("Allegro bind web login to show expiry")
+        );
+
+        // 档位缺失（额度查询失败）：保持现状。
+        assert_eq!(super::membership_status_text(None, &extra), None);
+    }
+
+    /// bind-web（issue #50）：**没有 `--token` 旗标**（命令行参数会进 shell
+    /// 历史与进程列表）；token 只从 stdin 读；位置参数仍是账号引用。
+    #[test]
+    fn bind_web_has_no_token_flag() {
+        use super::{Cli, Cmd};
+        use clap::Parser as _;
+
+        let ok = Cli::try_parse_from(["kimi-switch", "bind-web", "1"]);
+        assert!(matches!(
+            ok.unwrap().cmd,
+            Some(Cmd::BindWeb { ref id }) if id == "1"
+        ));
+        assert!(
+            Cli::try_parse_from(["kimi-switch", "bind-web", "1", "--token", "x"]).is_err(),
+            "--token 旗标不得存在"
+        );
+        assert!(
+            Cli::try_parse_from(["kimi-switch", "bind-web", "1", "--token=x"]).is_err(),
+            "--token=... 形式同样不得存在"
+        );
+    }
+
+    /// stdin 读到的 token：去首尾空白（管道输入带换行）；空输入失败。
+    #[test]
+    fn normalize_web_token_trims_and_rejects_empty() {
+        assert_eq!(
+            super::normalize_web_token("  header.payload.sig\n".into()).unwrap(),
+            "header.payload.sig"
+        );
+        assert_eq!(
+            super::normalize_web_token("header.payload.sig".into()).unwrap(),
+            "header.payload.sig"
+        );
+        for empty in ["", "\n", "   \t"] {
+            assert!(
+                super::normalize_web_token(empty.into()).is_err(),
+                "空输入必须失败：{empty:?}"
+            );
+        }
+    }
+
+    /// 闭环（issue #50）：绑定管道写侧（`write_membership_extra`）产出的 extra
+    /// → 默认列表行出现「有效期至」。写入与渲染隔着两层 crate，这里用与
+    /// 管道测试同一实抓样例钉住两端契约衔接。
+    #[test]
+    fn membership_status_text_renders_extra_written_by_bind_pipeline() {
+        let current_end = "2027-08-28T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let next_billing = "2027-08-27T01:25:37.930341Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let mut extra = serde_json::Map::new();
+        kimi_switch_core::write_membership_extra(&mut extra, Some(current_end), Some(next_billing));
+        assert_eq!(
+            super::membership_status_text(Some("LEVEL_ADVANCED"), &extra).as_deref(),
+            Some("Allegro 有效期至 2027-08-27")
+        );
     }
 }

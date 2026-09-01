@@ -139,6 +139,16 @@ pub struct AccountRow {
     pub label: String,
     pub active: bool,
     pub membership: Option<String>,
+    /// 会员到期日（东八区 `YYYY-MM-DD`，来自账号 extra 的到期瞬间，Rust 侧已格式化）。
+    /// 无到期数据为 `None`；只是缺展示信息，不是错误，不计告急、不按错误红。
+    /// 用户发起刷新成功时是刚拿到的新值；刷新失败时保留 extra 缓存旧值（#52）。
+    pub membership_expiry: Option<String>,
+    /// 档位在且（无到期日，或本次用户发起刷新中会员获取失败）：档位旁显示弱提示
+    /// （灰样式，非错误红）。文案两态：无到期日 →「绑定后可显示有效期」（#49 票面
+    /// 原文）；有到期日的刷新失败态 →「重新绑定后可刷新有效期」。提示可与日期
+    /// 共存——刷新失败（含网页 token 失效）保留旧日期并再现提示，引导重新绑定
+    /// （#52）。档位本身缺失（无额度数据）时为 `false`，保持现状不强加提示。
+    pub membership_expiry_hint: bool,
     pub quotas: Vec<QuotaView>,
     /// 失败展示文案。`credential_expired` 为 true 时是「凭证待续期」的引导文案，
     /// 否则是一般额度查询失败。
@@ -146,7 +156,8 @@ pub struct AccountRow {
     /// 凭证待续期：凭证过期型 401（`QuotaFailureKind::CredentialExpired`）。
     /// 凭证生命周期状态而非查询故障：不计告急，前端不按错误红渲染。
     pub credential_expired: bool,
-    /// 陈旧回退时的缓存取得时间（本地展示文案）；新鲜或节流命中为 `None`。
+    /// 额度取得时间的本地展示文案：非陈旧为「更新于 {时分}」，陈旧回退为「缓存于 {时分}」。
+    /// 查询失败且无缓存回退（含凭证待续期）为 `None`——没有可标注的取得时间。
     pub cached_at: Option<String>,
 }
 

@@ -65,9 +65,13 @@ describe("quotaHtml", () => {
   });
 
   it("有 cached_at 时追加灰字时间", () => {
-    const html = quotaHtml([], "超时", "缓存于 12:00", false);
-    expect(html).toContain(`额度查询失败: 超时`);
-    expect(html).toContain(`<p class="quota-cached">缓存于 12:00</p>`);
+    const cached = quotaHtml([], "超时", "缓存于 12:00", false);
+    expect(cached).toContain(`额度查询失败: 超时`);
+    expect(cached).toContain(`<p class="quota-cached">缓存于 12:00</p>`);
+
+    const updated = quotaHtml([quota()], null, "更新于 12:00", false);
+    expect(updated).toContain(`<p class="quota-cached">更新于 12:00</p>`);
+    expect(updated).toContain(`role="progressbar"`);
   });
 
   it("凭证待续期用独立状态行而非错误红", () => {

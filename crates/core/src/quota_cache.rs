@@ -204,9 +204,10 @@ impl QuotaCache {
         Some(entry)
     }
 
-    /// 把成功缓存的时间戳拨到过去，供额度快照测试模拟节流窗口已过。
-    #[cfg(test)]
-    pub(crate) fn age_success(&mut self, provider: &str, account_id: &str, age: Duration) {
+    /// 把成功缓存的时间戳拨到过去，供测试模拟节流窗口已过。
+    /// 跨 crate 的 gui 测试需要，故保持 pub。
+    #[doc(hidden)]
+    pub fn age_success(&mut self, provider: &str, account_id: &str, age: Duration) {
         if let Some(entry) = self.entries.get_mut(&cache_key(provider, account_id)) {
             entry.cached_at = Utc::now() - age;
         }

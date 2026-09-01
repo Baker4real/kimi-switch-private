@@ -17,12 +17,12 @@ kimi-switch-core.workspace = true
 kimi-switch-kimi.workspace = true
 
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 serde_json.workspace = true
 tempfile = "3"

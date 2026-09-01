@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
-    KeyringStore, Provider, Quota, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow,
-    RemovedAccounts,
+    membership_expiry_from_extra, prettify_membership, Account, AccountId, AccountRegistry,
+    AuditEvent, AuditLog, CredentialStore, FileStore, KeyringStore, Provider, Quota,
+    QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState,
+    QuotaWindow, RemovedAccounts, WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
+use kimi_switch_kimi::web_membership::{self, WebBinding};
 use kimi_switch_kimi::KimiProvider;
 
 use crate::dto::{AccountRow, AuthLink, QuotaView, Snapshot, ThemeId, UiMessage};
@@ -20,6 +22,8 @@ pub struct Backend {
     registry: Arc<AccountRegistry>,
     kimi: Arc<KimiProvider>,
     audit: AuditLog,
+    /// 会员到期「仅刷新」的生产替身（issue #52）：只在 UserInitiated 行列组装时被调用。
+    web_membership: Arc<LiveWebMembershipRefresh>,
     /// 进行中的设备码授权；第三项是「按卡授权」的目标账号 id（None = 添加新账号）。
     pending_auth: Mutex<Option<(DeviceAuthorization, Arc<AtomicBool>, Option<AccountId>)>>,
 }
@@ -34,11 +38,16 @@ impl Backend {
         let registry = Arc::new(AccountRegistry::from_default_paths()?);
         let kimi = Arc::new(kimi_switch_kimi::new(store.clone(), registry.clone()));
         let audit = AuditLog::from_default_paths()?;
+        let web_membership = Arc::new(LiveWebMembershipRefresh {
+            registry: registry.clone(),
+            store: store.clone(),
+        });
         Ok(Self {
             store,
             registry,
             kimi,
             audit,
+            web_membership,
             pending_auth: Mutex::new(None),
         })
     }
@@ -91,8 +100,12 @@ impl Backend {
         );
     }
 
-    pub async fn snapshot(&self, message: Option<UiMessage>) -> Snapshot {
-        let accounts = self.load_rows().await;
+    pub async fn snapshot(
+        &self,
+        message: Option<UiMessage>,
+        reason: QuotaCollectReason,
+    ) -> Snapshot {
+        let (accounts, stats) = self.load_rows(reason).await;
         let urgent_count = accounts.iter().filter(|a| a.is_urgent()).count() as u32;
         let current_label = accounts
             .iter()
@@ -106,17 +119,24 @@ impl Backend {
             accounts,
             theme: Self::load_theme(),
             proactive_renewal: Self::load_proactive_renewal(),
-            message,
+            message: attach_skip_message(message, reason, &stats),
         }
     }
 
-    async fn load_rows(&self) -> Vec<AccountRow> {
+    async fn load_rows(&self, reason: QuotaCollectReason) -> (Vec<AccountRow>, QuotaCollectStats) {
         let mut accounts = self.registry.list_by_provider("kimi").unwrap_or_default();
         accounts.sort_by_key(|a| !a.active);
         let cache_path = AppPaths::resolve()
             .map(|p| p.quota_cache_file())
             .unwrap_or_else(|_| std::path::PathBuf::from("quota-cache-missing.json"));
-        collect_account_rows(self.kimi.clone(), &accounts, &cache_path).await
+        collect_account_rows(
+            self.kimi.clone(),
+            Some(self.web_membership.clone()),
+            &accounts,
+            &cache_path,
+            reason,
+        )
+        .await
     }
 
     pub async fn import(&self) -> Result<Snapshot> {
@@ -134,10 +154,13 @@ impl Backend {
         self.audit
             .append(AuditEvent::ok("login", "kimi", Some(account.id.0.as_str())));
         Ok(self
-            .snapshot(Some(UiMessage {
-                text: format!("已导入账号 {}", account.id),
-                tone: "ok".into(),
-            }))
+            .snapshot(
+                Some(UiMessage {
+                    text: format!("已导入账号 {}", account.id),
+                    tone: "ok".into(),
+                }),
+                QuotaCollectReason::Scheduled,
+            )
             .await)
     }
 
@@ -151,10 +174,13 @@ impl Backend {
         self.audit
             .append(AuditEvent::ok("activate", "kimi", Some(id.0.as_str())));
         Ok(self
-            .snapshot(Some(UiMessage {
-                text: format!("已切换到 {id}"),
-                tone: "ok".into(),
-            }))
+            .snapshot(
+                Some(UiMessage {
+                    text: format!("已切换到 {id}"),
+                    tone: "ok".into(),
+                }),
+                QuotaCollectReason::Scheduled,
+            )
             .await)
     }
 
@@ -172,10 +198,13 @@ impl Backend {
             &id,
         )?;
         Ok(self
-            .snapshot(Some(UiMessage {
-                text: format!("已删除 {id}"),
-                tone: "ok".into(),
-            }))
+            .snapshot(
+                Some(UiMessage {
+                    text: format!("已删除 {id}"),
+                    tone: "ok".into(),
+                }),
+                QuotaCollectReason::Scheduled,
+            )
             .await)
     }
 
@@ -188,19 +217,25 @@ impl Backend {
         let label = label.trim();
         if label.is_empty() || label == account.label {
             return Ok(self
-                .snapshot(Some(UiMessage {
-                    text: "别名未变化".into(),
-                    tone: "info".into(),
-                }))
+                .snapshot(
+                    Some(UiMessage {
+                        text: "别名未变化".into(),
+                        tone: "info".into(),
+                    }),
+                    QuotaCollectReason::Scheduled,
+                )
                 .await);
         }
         account.label = label.to_string();
         self.registry.upsert(account)?;
         Ok(self
-            .snapshot(Some(UiMessage {
-                text: format!("已把 {id} 重命名为「{label}」"),
-                tone: "ok".into(),
-            }))
+            .snapshot(
+                Some(UiMessage {
+                    text: format!("已把 {id} 重命名为「{label}」"),
+                    tone: "ok".into(),
+                }),
+                QuotaCollectReason::Scheduled,
+            )
             .await)
     }
 
@@ -266,10 +301,13 @@ impl Backend {
             self.audit
                 .append(AuditEvent::ok("login", "kimi", Some(account.id.0.as_str())));
             return Ok(self
-                .snapshot(Some(UiMessage {
-                    text: format!("授权成功，已添加账号 {}", account.id),
-                    tone: "ok".into(),
-                }))
+                .snapshot(
+                    Some(UiMessage {
+                        text: format!("授权成功，已添加账号 {}", account.id),
+                        tone: "ok".into(),
+                    }),
+                    QuotaCollectReason::Scheduled,
+                )
                 .await);
         };
         // 按卡重新授权：写库与否、官方身份是否对得上全部由引擎判定；
@@ -282,10 +320,13 @@ impl Backend {
                     Some(account.id.0.as_str()),
                 ));
                 Ok(self
-                    .snapshot(Some(UiMessage {
-                        text: format!("已更新账号 {} 的登录凭证", account.id),
-                        tone: "ok".into(),
-                    }))
+                    .snapshot(
+                        Some(UiMessage {
+                            text: format!("已更新账号 {} 的登录凭证", account.id),
+                            tone: "ok".into(),
+                        }),
+                        QuotaCollectReason::Scheduled,
+                    )
                     .await)
             }
             Err(e) => {
@@ -296,6 +337,43 @@ impl Backend {
                     &e.to_string(),
                 ));
                 Err(anyhow::Error::from(e))
+            }
+        }
+    }
+
+    /// 给账号绑定网页登录（issue #51）：token 来自 GUI 绑定对话框粘贴，只交给
+    /// #50 的 kimi 管道（域名固定 `https://www.kimi.com`），不落日志、不进 Snapshot。
+    /// 成功后重取 Snapshot（Scheduled，#45 链约定）：该卡 `membership_expiry` 出现、
+    /// 绑定弱提示消失。失败映射为简洁中文（[`bind_web_user_message`]），不是额度
+    /// 错误：不写账号行 `error`、不置 `credential_expired`、不动 `urgent_count`，
+    /// 只经错误通道（前端 toast）表达，不影响切换。
+    pub async fn bind_web(&self, id: &str, web_token: &str) -> Result<Snapshot> {
+        let target = AccountId(id.to_string());
+        let outcome = web_membership::bind_web(
+            self.registry.as_ref(),
+            self.store.as_ref(),
+            &target,
+            web_token,
+        )
+        .await;
+        match outcome {
+            Ok(binding) => {
+                self.audit
+                    .append(AuditEvent::ok("bind-web", "kimi", Some(target.0.as_str())));
+                let message = bind_web_success_message(&binding);
+                Ok(self
+                    .snapshot(Some(message), QuotaCollectReason::Scheduled)
+                    .await)
+            }
+            Err(error) => {
+                // 审计与 CLI bind-web 同源：英文 detail，管道保证不含 token。
+                self.audit.append(AuditEvent::err(
+                    "bind-web",
+                    "kimi",
+                    Some(target.0.as_str()),
+                    &error.to_string(),
+                ));
+                Err(anyhow::anyhow!(bind_web_user_message(&error)))
             }
         }
     }
@@ -314,33 +392,238 @@ impl Backend {
     }
 }
 
+/// 会员到期「仅刷新」的替身面（issue #52）：行列组装在用户发起刷新
+/// （[`QuotaCollectReason::UserInitiated`]）时对每张卡调用一次。生产实现
+/// [`LiveWebMembershipRefresh`] 发真实 `GetSubscription`；测试注入计数 +
+/// 脚本化替身（见 lib.rs tests）。
+#[async_trait::async_trait]
+pub(crate) trait WebMembershipRefresh: Send + Sync {
+    /// 刷新目标账号的会员到期：
+    /// - `None` = 未绑定网页登录（没有网页凭证，本次不发请求、不产生刷新失败语义）；
+    /// - `Some(Ok(..))` = 已绑定且刷新成功（extra 已由管道重写，携带新到期展示日）；
+    /// - `Some(Err(..))` = 已绑定但刷新失败（extra 原样不动，展示层缓存降级）。
+    async fn refresh(&self, target: &AccountId) -> Option<kimi_switch_core::Result<WebBinding>>;
+}
+
+/// 生产实现（issue #52 触发口径的网页侧）：store 里有网页凭证才算已绑定，
+/// 刷新走 kimi 适配器（域名固定 `https://www.kimi.com`，超时 15s）。探测读
+/// 失败按未绑定处理——宁可少一次网页请求，也不在计划外路径制造提示。
+struct LiveWebMembershipRefresh {
+    registry: Arc<AccountRegistry>,
+    store: Arc<dyn CredentialStore>,
+}
+
+#[async_trait::async_trait]
+impl WebMembershipRefresh for LiveWebMembershipRefresh {
+    async fn refresh(&self, target: &AccountId) -> Option<kimi_switch_core::Result<WebBinding>> {
+        let bound = matches!(
+            self.store.get("kimi", target.0.as_str(), WEB_STORE_FIELD),
+            Ok(Some(_))
+        );
+        if !bound {
+            return None;
+        }
+        Some(
+            web_membership::refresh_web_membership(
+                self.registry.as_ref(),
+                self.store.as_ref(),
+                target,
+            )
+            .await,
+        )
+    }
+}
+
+/// 会员刷新 join 阶段的总预算（issue #52 补充）：额度收集被 5 秒节流窗毫秒级
+/// 返回，而网页 `GetSubscription` 单请求超时 15s——无预算时 www.kimi.com 挂起
+/// 会让一次刷新等满 15s，前端 busy 闸门把切换在内全部操作锁死。2s 足够覆盖
+/// 正常的亚秒级会员请求，超出即视为当次不可达。
+const MEMBERSHIP_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// 列出与刷新共用：走 core 额度快照（节流 / 退避 / 并发），GUI 只做展示映射。
+///
+/// 会员到期刷新（issue #52 触发口径）：仅 [`QuotaCollectReason::UserInitiated`]
+/// （用户点「刷新」）对已绑定账号并发刷新会员到期（与额度收集并行发起，单请求
+/// 超时 15s；join 阶段另受 [`MEMBERSHIP_JOIN_BUDGET`] 总预算约束，网页挂起
+/// 不得拖死整次刷新），缓存日历日无论新旧（含已过期）都请求；Scheduled（启动
+/// 加载 / 静默收集 / swap / import / 绑定等操作后再列）完全不发网页请求。会员
+/// 刷新失败只降级为行内绑定提示（日期 + 提示共存），不影响额度行、不计告急、
+/// 不置凭证待续期、不产生 toast。
 pub(crate) async fn collect_account_rows<P>(
     provider: Arc<P>,
+    membership: Option<Arc<dyn WebMembershipRefresh>>,
     accounts: &[Account],
     cache_path: &std::path::Path,
-) -> Vec<AccountRow>
+    reason: QuotaCollectReason,
+) -> (Vec<AccountRow>, QuotaCollectStats)
 where
     P: Provider + 'static,
 {
     let ids: Vec<AccountId> = accounts.iter().map(|account| account.id.clone()).collect();
-    let snapshots =
-        kimi_switch_core::quota_snapshot::collect(provider, "kimi", &ids, cache_path).await;
-    accounts
+
+    // 会员刷新与额度收集并行发起（账号序即结果序），额度结果语义不被会员拖慢。
+    let membership_jobs = match (&membership, reason) {
+        (Some(source), QuotaCollectReason::UserInitiated) => accounts
+            .iter()
+            .map(|account| {
+                let source = source.clone();
+                let id = account.id.clone();
+                tokio::spawn(async move { source.refresh(&id).await })
+            })
+            .collect::<Vec<_>>(),
+        // Scheduled / 静默路径连替身都不调用：网页会员请求恒为 0。
+        _ => Vec::new(),
+    };
+
+    let outcome = kimi_switch_core::quota_snapshot::collect_detailed(
+        provider,
+        "kimi",
+        &ids,
+        cache_path,
+        reason,
+    )
+    .await;
+
+    let mut refreshed: Vec<Option<kimi_switch_core::Result<WebBinding>>> =
+        Vec::with_capacity(membership_jobs.len());
+    // 预算是整个 join 阶段的总闸（不是每任务各 2s）：deadline 固定，谁先完成
+    // 谁先收，已完成的正常使用，超预算才降级。
+    let join_deadline = tokio::time::Instant::now() + MEMBERSHIP_JOIN_BUDGET;
+    for job in membership_jobs {
+        // 替身任务 panic 按「已绑定但刷新失败」降级，不拖垮整次列出。
+        refreshed.push(match tokio::time::timeout_at(join_deadline, job).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(join)) => Some(Err(kimi_switch_core::Error::provider(format!(
+                "membership refresh task failed: {join}"
+            )))),
+            // 预算耗尽：未完成的任务按「刷新失败」降级（行内保留 extra 旧日期 +
+            // 绑定提示再现）。底层任务不 cancel——JoinHandle 被丢弃即 detach，
+            // refresh_web_membership 在任务内自行写 extra，放任其在后台完成后
+            // 由下次列出自然呈现。
+            Err(_elapsed) => Some(Err(kimi_switch_core::Error::provider(
+                "membership refresh join timed out",
+            ))),
+        });
+    }
+
+    let rows = accounts
         .iter()
-        .zip(snapshots.iter())
-        .map(|(account, snapshot)| account_row(account, snapshot))
-        .collect()
+        .zip(outcome.snapshots.iter())
+        .enumerate()
+        .map(|(idx, (account, snapshot))| {
+            account_row(
+                account,
+                snapshot,
+                refreshed.get(idx).and_then(|outcome| outcome.as_ref()),
+            )
+        })
+        .collect();
+    (rows, outcome.stats)
 }
 
-pub(crate) fn account_row(account: &Account, snapshot: &QuotaSnapshot) -> AccountRow {
+/// 用户发起且没有任何账号真正查询时，把整批跳过原因写成快照提示。
+/// 计划内收集不弹这些提示；调用方已有文案时不覆盖。
+pub(crate) fn attach_skip_message(
+    message: Option<UiMessage>,
+    reason: QuotaCollectReason,
+    stats: &QuotaCollectStats,
+) -> Option<UiMessage> {
+    if message.is_some() {
+        return message;
+    }
+    if reason != QuotaCollectReason::UserInitiated || stats.queried > 0 {
+        return None;
+    }
+    match (
+        stats.skipped_success_throttle,
+        stats.skipped_rate_limit,
+        stats.skipped_auth,
+    ) {
+        (n, 0, 0) if n > 0 => Some(UiMessage {
+            text: "刚刚更新过".into(),
+            tone: "info".into(),
+        }),
+        (0, n, 0) if n > 0 => Some(UiMessage {
+            text: "请求过于频繁，请稍后再试".into(),
+            tone: "info".into(),
+        }),
+        _ => None,
+    }
+}
+
+/// 绑定成功的 toast 文案（issue #51）。订阅无到期瞬间时到期展示回退弱提示，
+/// 文案说明「暂无到期信息」，避免用户误以为绑定失败。
+pub(crate) fn bind_web_success_message(binding: &WebBinding) -> UiMessage {
+    let text = match binding.expiry_text.as_deref() {
+        Some(expiry) => format!("绑定成功，有效期至 {expiry}"),
+        None => "绑定成功，暂无会员到期信息".into(),
+    };
+    UiMessage {
+        text,
+        tone: "ok".into(),
+    }
+}
+
+/// 绑定失败的 GUI 用户文案（issue #51）：简洁中文，按结构化载荷映射。
+/// GetSubscription 的网络 / HTTP / 解析失败整条替换为固定中文（即使管道文案
+/// 意外夹带 token 也不会透到前端）；意外库存 / IO 失败保留细节便于排查。
+pub(crate) fn bind_web_user_message(error: &kimi_switch_core::Error) -> String {
+    match error.bind_web_error() {
+        Some(kimi_switch_core::BindWebError::IdentityMismatch { .. }) => {
+            "网页身份与该账号不一致，未绑定".into()
+        }
+        Some(kimi_switch_core::BindWebError::Unidentifiable) => {
+            "无法从该 token 辨认网页身份，未绑定".into()
+        }
+        // #50 管道里 GetSubscription 的请求 / HTTP / 解析失败都是 Provider 载荷。
+        None if matches!(error, kimi_switch_core::Error::Provider(_)) => {
+            "会员信息获取失败，请稍后再试".into()
+        }
+        None if matches!(error, kimi_switch_core::Error::AccountNotFound { .. }) => {
+            "账号不存在，请刷新后再试".into()
+        }
+        None => format!("绑定失败：{error}"),
+    }
+}
+
+/// 组装单行展示 DTO。
+///
+/// `membership_refresh` 是本次用户发起刷新中该账号的会员刷新结果（#52）：
+/// - `None` = 本次没有刷新（Scheduled / 静默路径，或该账号未绑定）；
+/// - `Some(Ok(..))` = 刷新成功：行内直接用新到期日（extra 已由管道写回），
+///   订阅无到期数据时日期为 `None` 并回到绑定弱提示（与绑定语义一致）；
+/// - `Some(Err(..))` = 刷新失败（缓存降级）：行内保留 extra 缓存旧日期，
+///   且绑定提示再现——**日期与提示共存**，网页失败不单独把日期藏起来。
+pub(crate) fn account_row(
+    account: &Account,
+    snapshot: &QuotaSnapshot,
+    membership_refresh: Option<&kimi_switch_core::Result<WebBinding>>,
+) -> AccountRow {
     let membership = snapshot.membership.as_deref().map(prettify_membership);
-    let (quotas, error, credential_expired) = match &snapshot.state {
-        QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => (quota_views(quotas), None, false),
+    // 到期日基线来自账号 extra（绑定 / 上次成功刷新写入）；刷新成功时用刚拿到
+    // 的新值，不等下次列出。
+    let (membership_expiry, membership_refresh_failed) = match membership_refresh {
+        Some(Ok(binding)) => (binding.expiry_text.clone(), false),
+        Some(Err(_)) => (membership_expiry_from_extra(&account.extra), true),
+        None => (membership_expiry_from_extra(&account.extra), false),
+    };
+    // 档位在且（无到期日，或本次用户发起刷新中会员获取失败）→ 绑定弱提示；
+    // 可与日期共存（#52 缓存降级）。档位缺失（无额度数据）保持现状不强加。
+    let membership_expiry_hint =
+        membership.is_some() && (membership_expiry.is_none() || membership_refresh_failed);
+    let (quotas, error, credential_expired, cached_at) = match &snapshot.state {
+        QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => (
+            quota_views(quotas),
+            None,
+            false,
+            Some(format_fetched_at(snapshot.fetched_at, snapshot.stale)),
+        ),
         QuotaState::Failed(failure) => (
             Vec::new(),
             Some(compact_error(&failure.message)),
             failure.kind == QuotaFailureKind::CredentialExpired,
+            // 查询失败且无缓存回退：没有额度取得时间可标，不带时间文案。
+            None,
         ),
     };
     AccountRow {
@@ -348,43 +631,24 @@ pub(crate) fn account_row(account: &Account, snapshot: &QuotaSnapshot) -> Accoun
         label: account.label.clone(),
         active: account.active,
         membership,
+        membership_expiry,
+        membership_expiry_hint,
         quotas,
         error,
         credential_expired,
-        cached_at: snapshot
-            .stale
-            .then(|| format_cached_at(snapshot.fetched_at)),
+        cached_at,
     }
 }
 
-fn format_cached_at(fetched_at: chrono::DateTime<chrono::Utc>) -> String {
+fn format_fetched_at(fetched_at: chrono::DateTime<chrono::Utc>, stale: bool) -> String {
+    let prefix = if stale { "缓存于" } else { "更新于" };
     format!(
-        "缓存于 {}",
+        "{} {}",
+        prefix,
         fetched_at
             .with_timezone(&chrono::Local)
             .format("%m-%d %H:%M")
     )
-}
-
-/// 将 `/usages` 的 `user.membership.level` 转成官网档位名。
-///
-/// 已与 `/me` 的 `user_level_name` 核对：`LEVEL_INTERMEDIATE` → Allegretto，
-/// `LEVEL_ADVANCED` → Allegro。未知档位仍去掉 `LEVEL_` 后首字母大写。
-fn prettify_membership(level: &str) -> String {
-    let stripped = level.strip_prefix("LEVEL_").unwrap_or(level);
-    match stripped.to_ascii_uppercase().as_str() {
-        "INTERMEDIATE" => "Allegretto".to_string(),
-        "ADVANCED" => "Allegro".to_string(),
-        _ => {
-            let mut chars = stripped.chars();
-            match chars.next() {
-                Some(first) => {
-                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
-                }
-                None => stripped.to_string(),
-            }
-        }
-    }
 }
 
 fn quota_views(quotas: &[Quota]) -> Vec<QuotaView> {

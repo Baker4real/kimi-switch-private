@@ -82,6 +82,13 @@ pub const QUOTA_FETCH_RETRY_DELAY_MS: u64 = 500;
 /// 稳定压到 ~90s 一次。daemon 与 CLI 共用 `quota_cache.json`，节流对两条路径同时生效。
 pub const QUOTA_MIN_REFRESH_INTERVAL_MS: u64 = 90_000;
 
+/// 用户发起额度查询时，成功缓存的连点窗口（毫秒）。不进 GUI 设置。
+///
+/// 计划内路径仍走 [`QUOTA_MIN_REFRESH_INTERVAL_MS`]；点「刷新」用更短窗口，
+/// 按该账号上次成功写入缓存的时间判断。429 / 鉴权失败两种原因都继续退避；
+/// 超时、网络等可重试失败在用户发起时忽略退避再查。
+pub const QUOTA_USER_INITIATED_MIN_INTERVAL_MS: u64 = 5_000;
+
 /// quota 查询失败后的退避上限（毫秒），默认 15 分钟。
 ///
 /// 成功结果会写进缓存并被 [`QUOTA_MIN_REFRESH_INTERVAL_MS`] 节流；**失败结果没有缓存**，

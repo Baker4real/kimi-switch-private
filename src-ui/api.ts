@@ -10,6 +10,14 @@ export interface AccountRow {
   label: string;
   active: boolean;
   membership: string | null;
+  /** 会员到期日（东八区 `YYYY-MM-DD`，Rust 侧已格式化；无到期数据为 null，不是错误）。
+   * 用户发起刷新成功时是新值；刷新失败保留缓存旧值（issue #52）。 */
+  membership_expiry: string | null;
+  /** 档位在且（无到期日，或本次刷新中会员获取失败）：档位旁显示弱提示
+   * （灰样式，非错误红）——无日期时「绑定后可显示有效期」（#49 票面原文）、
+   * 有日期时（刷新失败缓存降级，issue #52）「重新绑定后可刷新有效期」；
+   * 提示可与日期共存。 */
+  membership_expiry_hint: boolean;
   quotas: QuotaView[];
   error: string | null;
   /** 凭证待续期：凭证过期型 401。此时 error 是引导文案，不计告急、不按错误红渲染。 */
@@ -80,7 +88,11 @@ export function createApi(invokeFn: InvokeFn) {
     run(() => (args === undefined ? invokeFn<T>(cmd) : invokeFn<T>(cmd, args)));
 
   return {
-    listAccounts: () => call<Snapshot>("list_accounts"),
+    // Tauri v2 命令参数键为 camelCase（userInitiated），多词参数不得用 snake_case 键。
+    listAccounts: (userInitiated = false) =>
+      userInitiated
+        ? call<Snapshot>("list_accounts", { userInitiated: true })
+        : call<Snapshot>("list_accounts"),
     importCurrent: () => call<Snapshot>("import_current"),
     swapAccount: (id: string) => call<Snapshot>("swap_account", { id }),
     removeAccount: (id: string) => call<Snapshot>("remove_account", { id }),
@@ -90,6 +102,9 @@ export function createApi(invokeFn: InvokeFn) {
       call<AuthLink>("start_device_auth", { target }),
     completeDeviceAuth: () => call<Snapshot>("complete_device_auth"),
     cancelDeviceAuth: () => call<void>("cancel_device_auth"),
+    /** 绑定网页登录（issue #51）：token 只经 Tauri IPC 发给后端管道，不落 store。 */
+    bindWebAccount: (id: string, token: string) =>
+      call<Snapshot>("bind_web_account", { id, token }),
     openUrl: (url: string) => call<void>("open_url", { url }),
     setTheme: (theme: ThemeId) => call<ThemeId>("set_theme", { theme }),
     setProactiveRenewal: (enabled: boolean) =>

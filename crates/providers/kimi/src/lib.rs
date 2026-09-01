@@ -6,6 +6,7 @@ mod oauth;
 mod paths;
 
 pub mod device_flow;
+pub mod web_membership;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,6 +75,7 @@ mod test_support {
     pub struct MockServer {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
+        full_requests: Arc<Mutex<Vec<String>>>,
         handle: Option<JoinHandle<()>>,
     }
 
@@ -82,17 +84,20 @@ mod test_support {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let full_requests = Arc::new(Mutex::new(Vec::new()));
             let captured = Arc::clone(&requests);
+            let captured_full = Arc::clone(&full_requests);
             let handle = std::thread::spawn(move || {
                 for (status, body) in responses {
                     let (mut stream, _) = listener.accept().unwrap();
                     let mut buffer = [0_u8; 8192];
                     let count = stream.read(&mut buffer).unwrap();
-                    let request = String::from_utf8_lossy(&buffer[..count]);
+                    let request = String::from_utf8_lossy(&buffer[..count]).to_string();
                     captured
                         .lock()
                         .unwrap()
                         .push(request.lines().next().unwrap_or_default().to_string());
+                    captured_full.lock().unwrap().push(request);
                     write!(
                         stream,
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -104,6 +109,7 @@ mod test_support {
             Self {
                 base_url,
                 requests,
+                full_requests,
                 handle: Some(handle),
             }
         }
@@ -115,6 +121,16 @@ mod test_support {
         pub fn finish(mut self) -> Vec<String> {
             self.handle.take().unwrap().join().unwrap();
             Arc::try_unwrap(self.requests)
+                .unwrap()
+                .into_inner()
+                .unwrap()
+        }
+
+        /// 收取完整请求原文（含请求行、头与 body），用于断言
+        /// `connect-protocol-version` 之类的协议头（issue #50）。
+        pub fn finish_full(mut self) -> Vec<String> {
+            self.handle.take().unwrap().join().unwrap();
+            Arc::try_unwrap(self.full_requests)
                 .unwrap()
                 .into_inner()
                 .unwrap()

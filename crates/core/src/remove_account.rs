@@ -1,12 +1,16 @@
-//! 删除账号：注册表 → 墓碑 → 凭证 → 额度缓存 → 审计。
+//! 删除账号：注册表 → 墓碑 → 凭证（Code blob + 网页会员 field）→ 额度缓存 → 审计。
 //!
-//! CLI 与 GUI 只调用本操作，不再各自编排。`store_field` 由 provider 自报。
+//! CLI 与 GUI 只调用本操作，不再各自编排。`store_field` 由 provider 自报；
+//! 网页会员凭证按 core schema 常量 [`crate::membership_expiry::WEB_STORE_FIELD`]
+//! 一并清理（issue #50，ADR-0004）。会员到期 extra 键随 registry 行整体消失，
+//! 无需单独清理。
 
 use std::path::Path;
 
 use crate::account_registry::AccountRegistry;
 use crate::audit::{AuditEvent, AuditLog};
 use crate::error::Result;
+use crate::membership_expiry::WEB_STORE_FIELD;
 use crate::model::AccountId;
 use crate::quota_cache::QuotaCache;
 use crate::removed::RemovedAccounts;
@@ -33,6 +37,10 @@ pub fn remove_account(
 
     if let Err(e) = store.delete(provider_id, account_id.0.as_str(), store_field) {
         tracing::warn!(err=%e, "credential store delete failed (continuing)");
+    }
+    // 网页会员凭证（独立 field）：一并清理；从未绑定过时删除幂等 no-op。
+    if let Err(e) = store.delete(provider_id, account_id.0.as_str(), WEB_STORE_FIELD) {
+        tracing::warn!(err=%e, "web membership credential delete failed (continuing)");
     }
 
     let mut cache = QuotaCache::load(quota_cache_path);
@@ -176,6 +184,45 @@ mod tests {
                 .as_deref(),
             Some("unrelated-field"),
             "未自报的字段不得被删"
+        );
+    }
+
+    /// issue #50：删除账号把网页会员 field 一并清掉；会员到期 extra 键随
+    /// registry 行整体消失（extra 只存在于 registry.toml，无独立副本）。
+    #[test]
+    fn remove_account_clears_web_membership_field_and_expiry_extra() {
+        use crate::membership_expiry::{
+            EXTRA_CURRENT_END_TIME, EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
+        };
+
+        let h = Harness::new();
+        let mut bound = account("alice");
+        bound.extra.insert(
+            EXTRA_CURRENT_END_TIME.into(),
+            serde_json::Value::String("2027-08-28T00:00:00Z".into()),
+        );
+        bound.extra.insert(
+            EXTRA_NEXT_BILLING_TIME.into(),
+            serde_json::Value::String("2027-08-27T01:25:37.930341Z".into()),
+        );
+        h.registry.upsert(bound).unwrap();
+        h.store
+            .set("kimi", "alice", "blob", r#"{"access_token":"A1"}"#)
+            .unwrap();
+        h.store
+            .set("kimi", "alice", WEB_STORE_FIELD, "web-token-value")
+            .unwrap();
+
+        h.remove("alice", "blob").unwrap();
+
+        assert_eq!(h.store.get("kimi", "alice", WEB_STORE_FIELD).unwrap(), None);
+        assert_eq!(h.store.get("kimi", "alice", "blob").unwrap(), None);
+        assert!(
+            h.registry
+                .find("kimi", &AccountId("alice".into()))
+                .unwrap()
+                .is_none(),
+            "registry 行被删 → 会员到期 extra 键随行消失"
         );
     }
 

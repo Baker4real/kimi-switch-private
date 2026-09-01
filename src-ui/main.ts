@@ -3,6 +3,7 @@ import { api, commandError, type Snapshot } from "./api";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { escapeHtml } from "./escape";
 import { accountDisplayName, parseAliasInput } from "./labels";
+import { bindWebButtonHtml, membershipPlanHtml } from "./membership";
 import { quotaHtml } from "./quota";
 import { renewalSwitchView } from "./renewal";
 import { createAppStore } from "./store";
@@ -14,6 +15,7 @@ import {
   type ThemeId,
 } from "./theme";
 import { setupWindowControls } from "./window-controls";
+import { parseWebToken, webBindCopy, WEB_BIND_CONSOLE_URL } from "./webBind";
 
 type Route = "overview" | "library" | "settings";
 
@@ -30,6 +32,8 @@ const routes: Route[] = ["overview", "library", "settings"];
 const store = createAppStore();
 let renameId = "";
 let deleteId = "";
+// 绑定网页登录（issue #51）的目标账号 id：仅对话框打开期间持有，token 不落这里。
+let bindId = "";
 // 最近一次打开授权对话框的流程类型：仅用于取消时的 toast 文案区分
 let authIsReauth = false;
 let toastTimer = 0;
@@ -121,13 +125,33 @@ function paintAccountCards(next: Snapshot): void {
       return `<article class="profile-card${row.active ? " is-current" : ""}">
         <div class="profile-title-wrap">
           <span class="profile-title">${escapeHtml(row.label)}${row.active ? " · 当前" : ""}</span>
-          <span class="profile-plan">${escapeHtml(row.membership ?? "")}</span>
+          <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, busy)}</span>
         </div>
         <div class="profile-quota-stack">${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired)}</div>
         <div class="profile-card-actions">${cardActionButtons(row, busy)}</div>
       </article>`;
     })
     .join("");
+}
+
+/** 总览当前账号档位行：绑定入口与账号卡同一规则（issue #51），busy 时同样
+ * 禁用（防与进行中操作交错）。无档位且无绑定入口时保持「--」。 */
+function currentPlanHtml(
+  row: Snapshot["accounts"][number],
+  busy: boolean,
+): string {
+  const plan = membershipPlanHtml(row);
+  const bind = bindWebButtonHtml(row, busy);
+  return plan === null && bind === "" ? "--" : `${plan ?? ""}${bind}`;
+}
+
+/** 重画总览档位行；busy 翻转时与账号卡一同重画（syncBusyChrome），绑定按钮
+ * 不残留上一次操作期间的禁用态。 */
+function paintCurrentPlan(snapshot: Snapshot): void {
+  const current = snapshot.accounts.find((row) => row.active);
+  required<HTMLParagraphElement>("current-plan").innerHTML = current
+    ? currentPlanHtml(current, store.get().busy)
+    : "--";
 }
 
 function paintSnapshot(next: Snapshot): void {
@@ -137,7 +161,7 @@ function paintSnapshot(next: Snapshot): void {
   paintProactiveRenewal(next.proactive_renewal);
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.label ?? "--";
-  required<HTMLParagraphElement>("current-plan").textContent = current?.membership ?? "--";
+  paintCurrentPlan(next);
   required<HTMLDivElement>("current-quota-panel").innerHTML = current
     ? quotaHtml(current.quotas, current.error, current.cached_at, current.credential_expired)
     : `<p class="quota-reset">暂无当前账号，请先切换。</p>`;
@@ -157,6 +181,7 @@ function syncBusyChrome(): void {
   }
   if (snapshot) {
     paintAccountCards(snapshot);
+    paintCurrentPlan(snapshot);
   }
 }
 
@@ -393,6 +418,23 @@ function startDeviceAuth(target: string | null, displayName: string): Promise<vo
   });
 }
 
+/** 打开绑定对话框（issue #51）：粘贴来源见文案；token 输入随每次关闭清空（close 事件），
+ * 这里再清一次保证上次残留不出现。忙碌时不打开（防与进行中操作交错）。 */
+function openBindDialog(id: string): void {
+  if (store.get().busy) {
+    return;
+  }
+  bindId = id;
+  const row = store.get().snapshot?.accounts.find((item) => item.id === id);
+  required<HTMLParagraphElement>("bind-copy").textContent = webBindCopy(
+    accountDisplayName(row?.label, id),
+  );
+  const tokenInput = required<HTMLTextAreaElement>("bind-token");
+  tokenInput.value = "";
+  required<HTMLDialogElement>("bind-dialog").showModal();
+  tokenInput.focus();
+}
+
 function wireDialogs(): void {
   required<HTMLButtonElement>("auth-copy-url").addEventListener("click", () => {
     const input = required<HTMLInputElement>("auth-url");
@@ -424,6 +466,34 @@ function wireDialogs(): void {
   });
   required<HTMLDialogElement>("auth-dialog").addEventListener("cancel", () => {
     void api.cancelDeviceAuth();
+  });
+
+  // 绑定网页登录（issue #51）：打开控制台 → 粘贴 token → 提交走 bind-web 管道。
+  required<HTMLButtonElement>("bind-open").addEventListener("click", async () => {
+    try {
+      await api.openUrl(WEB_BIND_CONSOLE_URL);
+    } catch {
+      showToast("无法打开浏览器，请手动打开 kimi.com 控制台", true);
+    }
+  });
+  required<HTMLButtonElement>("bind-cancel").addEventListener("click", () => {
+    required<HTMLDialogElement>("bind-dialog").close();
+  });
+  required<HTMLButtonElement>("bind-submit").addEventListener("click", () => {
+    const token = parseWebToken(required<HTMLTextAreaElement>("bind-token").value);
+    if (token === null) {
+      showToast("请先粘贴网页 token", true);
+      return;
+    }
+    const id = bindId;
+    // 关闭即清空输入（下方 close 事件）；token 只活在本次闭包里，随命令交给后端。
+    required<HTMLDialogElement>("bind-dialog").close();
+    void runAction("正在绑定…", () => api.bindWebAccount(id, token));
+  });
+  // 对话框任何关闭路径（取消按钮 / Esc / 提交后的 close()）都清空 token 输入，
+  // token 不留在 DOM。
+  required<HTMLDialogElement>("bind-dialog").addEventListener("close", () => {
+    required<HTMLTextAreaElement>("bind-token").value = "";
   });
 
   required<HTMLButtonElement>("rename-cancel").addEventListener("click", () => {
@@ -459,8 +529,13 @@ function wireList(): void {
     const reauth = target.closest<HTMLElement>("[data-reauth]");
     const rename = target.closest<HTMLElement>("[data-rename]");
     const remove = target.closest<HTMLElement>("[data-delete]");
+    const bind = target.closest<HTMLElement>("[data-bind]");
     if (swap?.dataset.swap) {
       void runAction("正在切换…", () => api.swapAccount(swap.dataset.swap ?? ""));
+      return;
+    }
+    if (bind?.dataset.bind) {
+      openBindDialog(bind.dataset.bind);
       return;
     }
     if (reauth?.dataset.reauth) {
@@ -506,10 +581,10 @@ async function init(): Promise<void> {
     void runAction("正在导入…", () => api.importCurrent());
   });
   required<HTMLButtonElement>("refresh-button").addEventListener("click", () => {
-    void runAction("正在刷新额度…", () => api.listAccounts());
+    void runAction("正在刷新额度…", () => api.listAccounts(true));
   });
   required<HTMLButtonElement>("library-refresh-button").addEventListener("click", () => {
-    void runAction("正在刷新额度…", () => api.listAccounts());
+    void runAction("正在刷新额度…", () => api.listAccounts(true));
   });
   required<HTMLButtonElement>("overview-retry-button").addEventListener("click", () => {
     void loadInitialSnapshot();
@@ -536,6 +611,17 @@ async function init(): Promise<void> {
 
   wireDialogs();
   wireList();
+  // 总览当前账号档位行的绑定入口（issue #51）：与账号卡同一对话框。
+  required<HTMLParagraphElement>("current-plan").addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const bind = target.closest<HTMLElement>("[data-bind]");
+    if (bind?.dataset.bind) {
+      openBindDialog(bind.dataset.bind);
+    }
+  });
 
   await loadInitialSnapshot();
 }

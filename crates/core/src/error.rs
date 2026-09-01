@@ -142,6 +142,38 @@ impl fmt::Display for ReauthError {
     }
 }
 
+/// 绑定网页登录失败（issue #50，ADR-0004）。文案一律英文且不含 token。
+/// 身份门规则与按卡重新授权同型：网页 token 的 `sub`（回退 `user_id`）
+/// 必须等于目标账号 id，对不上或无法辨认时库存（Code blob、网页 field、extra）不变。
+///
+/// 载荷走 [`Error::Other`]（anyhow）：`Error` 枚举在 GUI 有穷尽匹配，新增顶层
+/// 变体会破坏无法同步修改的调用方；结构化读取用 [`Error::bind_web_error`]
+/// （anyhow downcast，无需匹配枚举）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindWebError {
+    /// 网页 token 的身份与目标账号不一致。
+    IdentityMismatch { observed: String, target: String },
+    /// 无法从网页 token 辨认身份（非 JWT / payload 无 `sub` 与 `user_id`）。
+    Unidentifiable,
+}
+
+impl fmt::Display for BindWebError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdentityMismatch { observed, target } => write!(
+                f,
+                "web token belongs to account {observed}, not target account {target}; nothing written"
+            ),
+            Self::Unidentifiable => {
+                f.write_str("cannot identify account from web token; nothing written")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BindWebError {}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("account not found: provider={provider} id={id}")]
@@ -263,6 +295,22 @@ impl Error {
         })
     }
 
+    /// 绑定网页登录的身份门失败（issue #50）：经 [`Error::Other`]（anyhow）携带
+    /// [`BindWebError`]，见该枚举 doc。
+    pub fn bind_web_identity_mismatch(
+        observed: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self::Other(anyhow::Error::new(BindWebError::IdentityMismatch {
+            observed: observed.into(),
+            target: target.into(),
+        }))
+    }
+
+    pub fn bind_web_unidentifiable() -> Self {
+        Self::Other(anyhow::Error::new(BindWebError::Unidentifiable))
+    }
+
     /// 结构化 HTTP 状态。与 Display 文案无关。
     pub fn http_status(&self) -> Option<u16> {
         match self {
@@ -328,6 +376,14 @@ impl Error {
     pub fn reauth_error(&self) -> Option<&ReauthError> {
         match self {
             Self::Reauth(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// 取出绑定网页登录的结构化失败载荷（anyhow downcast；非 bind-web 错误返回 None）。
+    pub fn bind_web_error(&self) -> Option<&BindWebError> {
+        match self {
+            Self::Other(error) => error.downcast_ref::<BindWebError>(),
             _ => None,
         }
     }
@@ -460,5 +516,29 @@ mod tests {
         }
         assert!(live.to_string().contains("已保存到账号库"));
         assert!(live.to_string().contains("os error 5"));
+    }
+
+    /// bind-web（issue #50）：结构化载荷保留、文案英文且说明「什么都没写」。
+    #[test]
+    fn bind_web_variants_keep_structured_payload() {
+        let mismatch = Error::bind_web_identity_mismatch("u9", "u1");
+        assert_eq!(
+            mismatch.bind_web_error(),
+            Some(&BindWebError::IdentityMismatch {
+                observed: "u9".into(),
+                target: "u1".into(),
+            })
+        );
+        assert!(mismatch.to_string().contains("not target account"));
+        assert!(mismatch.to_string().contains("nothing written"));
+
+        let unknown = Error::bind_web_unidentifiable();
+        assert_eq!(
+            unknown.bind_web_error(),
+            Some(&BindWebError::Unidentifiable)
+        );
+        assert!(unknown.to_string().contains("cannot identify account"));
+        // 非 bind-web 错误不带该载荷。
+        assert!(Error::reauth_unidentifiable().bind_web_error().is_none());
     }
 }

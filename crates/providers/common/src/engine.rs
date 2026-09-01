@@ -1727,4 +1727,62 @@ mod tests {
             "成功轮换后旧指纹作废清除"
         );
     }
+
+    /// issue #50（ADR-0004）：swap（activate）路径不触碰网页会员绑定状态——
+    /// 网页凭证 field 与会员到期 extra 键只由「绑定网页登录」管道写入/清理，
+    /// 切换只动 Code blob、live 与 active 标记。引擎本身零 HTTP，网页接口
+    /// （www.kimi.com GetSubscription）不属于切换路径。
+    #[tokio::test]
+    async fn activate_preserves_web_membership_binding_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        let store = FileStore::new(tmp.path().join("creds.json"));
+        // 两个账号都带网页绑定（web field + extra 会员键），u1 为当前账号。
+        let mut expected_extra = serde_json::Map::new();
+        expected_extra.insert(
+            "membership_current_end_time".into(),
+            serde_json::Value::String("2027-08-28T00:00:00Z".into()),
+        );
+        expected_extra.insert(
+            "membership_next_billing_time".into(),
+            serde_json::Value::String("2027-08-27T01:25:37.930341Z".into()),
+        );
+        for (uid, active) in [("u1", true), ("u2", false)] {
+            let mut account = fake_account(uid);
+            account.active = active;
+            account.extra = expected_extra.clone();
+            p.test_registry_upsert(account).unwrap();
+            store
+                .set("fake", uid, "blob", &format!(r#"{{"uid":"{uid}","access_token":"A1"}}"#))
+                .unwrap();
+            store
+                .set("fake", uid, "web", &format!("web-token-{uid}"))
+                .unwrap();
+        }
+        let u1_live = r#"{"uid":"u1","access_token":"A1"}"#;
+        fs::write(p.test_live_path(), u1_live).unwrap();
+
+        p.activate(&AccountId("u2".into())).await.unwrap();
+
+        for (uid, active) in [("u1", false), ("u2", true)] {
+            let account = p
+                .test_list_accounts()
+                .unwrap()
+                .into_iter()
+                .find(|a| a.id.0 == uid)
+                .unwrap();
+            assert_eq!(account.active, active);
+            assert_eq!(
+                account.extra, expected_extra,
+                "swap 不得改动会员到期 extra 键"
+            );
+            assert_eq!(
+                store.get("fake", uid, "web").unwrap().as_deref(),
+                Some(format!("web-token-{uid}").as_str()),
+                "swap 不得改动网页凭证 field"
+            );
+        }
+    }
 }

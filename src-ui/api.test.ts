@@ -12,6 +12,7 @@ describe("createApi 动词与命令字符串", () => {
     const api = createApi(invoke);
 
     await api.listAccounts();
+    await api.listAccounts(true);
     await api.importCurrent();
     await api.swapAccount("acc-1");
     await api.removeAccount("acc-2");
@@ -20,12 +21,14 @@ describe("createApi 动词与命令字符串", () => {
     await api.startDeviceAuth("acc-4");
     await api.completeDeviceAuth();
     await api.cancelDeviceAuth();
+    await api.bindWebAccount("acc-5", "web-token");
     await api.openUrl("https://auth.kimi.com/x");
     await api.setTheme("jade-night");
     await api.setProactiveRenewal(true);
 
     expect(invoke.mock.calls).toEqual([
       ["list_accounts"],
+      ["list_accounts", { userInitiated: true }],
       ["import_current"],
       ["swap_account", { id: "acc-1" }],
       ["remove_account", { id: "acc-2" }],
@@ -34,6 +37,7 @@ describe("createApi 动词与命令字符串", () => {
       ["start_device_auth", { target: "acc-4" }],
       ["complete_device_auth"],
       ["cancel_device_auth"],
+      ["bind_web_account", { id: "acc-5", token: "web-token" }],
       ["open_url", { url: "https://auth.kimi.com/x" }],
       ["set_theme", { theme: "jade-night" }],
       ["set_proactive_renewal", { enabled: true }],
