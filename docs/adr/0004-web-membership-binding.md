@@ -80,7 +80,7 @@ extra，默认列表即出现「有效期至」。展示格式化与读侧 schem
 写序固定：**先网页 field，后 extra**。身份门通过后先把网页 token 落库（此时
 身份已验证，token 即有效绑定），再请求 `GetSubscription`；会员读取失败（网络/
 HTTP）不回滚网页 field——到期日期可由重试或 #52 的刷新补齐，回滚反而把用户
-刚验证过的凭证丢掉。extra 写入走「读出 Account → 只动两个 membership 键 →
+刚验证过的凭证丢掉。extra 写入走「读出 Account → 只动三个 membership 键 →
 registry upsert」，保留 dedup / scope 等既有键；导入/同步路径从 metadata 整体
 重建 extra 的既有行为不变（重建后到期日缺失，展示回退绑定弱提示，等下次读取
 补齐）。`None` 的瞬间移除对应键：重新绑定后旧日期不得残留。
