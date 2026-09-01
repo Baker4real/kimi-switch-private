@@ -1,7 +1,33 @@
-/** 有别名用别名，空/空白别名退回账号 id。 */
-export function accountDisplayName(label: string | null | undefined, id: string): string {
-  const trimmed = label?.trim() ?? "";
+import { escapeHtml } from "./escape";
+
+/** 使用后端下发的显示名；行缺失时回退账号 id。 */
+export function accountDisplayName(
+  row: { display_name?: string | null } | null | undefined,
+  id: string,
+): string {
+  const trimmed = row?.display_name?.trim() ?? "";
   return trimmed === "" ? id : trimmed;
+}
+
+/** 账号库卡片标题：显示名，当前账号加「 · 当前」。 */
+export function accountCardTitle(row: { display_name: string; active: boolean }): string {
+  return row.active ? `${row.display_name} · 当前` : row.display_name;
+}
+
+/** 官方昵称已知则隐藏重命名入口。 */
+export function showRenameButton(officialNicknameKnown: boolean): boolean {
+  return !officialNicknameKnown;
+}
+
+export function renameButtonHtml(
+  row: { id: string; official_nickname_known: boolean },
+  busy: boolean,
+): string {
+  if (!showRenameButton(row.official_nickname_known)) {
+    return "";
+  }
+  const disabled = busy ? " disabled" : "";
+  return `<button class="profile-pill" data-rename="${escapeHtml(row.id)}" type="button"${disabled}>重命名</button>`;
 }
 
 export type DeviceAuthPhase = "fetching-link" | "waiting-browser";

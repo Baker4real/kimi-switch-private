@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         None => status(&ctx).await,
-        Some(Cmd::Login { provider }) => login(&ctx, &provider),
+        Some(Cmd::Login { provider }) => login(&ctx, &provider).await,
         Some(Cmd::Swap { id }) => swap(&ctx, id.as_deref()).await,
         Some(Cmd::Rm { id }) => rm(&ctx, &id).await,
         Some(Cmd::BindWeb { id }) => bind_web(&ctx, &id).await,
@@ -174,15 +174,14 @@ async fn status(ctx: &AppContext) -> Result<()> {
     // 3. 额度快照（节流 / 退避 / 并发 / 陈旧回退收口在 core）。
     let cache_path = AppPaths::resolve()?.quota_cache_file();
     let ids: Vec<_> = accounts.iter().map(|account| account.id.clone()).collect();
-    let snapshots =
-        kimi_switch_core::quota_snapshot::collect(
-            ctx.kimi.clone(),
-            "kimi",
-            &ids,
-            &cache_path,
-            kimi_switch_core::QuotaCollectReason::Scheduled,
-        )
-        .await;
+    let snapshots = kimi_switch_core::quota_snapshot::collect(
+        ctx.kimi.clone(),
+        "kimi",
+        &ids,
+        &cache_path,
+        kimi_switch_core::QuotaCollectReason::Scheduled,
+    )
+    .await;
 
     // 4. 渲染。账号 id 旁带档位名与会员到期（extra 有 → `有效期至 <日期>`；
     //    无 → 绑定弱提示）；节流命中不标 stale，失败回落标 `(stale)`。
@@ -200,7 +199,10 @@ async fn status(ctx: &AppContext) -> Result<()> {
             }
             QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => format_quotas(quotas),
         };
-        println!("  {star} {n:>2}  {:<24}{plan_text} {quota_text}", account.id);
+        println!(
+            "  {star} {n:>2}  {:<24}{plan_text} {quota_text}",
+            account.id
+        );
     }
     Ok(())
 }
@@ -269,7 +271,7 @@ fn format_quotas(quotas: &[Quota]) -> String {
 // login kimi
 // ---------------------------------------------------------------------------
 
-fn login(ctx: &AppContext, provider: &str) -> Result<()> {
+async fn login(ctx: &AppContext, provider: &str) -> Result<()> {
     match provider {
         "kimi" | "moonshot" => {
             // Kimi 登录是交互式 TUI：约定用户先在 kimi 里登录好，这里只导入当前登录的凭证。
@@ -280,6 +282,17 @@ fn login(ctx: &AppContext, provider: &str) -> Result<()> {
             ctx.registry
                 .set_active("kimi", &account.id)
                 .context("mark Kimi login active")?;
+            if let Ok(Some(blob)) =
+                ctx.store
+                    .get("kimi", account.id.0.as_str(), ctx.kimi.store_field())
+            {
+                kimi_switch_kimi::cache_official_nickname_from_blob(
+                    ctx.registry.as_ref(),
+                    &account.id,
+                    &blob,
+                )
+                .await;
+            }
             if let Ok(mut removed) = AppContext::load_removed() {
                 if let Err(e) = removed.clear("kimi", account.id.0.as_str()) {
                     tracing::warn!(err=%e, "failed to clear removed-account marker");
@@ -389,7 +402,10 @@ async fn bind_web(ctx: &AppContext, id_input: &str) -> Result<()> {
                 .append(AuditEvent::ok("bind-web", "kimi", Some(acc.id.0.as_str())));
             match binding.expiry_text.as_deref() {
                 // 到期日与默认列表同一口径（#49 format_membership_expiry，东八区日历日）。
-                Some(expiry) => println!("bind-web → kimi/{} (membership valid until {expiry})", acc.id),
+                Some(expiry) => println!(
+                    "bind-web → kimi/{} (membership valid until {expiry})",
+                    acc.id
+                ),
                 None => println!("bind-web → kimi/{} (no membership end time found)", acc.id),
             }
             Ok(())

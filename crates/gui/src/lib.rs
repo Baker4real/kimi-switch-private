@@ -27,8 +27,11 @@ mod tests {
     use kimi_switch_kimi::web_membership::WebBinding;
 
     use crate::backend::{
-        account_row, attach_skip_message, bind_web_success_message, bind_web_user_message,
-        collect_account_rows, WebMembershipRefresh,
+        account_row, account_for_notice, attach_skip_message, auth_success_message,
+        bind_web_success_message, bind_web_user_message, cached_membership_plan,
+        collect_account_rows, delete_success_message, import_success_message,
+        reauth_success_message, rename_success_message, swap_failure_message,
+        swap_success_message, WebMembershipRefresh,
     };
 
     #[test]
@@ -72,6 +75,8 @@ mod tests {
             error: None,
             credential_expired: false,
             cached_at: None,
+            display_name: "a".into(),
+            official_nickname_known: false,
         };
         assert!(!quiet.is_urgent());
 
@@ -272,11 +277,10 @@ mod tests {
         let row = account_row(&account, &snap, None);
 
         assert_eq!(row.membership.as_deref(), Some("Allegro"));
-        assert!(
-            row.cached_at
-                .as_deref()
-                .is_some_and(|text| text.starts_with("更新于 "))
-        );
+        assert!(row
+            .cached_at
+            .as_deref()
+            .is_some_and(|text| text.starts_with("更新于 ")));
     }
 
     #[test]
@@ -712,10 +716,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let bound = account_with_expiry("alice", "2027-08-27T01:25:37.930341Z");
-        let membership = Arc::new(MembershipDouble::new([(
-            "alice",
-            MembershipScript::Hang,
-        )]));
+        let membership = Arc::new(MembershipDouble::new([("alice", MembershipScript::Hang)]));
 
         let started = std::time::Instant::now();
         let (rows, _) = collect_account_rows(
@@ -785,6 +786,38 @@ mod tests {
         let row = account_row(&bound, &snap, Some(&ok_with_expiry));
         assert_eq!(row.membership_expiry.as_deref(), Some("2030-01-02"));
         assert!(!row.membership_expiry_hint);
+    }
+
+    #[test]
+    fn account_row_carries_display_name_and_nickname_known() {
+        let snap = QuotaSnapshot {
+            account_id: AccountId("acc-1".into()),
+            fetched_at: Utc::now(),
+            stale: false,
+            membership: None,
+            state: QuotaState::Failed(kimi_switch_core::QuotaFailure::other("n/a")),
+        };
+
+        let row = account_row(&nicknamed("acc-1", "工作机", "Forever"), &snap, None);
+        assert_eq!(row.display_name, "Forever");
+        assert!(row.official_nickname_known);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["display_name"], "Forever");
+        assert_eq!(json["official_nickname_known"], true);
+
+        let mut aliased = sample_account("acc-1");
+        aliased.label = "工作机".into();
+        let row = account_row(&aliased, &snap, None);
+        assert_eq!(row.display_name, "工作机");
+        assert!(!row.official_nickname_known);
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["official_nickname_known"],
+            false
+        );
+
+        let row = account_row(&sample_account("acc-1"), &snap, None);
+        assert_eq!(row.display_name, "acc-1");
+        assert!(!row.official_nickname_known);
     }
 
     fn snapshot_message_of(
@@ -979,6 +1012,116 @@ mod tests {
             last_used_at: None,
             extra: Default::default(),
         }
+    }
+
+    fn nicknamed(id: &str, label: &str, nickname: &str) -> Account {
+        let mut account = sample_account(id);
+        account.label = label.into();
+        kimi_switch_core::write_official_nickname_extra(&mut account.extra, nickname);
+        account
+    }
+
+    #[test]
+    fn import_auth_toast_uses_persisted_official_nickname_not_raw_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            kimi_switch_core::AccountRegistry::new(dir.path().join("registry.toml"));
+        let account = sample_account("acc-1");
+        registry.upsert(account.clone()).unwrap();
+        assert_eq!(
+            import_success_message(&account),
+            "已导入账号 acc-1",
+            "persist 前内存 Account 仍是裸 id"
+        );
+
+        kimi_switch_core::persist_official_nickname(
+            &registry,
+            "kimi",
+            &account.id,
+            "Forever",
+        )
+        .unwrap();
+
+        let for_toast = account_for_notice(&registry, account);
+        assert_eq!(import_success_message(&for_toast), "已导入账号 Forever");
+        assert_eq!(
+            auth_success_message(&for_toast),
+            "授权成功，已添加账号 Forever"
+        );
+        assert_eq!(
+            reauth_success_message(&for_toast),
+            "已更新账号 Forever 的登录凭证"
+        );
+    }
+
+    #[test]
+    fn gui_notices_use_display_name_not_raw_id() {
+        let named = nicknamed("acc-1", "工作机", "Forever");
+        assert_eq!(import_success_message(&named), "已导入账号 Forever");
+        assert_eq!(swap_success_message(&named, None), "已切换到 Forever");
+        assert_eq!(swap_failure_message(&named), "切换到 Forever 失败");
+        assert_eq!(delete_success_message(&named), "已删除 Forever");
+        assert_eq!(
+            rename_success_message(&named, "新别名"),
+            "已把 Forever 重命名为「新别名」"
+        );
+        assert_eq!(auth_success_message(&named), "授权成功，已添加账号 Forever");
+        assert_eq!(
+            reauth_success_message(&named),
+            "已更新账号 Forever 的登录凭证"
+        );
+
+        let aliased = {
+            let mut account = sample_account("acc-2");
+            account.label = "工作机".into();
+            account
+        };
+        assert_eq!(swap_success_message(&aliased, None), "已切换到 工作机");
+        assert_eq!(
+            swap_success_message(&sample_account("acc-3"), None),
+            "已切换到 acc-3"
+        );
+    }
+
+    #[test]
+    fn swap_success_notice_appends_cached_plan_name() {
+        let named = nicknamed("acc-1", "工作机", "Forever");
+        assert_eq!(
+            swap_success_message(&named, Some("Allegro")),
+            "已切换到 Forever（Allegro）"
+        );
+        assert_eq!(
+            swap_success_message(&named, Some("Allegretto")),
+            "已切换到 Forever（Allegretto）"
+        );
+        assert_eq!(swap_success_message(&named, None), "已切换到 Forever");
+        assert_eq!(swap_success_message(&named, Some("")), "已切换到 Forever");
+    }
+
+    #[test]
+    fn cached_membership_plan_reads_local_quota_cache_only() {
+        let mut cache = kimi_switch_core::QuotaCache::default();
+        cache.set(
+            "kimi",
+            "acc-1",
+            vec![sample_quota("acc-1", Some("LEVEL_ADVANCED"), None)],
+        );
+        assert_eq!(
+            cached_membership_plan(&cache, "acc-1").as_deref(),
+            Some("Allegro")
+        );
+        cache.set(
+            "kimi",
+            "acc-2",
+            vec![sample_quota("acc-2", Some("LEVEL_INTERMEDIATE"), None)],
+        );
+        assert_eq!(
+            cached_membership_plan(&cache, "acc-2").as_deref(),
+            Some("Allegretto")
+        );
+        assert_eq!(cached_membership_plan(&cache, "missing"), None);
+        let empty = kimi_switch_core::QuotaCache::default();
+        assert_eq!(cached_membership_plan(&empty, "acc-1"), None);
     }
 
     fn sample_quota(id: &str, membership: Option<&str>, note: Option<&str>) -> Quota {

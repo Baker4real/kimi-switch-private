@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    membership_expiry_from_extra, prettify_membership, Account, AccountId, AccountRegistry,
-    AuditEvent, AuditLog, CredentialStore, FileStore, KeyringStore, Provider, Quota,
-    QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState,
-    QuotaWindow, RemovedAccounts, WEB_STORE_FIELD,
+    display_name, membership_expiry_from_extra, official_nickname_known, prettify_membership,
+    Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
+    KeyringStore, Provider, Quota, QuotaCollectReason, QuotaCollectStats, QuotaFailureKind,
+    QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts, WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
@@ -100,6 +100,22 @@ impl Backend {
         );
     }
 
+    /// 导入/授权后顺带打 `/me` 缓存官方昵称；失败忽略，不挡主流程。
+    async fn cache_official_nickname(&self, account: &Account) {
+        let Ok(Some(blob)) = self
+            .store
+            .get("kimi", account.id.0.as_str(), self.kimi.store_field())
+        else {
+            return;
+        };
+        kimi_switch_kimi::cache_official_nickname_from_blob(
+            self.registry.as_ref(),
+            &account.id,
+            &blob,
+        )
+        .await;
+    }
+
     pub async fn snapshot(
         &self,
         message: Option<UiMessage>,
@@ -110,7 +126,7 @@ impl Backend {
         let current_label = accounts
             .iter()
             .find(|a| a.active)
-            .map(|a| a.label.clone())
+            .map(|a| a.display_name.clone())
             .unwrap_or_else(|| "--".to_string());
         Snapshot {
             account_count: accounts.len() as u32,
@@ -146,6 +162,8 @@ impl Backend {
             .map_err(anyhow::Error::from)
             .context("导入失败：请先在 Kimi Code 里登录账号")?;
         self.registry.set_active("kimi", &account.id)?;
+        self.cache_official_nickname(&account).await;
+        let account = account_for_notice(self.registry.as_ref(), account);
         if let Ok(mut removed) =
             AppPaths::resolve().map(|p| RemovedAccounts::load(&p.removed_file()))
         {
@@ -156,7 +174,7 @@ impl Backend {
         Ok(self
             .snapshot(
                 Some(UiMessage {
-                    text: format!("已导入账号 {}", account.id),
+                    text: import_success_message(&account),
                     tone: "ok".into(),
                 }),
                 QuotaCollectReason::Scheduled,
@@ -166,17 +184,25 @@ impl Backend {
 
     pub async fn swap(&self, id: &str) -> Result<Snapshot> {
         let id = AccountId(id.to_string());
+        let account = self
+            .registry
+            .find("kimi", &id)?
+            .ok_or_else(|| anyhow::anyhow!("账号 {id} 不存在"))?;
         self.kimi
             .activate(&id)
             .await
             .map_err(anyhow::Error::from)
-            .with_context(|| format!("切换到 {id} 失败"))?;
+            .with_context(|| swap_failure_message(&account))?;
         self.audit
             .append(AuditEvent::ok("activate", "kimi", Some(id.0.as_str())));
+        let plan = AppPaths::resolve().ok().and_then(|paths| {
+            let cache = kimi_switch_core::QuotaCache::load(&paths.quota_cache_file());
+            cached_membership_plan(&cache, &id.0)
+        });
         Ok(self
             .snapshot(
                 Some(UiMessage {
-                    text: format!("已切换到 {id}"),
+                    text: swap_success_message(&account, plan.as_deref()),
                     tone: "ok".into(),
                 }),
                 QuotaCollectReason::Scheduled,
@@ -186,6 +212,10 @@ impl Backend {
 
     pub async fn remove(&self, id: &str) -> Result<Snapshot> {
         let id = AccountId(id.to_string());
+        let account = self
+            .registry
+            .find("kimi", &id)?
+            .ok_or_else(|| anyhow::anyhow!("账号 {id} 不存在"))?;
         let paths = AppPaths::resolve()?;
         kimi_switch_core::remove_account(
             self.registry.as_ref(),
@@ -200,7 +230,7 @@ impl Backend {
         Ok(self
             .snapshot(
                 Some(UiMessage {
-                    text: format!("已删除 {id}"),
+                    text: delete_success_message(&account),
                     tone: "ok".into(),
                 }),
                 QuotaCollectReason::Scheduled,
@@ -226,12 +256,13 @@ impl Backend {
                 )
                 .await);
         }
+        let text = rename_success_message(&account, label);
         account.label = label.to_string();
         self.registry.upsert(account)?;
         Ok(self
             .snapshot(
                 Some(UiMessage {
-                    text: format!("已把 {id} 重命名为「{label}」"),
+                    text,
                     tone: "ok".into(),
                 }),
                 QuotaCollectReason::Scheduled,
@@ -298,12 +329,14 @@ impl Backend {
                 .import_raw(blob, None, Some(false))
                 .map_err(anyhow::Error::from)
                 .context("授权成功但入库失败")?;
+            self.cache_official_nickname(&account).await;
+            let account = account_for_notice(self.registry.as_ref(), account);
             self.audit
                 .append(AuditEvent::ok("login", "kimi", Some(account.id.0.as_str())));
             return Ok(self
                 .snapshot(
                     Some(UiMessage {
-                        text: format!("授权成功，已添加账号 {}", account.id),
+                        text: auth_success_message(&account),
                         tone: "ok".into(),
                     }),
                     QuotaCollectReason::Scheduled,
@@ -314,6 +347,8 @@ impl Backend {
         // GUI 只把 ReauthError 映成文案，不重解析凭证。
         match self.kimi.replace_account_blob(&target, blob) {
             Ok(account) => {
+                self.cache_official_nickname(&account).await;
+                let account = account_for_notice(self.registry.as_ref(), account);
                 self.audit.append(AuditEvent::ok(
                     "reauth",
                     "kimi",
@@ -322,7 +357,7 @@ impl Backend {
                 Ok(self
                     .snapshot(
                         Some(UiMessage {
-                            text: format!("已更新账号 {} 的登录凭证", account.id),
+                            text: reauth_success_message(&account),
                             tone: "ok".into(),
                         }),
                         QuotaCollectReason::Scheduled,
@@ -476,11 +511,7 @@ where
     };
 
     let outcome = kimi_switch_core::quota_snapshot::collect_detailed(
-        provider,
-        "kimi",
-        &ids,
-        cache_path,
-        reason,
+        provider, "kimi", &ids, cache_path, reason,
     )
     .await;
 
@@ -519,6 +550,65 @@ where
         })
         .collect();
     (rows, outcome.stats)
+}
+
+/// persist 官方昵称后，用 registry 里已带 `official_nickname` 的 Account 生成 toast。
+pub(crate) fn account_for_notice(registry: &AccountRegistry, account: Account) -> Account {
+    registry
+        .find(&account.provider, &account.id)
+        .ok()
+        .flatten()
+        .unwrap_or(account)
+}
+
+pub(crate) fn import_success_message(account: &Account) -> String {
+    format!("已导入账号 {}", display_name(account))
+}
+
+pub(crate) fn swap_success_message(account: &Account, plan: Option<&str>) -> String {
+    let display = display_name(account);
+    match plan {
+        Some(plan) if !plan.is_empty() => format!("已切换到 {display}（{plan}）"),
+        _ => format!("已切换到 {display}"),
+    }
+}
+
+/// 只读本地额度缓存里的会员等级，映射成官网档位名。读取失败或无缓存则 `None`，不打网。
+pub(crate) fn cached_membership_plan(
+    cache: &kimi_switch_core::QuotaCache,
+    account_id: &str,
+) -> Option<String> {
+    let entry = cache.get("kimi", account_id)?;
+    let raw = entry
+        .quotas
+        .iter()
+        .find_map(|quota| quota.membership.as_deref())?;
+    let pretty = prettify_membership(raw);
+    if pretty.is_empty() {
+        None
+    } else {
+        Some(pretty)
+    }
+}
+
+pub(crate) fn swap_failure_message(account: &Account) -> String {
+    format!("切换到 {} 失败", display_name(account))
+}
+
+pub(crate) fn delete_success_message(account: &Account) -> String {
+    format!("已删除 {}", display_name(account))
+}
+
+pub(crate) fn rename_success_message(account: &Account, new_label: &str) -> String {
+    format!("已把 {} 重命名为「{new_label}」", display_name(account))
+}
+
+pub(crate) fn auth_success_message(account: &Account) -> String {
+    format!("授权成功，已添加账号 {}", display_name(account))
+}
+
+pub(crate) fn reauth_success_message(account: &Account) -> String {
+    format!("已更新账号 {} 的登录凭证", display_name(account))
 }
 
 /// 用户发起且没有任何账号真正查询时，把整批跳过原因写成快照提示。
@@ -637,6 +727,8 @@ pub(crate) fn account_row(
         error,
         credential_expired,
         cached_at,
+        display_name: display_name(account),
+        official_nickname_known: official_nickname_known(&account.extra),
     }
 }
 

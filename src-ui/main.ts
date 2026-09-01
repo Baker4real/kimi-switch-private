@@ -2,7 +2,7 @@ import "./styles.css";
 import { api, commandError, type Snapshot } from "./api";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { escapeHtml } from "./escape";
-import { accountDisplayName, parseAliasInput } from "./labels";
+import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
 import { bindWebButtonHtml, membershipPlanHtml } from "./membership";
 import { quotaHtml } from "./quota";
 import { renewalSwitchView } from "./renewal";
@@ -102,16 +102,15 @@ function setOverviewLoadError(visible: boolean): void {
 function cardActionButtons(row: Snapshot["accounts"][number], busy: boolean): string {
   const disabled = busy ? " disabled" : "";
   const reauth = `<button class="profile-pill" data-reauth="${escapeHtml(row.id)}" type="button" title="给这张卡重新走浏览器授权"${disabled}>授权</button>`;
-  const rename = `<button class="profile-pill" data-rename="${escapeHtml(row.id)}" type="button"${disabled}>重命名</button>`;
+  const rename = renameButtonHtml(row, busy);
   const remove = `<button class="profile-pill profile-pill--danger" data-delete="${escapeHtml(row.id)}" type="button"${disabled}>删除</button>`;
+  const renameGap = rename ? `\n           ${rename}` : "";
   if (row.active) {
-    return `${reauth}
-           ${rename}
+    return `${reauth}${renameGap}
            ${remove}`;
   }
   return `<button class="profile-pill" data-swap="${escapeHtml(row.id)}" type="button"${disabled}>切换</button>
-           ${reauth}
-           ${rename}
+           ${reauth}${renameGap}
            ${remove}`;
 }
 
@@ -124,7 +123,7 @@ function paintAccountCards(next: Snapshot): void {
     .map((row) => {
       return `<article class="profile-card${row.active ? " is-current" : ""}">
         <div class="profile-title-wrap">
-          <span class="profile-title">${escapeHtml(row.label)}${row.active ? " · 当前" : ""}</span>
+          <span class="profile-title">${escapeHtml(accountCardTitle(row))}</span>
           <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, busy)}</span>
         </div>
         <div class="profile-quota-stack">${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired)}</div>
@@ -160,7 +159,7 @@ function paintSnapshot(next: Snapshot): void {
   applyTheme(next.theme);
   paintProactiveRenewal(next.proactive_renewal);
   const current = next.accounts.find((row) => row.active);
-  required<HTMLHeadingElement>("current-title").textContent = current?.label ?? "--";
+  required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
   paintCurrentPlan(next);
   required<HTMLDivElement>("current-quota-panel").innerHTML = current
     ? quotaHtml(current.quotas, current.error, current.cached_at, current.credential_expired)
@@ -427,7 +426,7 @@ function openBindDialog(id: string): void {
   bindId = id;
   const row = store.get().snapshot?.accounts.find((item) => item.id === id);
   required<HTMLParagraphElement>("bind-copy").textContent = webBindCopy(
-    accountDisplayName(row?.label, id),
+    accountDisplayName(row, id),
   );
   const tokenInput = required<HTMLTextAreaElement>("bind-token");
   tokenInput.value = "";
@@ -541,13 +540,13 @@ function wireList(): void {
     if (reauth?.dataset.reauth) {
       const id = reauth.dataset.reauth;
       const row = store.get().snapshot?.accounts.find((item) => item.id === id);
-      void startDeviceAuth(id, accountDisplayName(row?.label, id));
+      void startDeviceAuth(id, accountDisplayName(row, id));
       return;
     }
     if (rename?.dataset.rename) {
       renameId = rename.dataset.rename;
       const row = store.get().snapshot?.accounts.find((item) => item.id === renameId);
-      const display = accountDisplayName(row?.label, renameId);
+      const display = accountDisplayName(row, renameId);
       required<HTMLParagraphElement>("rename-copy").textContent =
         `给 ${display} 起个别名（只影响本软件里的显示）：`;
       required<HTMLInputElement>("rename-input").value = row?.label ?? "";
@@ -557,8 +556,9 @@ function wireList(): void {
     }
     if (remove?.dataset.delete) {
       deleteId = remove.dataset.delete;
+      const row = store.get().snapshot?.accounts.find((item) => item.id === deleteId);
       required<HTMLParagraphElement>("delete-copy").textContent =
-        `确定要从账号库删除 ${deleteId} 吗？`;
+        `确定要从账号库删除 ${accountDisplayName(row, deleteId)} 吗？`;
       required<HTMLDialogElement>("delete-dialog").showModal();
     }
   });

@@ -25,8 +25,8 @@ _Avoid_: parked（仅代码内部名）, 非当前账号, 闲置账号
 _Avoid_: 昵称, folder name
 
 **官方昵称**:
-Kimi 官网账号的显示名，由官方接口的既有响应顺带缓存到本机，本软件内只读、不参与切换。界面上辨认账号时优先于别名。
-_Avoid_: 官方名称, nickname
+Kimi 官网账号的显示名。在导入、设备码授权、重新授权、额度查询这些既有官方流程里，额外请求一次 `GET https://api.kimi.com/coding/v1/me`，只把响应里的 `nickname` 字符串缓存到账号 extra（键 `official_nickname`）。不是 JWT claim，也不是 `/usages` 的 `user`。请求走已在白名单的 `api.kimi.com`（与额度查询同一 Code OAuth access token），不是 `www.kimi.com`。`/me` 失败保留旧缓存、不失败主流程。切换不请求。本软件内只读、不参与切换。界面上辨认账号时优先于别名。
+_Avoid_: 官方名称, nickname（对用户）, 网页 /me
 
 **额度**:
 某个账号在 Kimi 官方用量窗口（5 小时 / 7 天等）里已经用掉或还剩多少。

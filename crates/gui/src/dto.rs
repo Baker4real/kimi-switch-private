@@ -159,6 +159,10 @@ pub struct AccountRow {
     /// 额度取得时间的本地展示文案：非陈旧为「更新于 {时分}」，陈旧回退为「缓存于 {时分}」。
     /// 查询失败且无缓存回退（含凭证待续期）为 `None`——没有可标注的取得时间。
     pub cached_at: Option<String>,
+    /// 界面显示名（官方昵称 > 用户改过的别名 > 账号 id），由后端单一规则计算。
+    pub display_name: String,
+    /// 官方昵称缓存非空。已知时前端隐藏「重命名」入口。
+    pub official_nickname_known: bool,
 }
 
 impl AccountRow {

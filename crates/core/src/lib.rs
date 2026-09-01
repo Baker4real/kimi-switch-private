@@ -3,6 +3,7 @@
 pub mod account_registry;
 pub mod audit;
 pub mod defaults;
+pub mod display_name;
 pub mod error;
 pub mod membership_expiry;
 pub mod model;
@@ -22,9 +23,13 @@ pub mod time;
 
 pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
+pub use display_name::{
+    display_name, official_nickname_from_extra, official_nickname_known, persist_official_nickname,
+    write_official_nickname_extra, EXTRA_OFFICIAL_NICKNAME,
+};
 pub use error::{
-    BindWebError, Error, ProviderFailure, ProviderKind, QuotaFailure, QuotaFailureKind, ReauthError,
-    Result,
+    BindWebError, Error, ProviderFailure, ProviderKind, QuotaFailure, QuotaFailureKind,
+    ReauthError, Result,
 };
 pub use membership_expiry::{
     format_membership_expiry, membership_expiry_from_extra, prettify_membership,

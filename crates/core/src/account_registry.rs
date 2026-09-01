@@ -158,6 +158,26 @@ impl AccountRegistry {
         unique_match(matches, id_or_qualified)
     }
 
+    /// 在同一把写锁内读出账号、只改 extra，再写回。账号不存在则跳过。
+    pub fn update_extra(
+        &self,
+        provider: &str,
+        id: &AccountId,
+        update: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Result<()> {
+        self.with_write_lock(|| {
+            let mut all = self.load()?;
+            if let Some(existing) = all
+                .iter_mut()
+                .find(|a| a.provider == provider && a.id == *id)
+            {
+                update(&mut existing.extra);
+                self.save_unlocked(&all)?;
+            }
+            Ok(())
+        })
+    }
+
     /// 插入或更新一个账号（按 (provider, id) 主键去重）。
     pub fn upsert(&self, account: Account) -> Result<()> {
         self.with_write_lock(|| {

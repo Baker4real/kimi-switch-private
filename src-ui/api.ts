@@ -23,6 +23,10 @@ export interface AccountRow {
   /** 凭证待续期：凭证过期型 401。此时 error 是引导文案，不计告急、不按错误红渲染。 */
   credential_expired: boolean;
   cached_at: string | null;
+  /** 后端计算的显示名（官方昵称 > 用户改过的别名 > 账号 id）。 */
+  display_name: string;
+  /** 官方昵称缓存非空。已知时隐藏「重命名」入口。 */
+  official_nickname_known: boolean;
 }
 
 export interface UiMessage {

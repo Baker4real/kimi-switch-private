@@ -84,6 +84,69 @@ fn quota_from(
     })
 }
 
+/// 从 `/me` JSON 抽取官方昵称。只读 `nickname` 字符串；缺字段、空串、非字符串都视为未知。
+pub fn parse_official_nickname(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let raw = value.get("nickname").and_then(|item| item.as_str())?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// `/me` 独立短超时：对齐会员 join 预算，远小于 20s 额度超时。超时 = 未知。
+const OFFICIAL_NICKNAME_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn fetch_official_nickname(access_token: &str, api_base: &str) -> Option<String> {
+    let url = format!("{}/me", api_base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(OFFICIAL_NICKNAME_HTTP_TIMEOUT)
+        .build()
+        .ok()?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "kimi-switch")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    parse_official_nickname(&body)
+}
+
+/// 额度查询或导入成功后顺带缓存官方昵称。`/me` 失败不改变 extra、不失败主流程。
+async fn cache_official_nickname(
+    access_token: &str,
+    account_id: &AccountId,
+    api_base: &str,
+    registry: Option<&kimi_switch_core::AccountRegistry>,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    let Some(nickname) = fetch_official_nickname(access_token, api_base).await else {
+        return;
+    };
+    let _ = kimi_switch_core::persist_official_nickname(registry, "kimi", account_id, &nickname);
+}
+
+/// 导入/授权拿到 blob 后若能取出 access_token，顺带缓存官方昵称。失败忽略。
+pub async fn cache_official_nickname_from_blob(
+    registry: &kimi_switch_core::AccountRegistry,
+    account_id: &AccountId,
+    blob: &str,
+) {
+    let Some(access_token) = kimi_switch_engine::extract_access_token(blob) else {
+        return;
+    };
+    cache_official_nickname(&access_token, account_id, &base_url(), Some(registry)).await;
+}
+
 /// 解析 /usages 响应为多窗口 Quota。会员等级写入 `Quota.membership`，并双写 `note`。
 pub fn parse_usages(body: &str, provider: &str, id: &AccountId) -> Vec<Quota> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -118,6 +181,7 @@ pub fn parse_usages(body: &str, provider: &str, id: &AccountId) -> Vec<Quota> {
 pub async fn fetch_quota_with_active_recovery(
     access_token: &str,
     account: &Account,
+    registry: &kimi_switch_core::AccountRegistry,
 ) -> Result<Vec<Quota>> {
     let api_base = base_url();
     fetch_quota_with_active_recovery_at(
@@ -126,6 +190,7 @@ pub async fn fetch_quota_with_active_recovery(
         &api_base,
         &crate::paths::kimi_home(),
         None,
+        Some(registry),
     )
     .await
 }
@@ -136,8 +201,9 @@ async fn fetch_quota_with_active_recovery_at(
     api_base: &str,
     home: &std::path::Path,
     test_recovery: Option<(&str, crate::oauth::RefreshLockProtocol)>,
+    registry: Option<&kimi_switch_core::AccountRegistry>,
 ) -> Result<Vec<Quota>> {
-    match fetch_quota_at(access_token, account, api_base).await {
+    let (quotas, token_for_me) = match fetch_quota_at(access_token, account, api_base).await {
         Err(error) if account.active && error.http_status() == Some(401) => {
             let recovered = if let Some((oauth_base, protocol)) = test_recovery {
                 crate::oauth::recover_active_401_at(
@@ -154,10 +220,24 @@ async fn fetch_quota_with_active_recovery_at(
             let Some(fresh_access) = recovered else {
                 return Err(classify_unrecovered_401(error, access_token));
             };
-            fetch_quota_at(&fresh_access, account, api_base).await
+            (
+                fetch_quota_at(&fresh_access, account, api_base).await?,
+                fresh_access,
+            )
         }
-        result => result,
+        Ok(quotas) => (quotas, access_token.to_string()),
+        Err(error) => return Err(error),
+    };
+    if let Some(registry) = registry {
+        let token_for_me = token_for_me;
+        let account_id = account.id.clone();
+        let api_base = api_base.to_string();
+        let registry = kimi_switch_core::AccountRegistry::new(registry.path().clone());
+        tokio::spawn(async move {
+            cache_official_nickname(&token_for_me, &account_id, &api_base, Some(&registry)).await;
+        });
     }
+    Ok(quotas)
 }
 
 /// 「凭证过期型 401」的引导文案（issue #41）：卡片用它替代裸 401，给出可行动的恢复路径。
@@ -211,6 +291,275 @@ mod tests {
       "limits": [{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},
                   "detail":{"limit":"100","used":"18","remaining":"82","resetTime":"2026-07-17T12:52:15Z"}}]
     }"#;
+
+    async fn wait_received(server: &MockServer, n: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if server.received() >= n {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timeout waiting for {n} mock requests, got {}", server.received());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_official_nickname(
+        registry: &kimi_switch_core::AccountRegistry,
+        expected: Option<&str>,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let stored = registry
+                .find("kimi", &AccountId("u-123".into()))
+                .unwrap()
+                .unwrap();
+            if kimi_switch_core::official_nickname_from_extra(&stored.extra) == expected {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timeout waiting for official nickname {expected:?}, got {:?}",
+                    kimi_switch_core::official_nickname_from_extra(&stored.extra)
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn parse_official_nickname_reads_top_level_nickname() {
+        let body = r#"{"nickname":"Forever","userId":"u1"}"#;
+        assert_eq!(parse_official_nickname(body).as_deref(), Some("Forever"));
+    }
+
+    #[test]
+    fn parse_official_nickname_missing_or_blank_is_unknown() {
+        assert_eq!(parse_official_nickname(r#"{"userId":"u1"}"#), None);
+        assert_eq!(parse_official_nickname(r#"{"nickname":""}"#), None);
+        assert_eq!(parse_official_nickname(r#"{"nickname":"   "}"#), None);
+        assert_eq!(parse_official_nickname(r#"{"nickname":1}"#), None);
+        assert_eq!(parse_official_nickname("not-json"), None);
+    }
+
+    #[test]
+    fn parse_official_nickname_ignores_other_profile_fields() {
+        let body = r#"{"nickname":"Forever","phone":"+86","email":"a@b.c","avatar":"http://x","user_level_name":"Allegro"}"#;
+        assert_eq!(parse_official_nickname(body).as_deref(), Some("Forever"));
+    }
+
+    #[tokio::test]
+    async fn usages_success_returns_quota_even_when_me_hangs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let registry =
+            kimi_switch_core::AccountRegistry::new(temporary.path().join("registry.toml"));
+        registry.upsert(active_account()).unwrap();
+        let usages = r#"{"usage":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"}}"#;
+        let server = MockServer::start_then_hang(vec![("200 OK", usages)]);
+
+        let started = std::time::Instant::now();
+        let quotas = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            fetch_quota_with_active_recovery_at(
+                "tok",
+                &active_account(),
+                server.base_url(),
+                temporary.path(),
+                None,
+                Some(&registry),
+            ),
+        )
+        .await
+        .expect("/usages 成功后不得因 /me 挂起而丢掉额度")
+        .unwrap();
+
+        assert_eq!(quotas[0].used, 4);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "/usages 成功必须立刻交回额度，不得等 /me：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            kimi_switch_core::official_nickname_from_extra(
+                &registry
+                    .find("kimi", &AccountId("u-123".into()))
+                    .unwrap()
+                    .unwrap()
+                    .extra
+            ),
+            None,
+            "挂起的 /me 不得写入昵称"
+        );
+    }
+
+    #[tokio::test]
+    async fn me_timeout_keeps_old_nickname_and_does_not_hang() {
+        let temporary = tempfile::tempdir().unwrap();
+        let registry =
+            kimi_switch_core::AccountRegistry::new(temporary.path().join("registry.toml"));
+        let mut seeded = active_account();
+        kimi_switch_core::write_official_nickname_extra(&mut seeded.extra, "OldName");
+        registry.upsert(seeded).unwrap();
+        let server = MockServer::start_then_hang(vec![]);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            cache_official_nickname(
+                "tok",
+                &AccountId("u-123".into()),
+                server.base_url(),
+                Some(&registry),
+            ),
+        )
+        .await
+        .expect("/me 必须有短超时，不得挂起导入/授权");
+
+        let stored = registry
+            .find("kimi", &AccountId("u-123".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kimi_switch_core::official_nickname_from_extra(&stored.extra),
+            Some("OldName")
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_success_caches_official_nickname_from_me() {
+        let temporary = tempfile::tempdir().unwrap();
+        let registry =
+            kimi_switch_core::AccountRegistry::new(temporary.path().join("registry.toml"));
+        registry.upsert(active_account()).unwrap();
+        let server = MockServer::start(vec![
+            (
+                "200 OK",
+                r#"{"usage":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"}}"#,
+            ),
+            ("200 OK", r#"{"nickname":"Forever","phone":"+86"}"#),
+        ]);
+
+        let quotas = fetch_quota_with_active_recovery_at(
+            "tok",
+            &active_account(),
+            server.base_url(),
+            temporary.path(),
+            None,
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(quotas[0].used, 4);
+        wait_received(&server, 2).await;
+        wait_official_nickname(&registry, Some("Forever")).await;
+        let stored = registry
+            .find("kimi", &AccountId("u-123".into()))
+            .unwrap()
+            .unwrap();
+        assert!(stored.extra.get("phone").is_none());
+        assert_eq!(
+            server.finish(),
+            vec!["GET /usages HTTP/1.1", "GET /me HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn me_failure_keeps_old_nickname_and_does_not_fail_quota() {
+        let temporary = tempfile::tempdir().unwrap();
+        let registry =
+            kimi_switch_core::AccountRegistry::new(temporary.path().join("registry.toml"));
+        let mut seeded = active_account();
+        kimi_switch_core::write_official_nickname_extra(&mut seeded.extra, "OldName");
+        registry.upsert(seeded).unwrap();
+        let server = MockServer::start(vec![
+            (
+                "200 OK",
+                r#"{"usage":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"}}"#,
+            ),
+            ("500 Internal Server Error", r#"{"error":"boom"}"#),
+        ]);
+
+        let quotas = fetch_quota_with_active_recovery_at(
+            "tok",
+            &active_account(),
+            server.base_url(),
+            temporary.path(),
+            None,
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(quotas[0].used, 4);
+        wait_received(&server, 2).await;
+        wait_official_nickname(&registry, Some("OldName")).await;
+        assert_eq!(
+            server.finish(),
+            vec!["GET /usages HTTP/1.1", "GET /me HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_quota_uses_fresh_access_token_for_me() {
+        let temporary = tempfile::tempdir().unwrap();
+        let credentials = crate::paths::active_cred_path(temporary.path());
+        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        let old = credential_blob("OLD", "R1");
+        let old_access = extract_json_string(&old, "access_token");
+        std::fs::write(&credentials, &old).unwrap();
+        let registry =
+            kimi_switch_core::AccountRegistry::new(temporary.path().join("registry.toml"));
+        registry.upsert(active_account()).unwrap();
+        let server = MockServer::start(vec![
+            ("401 Unauthorized", r#"{"error":"expired"}"#),
+            (
+                "200 OK",
+                r#"{"access_token":"NEW","refresh_token":"R2","expires_in":3600,"scope":"kimi-code","token_type":"Bearer"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"usage":{"limit":"100","used":"7","remaining":"93","resetTime":"2026-07-24T07:52:15Z"}}"#,
+            ),
+            ("200 OK", r#"{"nickname":"Forever"}"#),
+        ]);
+
+        fetch_quota_with_active_recovery_at(
+            &old_access,
+            &active_account(),
+            server.base_url(),
+            temporary.path(),
+            Some((
+                server.base_url(),
+                crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
+            )),
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+
+        wait_received(&server, 4).await;
+        wait_official_nickname(&registry, Some("Forever")).await;
+        let requests = server.finish_full();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("GET /usages HTTP/1.1"));
+        assert!(requests[1].starts_with("POST /api/oauth/token HTTP/1.1"));
+        assert!(requests[2].starts_with("GET /usages HTTP/1.1"));
+        assert!(requests[3].starts_with("GET /me HTTP/1.1"));
+        let me = requests[3].to_ascii_lowercase();
+        assert!(
+            me.contains("authorization: bearer new"),
+            "恢复成功后 /me 必须用新 access token"
+        );
+        assert!(
+            !requests[3].contains(&old_access),
+            "/me 不得使用恢复前的 access token"
+        );
+        assert!(
+            me.contains("user-agent: kimi-switch"),
+            "/me 须带 kimi-switch UA"
+        );
+    }
 
     #[test]
     fn parses_weekly_and_5h() {
@@ -269,6 +618,7 @@ mod tests {
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
             )),
+            None,
         )
         .await
         .unwrap();
@@ -309,6 +659,7 @@ mod tests {
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
             )),
+            None,
         )
         .await;
 
@@ -345,6 +696,7 @@ mod tests {
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
             )),
+            None,
         )
         .await
         .unwrap_err();
@@ -396,6 +748,7 @@ mod tests {
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
             )),
+            None,
         )
         .await
         .unwrap_err();
@@ -429,6 +782,7 @@ mod tests {
             server.base_url(),
             temporary.path(),
             None, // 停泊账号本就不进协调恢复；显式 None 钉住
+            None,
         )
         .await
         .unwrap_err();
@@ -454,8 +808,10 @@ mod tests {
         // 过期 JWT → 归入凭证过期型 401。
         let expired = credential_blob_with_exp("OLD", "R1", 1_000_000_000);
         let expired_token = extract_json_string(&expired, "access_token");
-        let err =
-            classify_unrecovered_401(Error::quota_http(401, "kimi usages HTTP 401"), &expired_token);
+        let err = classify_unrecovered_401(
+            Error::quota_http(401, "kimi usages HTTP 401"),
+            &expired_token,
+        );
         assert_eq!(
             err.quota_failure().map(|f| f.kind),
             Some(QuotaFailureKind::CredentialExpired)
@@ -465,8 +821,10 @@ mod tests {
         // 既有测试 blob 的 JWT 无 exp → 无法确证过期，维持裸 401。
         let no_exp = credential_blob("OLD", "R1");
         let no_exp_token = extract_json_string(&no_exp, "access_token");
-        let err =
-            classify_unrecovered_401(Error::quota_http(401, "kimi usages HTTP 401"), &no_exp_token);
+        let err = classify_unrecovered_401(
+            Error::quota_http(401, "kimi usages HTTP 401"),
+            &no_exp_token,
+        );
         assert_eq!(
             err.quota_failure().map(|f| f.kind),
             Some(QuotaFailureKind::Http)

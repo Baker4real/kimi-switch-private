@@ -8,6 +8,8 @@ mod paths;
 pub mod device_flow;
 pub mod web_membership;
 
+pub use kimi_usage::cache_official_nickname_from_blob;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,7 +21,9 @@ use kimi_switch_engine::{BlobMetadata, FileBlobProvider, FileBlobRuntime, Refres
 pub const PROVIDER_ID: &str = "kimi";
 
 /// Kimi runtime adapter：只提供差异点，机制在引擎。
-pub struct KimiRuntime;
+pub struct KimiRuntime {
+    registry: Arc<AccountRegistry>,
+}
 
 #[async_trait]
 impl FileBlobRuntime for KimiRuntime {
@@ -39,7 +43,7 @@ impl FileBlobRuntime for KimiRuntime {
         oauth::refresh_blob(blob).await
     }
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>> {
-        kimi_usage::fetch_quota_with_active_recovery(access_token, account).await
+        kimi_usage::fetch_quota_with_active_recovery(access_token, account, &self.registry).await
     }
 
     // 当前账号主动续期（issue #44）：判定与 DeadToken 纪律在 oauth，机制在引擎。
@@ -62,7 +66,13 @@ pub type KimiProvider = FileBlobProvider<KimiRuntime>;
 
 /// 构造 KimiProvider（与 BetaProvider/AlphaProvider 的 `::new` 调用面一致）。
 pub fn new(store: Arc<dyn CredentialStore>, registry: Arc<AccountRegistry>) -> KimiProvider {
-    FileBlobProvider::new(KimiRuntime, store, registry)
+    FileBlobProvider::new(
+        KimiRuntime {
+            registry: registry.clone(),
+        },
+        store,
+        registry,
+    )
 }
 
 #[cfg(test)]
@@ -81,6 +91,16 @@ mod test_support {
 
     impl MockServer {
         pub fn start(responses: Vec<(&'static str, &'static str)>) -> Self {
+            Self::spawn(responses, false)
+        }
+
+        /// 先按序回完 `responses`，再 accept 下一连接并挂起不写回。
+        /// 用于模拟 `/me` 对端挂起；调用方不要 `finish()`（会一直等）。
+        pub fn start_then_hang(responses: Vec<(&'static str, &'static str)>) -> Self {
+            Self::spawn(responses, true)
+        }
+
+        fn spawn(responses: Vec<(&'static str, &'static str)>, hang_after: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -105,6 +125,20 @@ mod test_support {
                     )
                     .unwrap();
                 }
+                if hang_after {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut buffer = [0_u8; 8192];
+                    let count = stream.read(&mut buffer).unwrap();
+                    let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(request.lines().next().unwrap_or_default().to_string());
+                    captured_full.lock().unwrap().push(request);
+                    // 保持连接、不写响应，模拟对端挂起。
+                    std::thread::park();
+                    drop(stream);
+                }
             });
             Self {
                 base_url,
@@ -116,6 +150,10 @@ mod test_support {
 
         pub fn base_url(&self) -> &str {
             &self.base_url
+        }
+
+        pub fn received(&self) -> usize {
+            self.requests.lock().unwrap().len()
         }
 
         pub fn finish(mut self) -> Vec<String> {
