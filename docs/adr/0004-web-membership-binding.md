@@ -30,7 +30,9 @@ extra，默认列表即出现「有效期至」。展示格式化与读侧 schem
    到期瞬间是非秘密元数据，写进账号 extra（#49 schema 的两个 RFC3339 UTC 键），
    不进凭证仓库。重新授权（`replace_account_blob`）只写 Code store_field 与
    live，同一账号 id 的网页绑定原样保留，也不在授权流程里打网页接口。
-   `swap` / `activate` / 额度查询路径零改动、零网页请求（由引擎测试钉住）。
+   `swap` / `activate` / 额度查询不打 `www.kimi.com`、不读写网页 field
+   （由引擎测试钉住）。额度路径可以顺带请求 `api.kimi.com` `/me` 缓存
+   官方昵称（见 CONTEXT.md），与本 ADR 的网页会员路径无关。
 
 3. **为何不用浏览器 cookie**：cookie 是浏览器会话级凭证，读取它等于冒充用户
    的浏览器身份，超出用户明确授权的范围，且依赖抓取页面/存储布局，官方一改

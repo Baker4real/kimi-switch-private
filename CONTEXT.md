@@ -28,6 +28,10 @@ _Avoid_: 昵称, folder name
 Kimi 官网账号的显示名。在导入、设备码授权、重新授权、额度查询这些既有官方流程里，额外请求一次 `GET https://api.kimi.com/coding/v1/me`，只把响应里的 `nickname` 字符串缓存到账号 extra（键 `official_nickname`）。不是 JWT claim，也不是 `/usages` 的 `user`。请求走已在白名单的 `api.kimi.com`（与额度查询同一 Code OAuth access token），不是 `www.kimi.com`。`/me` 失败保留旧缓存、不失败主流程。切换不请求。本软件内只读、不参与切换。界面上辨认账号时优先于别名。
 _Avoid_: 官方名称, nickname（对用户）, 网页 /me
 
+**显示名**:
+GUI 辨认账号用的字符串，单一出处 `display_name()`：官方昵称非空用之，否则用户改过的别名，否则账号 id。通知文案与账号行 DTO 共用这一规则。CLI 用户可见输出仍用账号 id。
+_Avoid_: 在前端重算这套优先级
+
 **额度**:
 某个账号在 Kimi 官方用量窗口（5 小时 / 7 天等）里已经用掉或还剩多少。
 _Avoid_: metric, quota monitor

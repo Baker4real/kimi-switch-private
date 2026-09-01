@@ -77,7 +77,7 @@ GUI 与 CLI 共用同一份账号库和设置（`%APPDATA%\kimi-switch\`），�
 不需要。凭证是每次请求时读取的，切换即时生效。
 
 **账号库的凭证安全吗？**
-所有 token 只存在你自己的电脑上（`%APPDATA%\kimi-switch\` 下的私有文件），不会上传到任何第三方服务器。源码中唯一的网络请求发往 Kimi 官方域名：授权与额度走 `auth.kimi.com` / `api.kimi.com`，绑定网页登录读取会员到期才访问 `www.kimi.com`。
+所有 token 只存在你自己的电脑上（`%APPDATA%\kimi-switch\` 下的私有文件），不会上传到任何第三方服务器。源码中唯一的网络请求发往 Kimi 官方域名：授权、额度与官方昵称走 `auth.kimi.com` / `api.kimi.com`，绑定网页登录读取会员到期才访问 `www.kimi.com`。
 
 **账号放久了切换过去提示 401？**
 refresh token 有有效期，长期未使用的账号凭证会过期。在账号库对那张卡点「授权」重走一次浏览器登录即可救活，无需删除重加。
