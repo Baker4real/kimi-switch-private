@@ -780,12 +780,9 @@ fn quota_views(quotas: &[Quota]) -> Vec<QuotaView> {
                 Some(r) => format!("{:.0}% ({}/{})", r * 100.0, q.used, q.limit),
                 None => format!("{}/{}", q.used, q.limit),
             };
-            let reset = q.reset_at.map(|t| {
-                format!(
-                    "重置 {}",
-                    t.with_timezone(&chrono::Local).format("%m-%d %H:%M")
-                )
-            });
+            let reset = q
+                .reset_at
+                .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string());
             QuotaView {
                 tone: QuotaView::tone(ratio),
                 window,

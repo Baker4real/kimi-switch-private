@@ -1,5 +1,5 @@
 import { escapeHtml } from "./escape";
-import { quotaHtml, type QuotaView } from "./quota";
+import { quotaHtml, type QuotaView, type Tone } from "./quota";
 
 export interface MembershipFields {
   membership: string | null;
@@ -70,8 +70,32 @@ function remainingBadge(days: number): string {
   return `已过期 ${-days} 天`;
 }
 
+/** 会员轨道填充的年度参照：本地只有到期日与剩余天数，无会员开始日，
+ * 按剩余天数 / 365 折算占比（封顶 100%，0 与负数条为空）。 */
+const MEMBERSHIP_YEAR_DAYS = 365;
+
+/** 剩余 >30 天绿、8–30 天黄、1–7 天橙、0 与负数红，与额度条四档 tone 同一套视觉语言。 */
+function remainingTone(days: number): Tone {
+  if (days <= 0) {
+    return "full";
+  }
+  if (days <= 7) {
+    return "high";
+  }
+  if (days <= 30) {
+    return "warn";
+  }
+  return "ok";
+}
+
+/** 占比保留 1 位小数，避免 HTML 里出现无限小数。 */
+function remainingPercent(days: number): number {
+  const raw = Math.max(0, Math.min(100, (days / MEMBERSHIP_YEAR_DAYS) * 100));
+  return Math.round(raw * 10) / 10;
+}
+
 /** 额度 stack 顶部的会员轨道：有档位且有到期日（含剩余天数，0 与负数也算）才画。
- * 借用额度行外形，不借用填充=用量压力，也不是 progressbar。 */
+ * 借用额度行外形与四档 tone；填充=剩余时间占比（年度参照），不是用量压力。 */
 export function membershipTrackHtml(row: MembershipTrackFields): string {
   if (
     row.membership == null ||
@@ -83,9 +107,12 @@ export function membershipTrackHtml(row: MembershipTrackFields): string {
   const badge = remainingBadge(row.membership_remaining_days);
   const date = row.membership_expiry;
   const sentence = `会员 ${badge} 有效期至 ${date}`;
+  const width = remainingPercent(row.membership_remaining_days);
+  const tone = remainingTone(row.membership_remaining_days);
   return `<div class="quota-row">
         <span class="quota-label">会员</span>
-        <div class="quota-track" title="${escapeHtml(sentence)}" aria-label="${escapeHtml(sentence)}">
+        <div class="quota-track" role="progressbar" aria-label="${escapeHtml(sentence)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(width)}" aria-valuetext="${escapeHtml(sentence)}" title="${escapeHtml(sentence)}">
+          <div class="quota-fill quota-fill--${tone}" style="width:${width}%"></div>
           <span class="quota-value">${escapeHtml(badge)}</span>
         </div>
         <span class="quota-reset">${escapeHtml(date)}</span>

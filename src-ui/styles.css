@@ -682,6 +682,11 @@ p {
   text-overflow: ellipsis;
 }
 
+/* 行内时间列紧贴轨道右端、三行左缘对齐；「额度: n/a」独立段落维持右对齐现状 */
+.quota-row .quota-reset {
+  text-align: left;
+}
+
 /* 条上直接标注用量文字（DTO 的 text）：小徽章形式，
    用主题表面色打底，保证亮/暗主题与四档压力色下都可读；
    超长时在条内省略号，完整文字仍可从 title 提示看到。 */

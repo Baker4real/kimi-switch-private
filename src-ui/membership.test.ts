@@ -155,15 +155,39 @@ describe("membershipTrackHtml", () => {
     expect(html).toContain(`aria-label="会员 已过期 3 天 有效期至 2027-08-27"`);
   });
 
-  it("不是 progressbar，空槽无填充、无压力色", () => {
+  it("剩余时间走进度条：填充=剩余/365 封顶，progressbar 语义完整", () => {
     const html = membershipTrackHtml(trackFields());
-    expect(html).not.toContain("progressbar");
-    expect(html).not.toContain("quota-fill");
-    expect(html).not.toContain("quota-fill--ok");
-    expect(html).not.toContain("quota-fill--warn");
-    expect(html).not.toContain("quota-fill--high");
-    expect(html).not.toContain("quota-fill--full");
-    expect(html).not.toContain("style=\"width");
+    expect(html).toContain(`role="progressbar"`);
+    expect(html).toContain(`aria-valuemin="0"`);
+    expect(html).toContain(`aria-valuemax="100"`);
+    expect(html).toContain(`aria-valuenow="99"`);
+    expect(html).toContain(`aria-valuetext="会员 剩余 360 天 有效期至 2027-08-27"`);
+    expect(html).toContain(`class="quota-fill quota-fill--ok"`);
+    expect(html).toContain(`style="width:98.6%"`);
+  });
+
+  it("填充档位随剩余天数换色：31 ok / 30、8 warn / 7、1 high / 0 与负 full", () => {
+    const toneOf = (days: number) =>
+      membershipTrackHtml(trackFields({ membership_remaining_days: days })).match(
+        /quota-fill--(\w+)/,
+      )?.[1];
+    expect(toneOf(31)).toBe("ok");
+    expect(toneOf(30)).toBe("warn");
+    expect(toneOf(8)).toBe("warn");
+    expect(toneOf(7)).toBe("high");
+    expect(toneOf(1)).toBe("high");
+    expect(toneOf(0)).toBe("full");
+    expect(toneOf(-3)).toBe("full");
+  });
+
+  it("剩余 0 与负数填充宽度为 0，超一年封顶 100%", () => {
+    const zero = membershipTrackHtml(trackFields({ membership_remaining_days: 0 }));
+    expect(zero).toContain(`style="width:0%"`);
+    const expired = membershipTrackHtml(trackFields({ membership_remaining_days: -3 }));
+    expect(expired).toContain(`style="width:0%"`);
+    const over = membershipTrackHtml(trackFields({ membership_remaining_days: 400 }));
+    expect(over).toContain(`style="width:100%"`);
+    expect(over).toContain(`aria-valuenow="100"`);
   });
 
   it("转义到期日", () => {
