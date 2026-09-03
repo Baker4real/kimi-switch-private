@@ -218,10 +218,15 @@ impl AccountRegistry {
             for a in &mut all {
                 if a.provider == provider {
                     let is_target = a.id == *id;
-                    a.active = is_target;
                     if is_target {
                         found = true;
-                        a.last_used_at = Some(chrono::Utc::now());
+                        // 只在非当前 → 当前时盖戳；对齐已是当前的号不刷新安顿宽限锚点。
+                        if !a.active {
+                            a.last_used_at = Some(chrono::Utc::now());
+                        }
+                        a.active = true;
+                    } else {
+                        a.active = false;
                     }
                 }
             }
@@ -275,6 +280,8 @@ fn strip_json_nulls(value: &mut serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
     use crate::model::AccountId;
 
     fn make_account(provider: &str, id: &str) -> Account {
@@ -397,6 +404,54 @@ mod tests {
         let actives: Vec<_> = all.iter().filter(|a| a.active).collect();
         assert_eq!(actives.len(), 1);
         assert_eq!(actives[0].id.0, "b");
+    }
+
+    #[test]
+    fn set_active_same_id_does_not_refresh_last_used_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AccountRegistry::new(tmp.path().join("registry.toml"));
+        let stamp = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let mut a = make_account("alpha", "a");
+        a.active = true;
+        a.last_used_at = Some(stamp);
+        reg.upsert(a).unwrap();
+
+        reg.set_active("alpha", &AccountId("a".into())).unwrap();
+
+        let loaded = reg
+            .find("alpha", &AccountId("a".into()))
+            .unwrap()
+            .expect("a");
+        assert!(loaded.active);
+        assert_eq!(loaded.last_used_at, Some(stamp));
+    }
+
+    #[test]
+    fn set_active_switch_updates_last_used_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AccountRegistry::new(tmp.path().join("registry.toml"));
+        let stamp = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let mut a = make_account("alpha", "a");
+        a.last_used_at = Some(stamp);
+        let mut b = make_account("alpha", "b");
+        b.active = true;
+        b.last_used_at = Some(stamp);
+        reg.upsert(a).unwrap();
+        reg.upsert(b).unwrap();
+
+        reg.set_active("alpha", &AccountId("a".into())).unwrap();
+
+        let all = reg.load().unwrap();
+        let a = all.iter().find(|account| account.id.0 == "a").expect("a");
+        let b = all.iter().find(|account| account.id.0 == "b").expect("b");
+        assert!(a.active);
+        assert!(!b.active);
+        let used = a.last_used_at.expect("切到 A 应盖 last_used_at");
+        assert!(
+            used > stamp,
+            "切到新号应刷新 last_used_at: {used} vs {stamp}"
+        );
+        assert_eq!(b.last_used_at, Some(stamp));
     }
 
     #[test]

@@ -195,6 +195,8 @@ pub struct Snapshot {
     pub theme: ThemeId,
     /// 「当前账号主动续期」开关（issue #42）：直读 config.toml，默认关。
     pub proactive_renewal: bool,
+    /// 「额度耗尽自动切换」开关（issue #68）：直读 config.toml，默认关。
+    pub auto_swap: bool,
     pub message: Option<UiMessage>,
 }
 

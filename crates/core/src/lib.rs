@@ -2,6 +2,7 @@
 
 pub mod account_registry;
 pub mod audit;
+pub mod auto_swap;
 pub mod defaults;
 pub mod display_name;
 pub mod error;
@@ -23,6 +24,10 @@ pub mod time;
 
 pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
+pub use auto_swap::{
+    decide_auto_swap, read_last_auto_swap_at, write_last_auto_swap_at, AutoSwapDecision,
+    AutoSwapSkipReason, AutoSwapTarget,
+};
 pub use display_name::{
     display_name, official_nickname_from_extra, official_nickname_known, persist_official_nickname,
     write_official_nickname_extra, EXTRA_OFFICIAL_NICKNAME,

@@ -5,6 +5,7 @@ import { escapeHtml } from "./escape";
 import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
+import { autoSwapSwitchView, silentQuotaMessage } from "./auto-swap";
 import { renewalSwitchView } from "./renewal";
 import { createAppStore } from "./store";
 import {
@@ -85,6 +86,14 @@ function paintProactiveRenewal(enabled: boolean): void {
   );
 }
 
+function paintAutoSwap(enabled: boolean): void {
+  const view = autoSwapSwitchView(enabled);
+  required<HTMLButtonElement>("auto-swap-toggle").setAttribute(
+    "aria-checked",
+    String(view.checked),
+  );
+}
+
 function showToast(text: string, isError = false): void {
   const toast = required<HTMLDivElement>("toast");
   toast.textContent = text;
@@ -158,6 +167,7 @@ function paintSnapshot(next: Snapshot): void {
   setOverviewLoadError(false);
   applyTheme(next.theme);
   paintProactiveRenewal(next.proactive_renewal);
+  paintAutoSwap(next.auto_swap);
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
   paintCurrentPlan(next);
@@ -291,7 +301,7 @@ async function runSilentQuotaQuery(): Promise<void> {
     if (silentStopped || store.get().busy) {
       return;
     }
-    applySnapshot({ ...next, message: null }, generation);
+    applySnapshot({ ...next, message: silentQuotaMessage(next.message) }, generation);
   } catch {
     // 静默失败不 toast；有上次成功快照则条留在当前界面。静默列出不弹会员 toast。
   } finally {
@@ -623,6 +633,17 @@ async function init(): Promise<void> {
       const saved = await api.setProactiveRenewal(next);
       paintProactiveRenewal(saved);
       showToast(renewalSwitchView(saved).toast);
+    } catch (error) {
+      showToast(commandError(error).message, true);
+    }
+  });
+  required<HTMLButtonElement>("auto-swap-toggle").addEventListener("click", async () => {
+    const toggle = required<HTMLButtonElement>("auto-swap-toggle");
+    const next = toggle.getAttribute("aria-checked") !== "true";
+    try {
+      const saved = await api.setAutoSwap(next);
+      paintAutoSwap(saved);
+      showToast(autoSwapSwitchView(saved).toast);
     } catch (error) {
       showToast(commandError(error).message, true);
     }

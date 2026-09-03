@@ -16,7 +16,7 @@ pub use kimi_switch_core::QuotaCollectReason;
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use chrono::{Local, TimeZone, Utc};
@@ -27,12 +27,14 @@ mod tests {
     use kimi_switch_kimi::web_membership::WebBinding;
 
     use crate::backend::{
-        account_for_notice, account_row, account_row_at, attach_skip_message, auth_success_message,
-        bind_web_success_message, bind_web_user_message, cached_membership_plan,
-        collect_account_rows, delete_success_message, import_success_message,
-        reauth_success_message, rename_success_message, swap_failure_message, swap_success_message,
-        WebMembershipRefresh,
+        account_for_notice, account_row, account_row_at, apply_snapshot_auto_swap,
+        attach_auto_swap_message, attach_skip_message, auth_success_message,
+        auto_swap_success_message, bind_web_success_message, bind_web_user_message,
+        cached_membership_plan, collect_account_rows, delete_success_message,
+        import_success_message, reauth_success_message, rename_success_message,
+        swap_failure_message, swap_success_message, AutoSwapSnapshotEffect, WebMembershipRefresh,
     };
+    use kimi_switch_core::{AuditEvent, AuditLog};
 
     #[test]
     fn quota_tone_follows_pressure_thresholds() {
@@ -472,7 +474,7 @@ mod tests {
         });
         let accounts = vec![sample_account("alice"), sample_account("bob")];
 
-        let (first, _) = collect_account_rows(
+        let (first, _, _) = collect_account_rows(
             provider.clone(),
             None,
             &accounts,
@@ -492,7 +494,7 @@ mod tests {
                 .is_some_and(|text| text.starts_with("更新于 "))
         }));
 
-        let (second, _) = collect_account_rows(
+        let (second, _, _) = collect_account_rows(
             provider.clone(),
             None,
             &accounts,
@@ -524,7 +526,7 @@ mod tests {
         });
         let accounts = vec![sample_account("alice")];
 
-        let (rows, _) = collect_account_rows(
+        let (rows, _, _) = collect_account_rows(
             provider.clone(),
             None,
             &accounts,
@@ -557,7 +559,7 @@ mod tests {
         });
         let accounts = vec![sample_account("alice")];
 
-        let (rows, _) = collect_account_rows(
+        let (rows, _, _) = collect_account_rows(
             provider.clone(),
             None,
             &accounts,
@@ -604,7 +606,7 @@ mod tests {
         ];
 
         for _ in 0..2 {
-            let (rows, _) = collect_account_rows(
+            let (rows, _, _) = collect_account_rows(
                 provider.clone(),
                 Some(membership.clone()),
                 &accounts,
@@ -645,7 +647,7 @@ mod tests {
             ("carol", MembershipScript::Fresh(Some("2030-03-04"))),
         ]));
 
-        let (rows, _) = collect_account_rows(
+        let (rows, _, _) = collect_account_rows(
             provider.clone(),
             Some(membership.clone()),
             &accounts,
@@ -685,7 +687,7 @@ mod tests {
             MembershipScript::Fail(401),
         )]));
 
-        let (rows, _) = collect_account_rows(
+        let (rows, _, _) = collect_account_rows(
             provider.clone(),
             Some(membership.clone()),
             &[bound],
@@ -723,7 +725,7 @@ mod tests {
         let membership = Arc::new(MembershipDouble::new([("alice", MembershipScript::Hang)]));
 
         let started = std::time::Instant::now();
-        let (rows, _) = collect_account_rows(
+        let (rows, _, _) = collect_account_rows(
             provider.clone(),
             Some(membership.clone()),
             &[bound],
@@ -912,6 +914,7 @@ mod tests {
             accounts,
             theme: ThemeId::Classic,
             proactive_renewal: false,
+            auto_swap: false,
             message: attach_skip_message(None, reason, stats),
         }
     }
@@ -932,7 +935,7 @@ mod tests {
         let provider = Arc::new(CountingProvider {
             calls: AtomicUsize::new(0),
         });
-        let (rows, stats) = collect_account_rows(
+        let (rows, stats, _) = collect_account_rows(
             provider.clone(),
             None,
             &[sample_account("alice")],
@@ -964,7 +967,7 @@ mod tests {
         let provider = Arc::new(CountingProvider {
             calls: AtomicUsize::new(0),
         });
-        let (rows, stats) = collect_account_rows(
+        let (rows, stats, _) = collect_account_rows(
             provider.clone(),
             None,
             &[sample_account("alice")],
@@ -995,7 +998,7 @@ mod tests {
         let provider = Arc::new(CountingProvider {
             calls: AtomicUsize::new(0),
         });
-        let (rows, stats) = collect_account_rows(
+        let (rows, stats, _) = collect_account_rows(
             provider.clone(),
             None,
             &[sample_account("alice")],
@@ -1029,7 +1032,7 @@ mod tests {
         let provider = Arc::new(CountingProvider {
             calls: AtomicUsize::new(0),
         });
-        let (rows, stats) = collect_account_rows(
+        let (rows, stats, _) = collect_account_rows(
             provider.clone(),
             None,
             &[sample_account("alice")],
@@ -1066,7 +1069,7 @@ mod tests {
         let provider = Arc::new(CountingProvider {
             calls: AtomicUsize::new(0),
         });
-        let (rows, stats) = collect_account_rows(
+        let (rows, stats, _) = collect_account_rows(
             provider.clone(),
             None,
             &[sample_account("alice"), sample_account("bob")],
@@ -1154,6 +1157,12 @@ mod tests {
         assert_eq!(
             swap_success_message(&sample_account("acc-3"), None),
             "已切换到 acc-3"
+        );
+        assert_eq!(auto_swap_success_message(&named), "已自动切换到 Forever");
+        assert_eq!(auto_swap_success_message(&aliased), "已自动切换到 工作机");
+        assert_eq!(
+            auto_swap_success_message(&sample_account("acc-3")),
+            "已自动切换到 acc-3"
         );
     }
 
@@ -1304,5 +1313,313 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn auto_swap_now() -> chrono::DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 9, 3, 12, 0, 0).unwrap()
+    }
+
+    fn auto_swap_on() -> kimi_switch_core::settings::AutoSwap {
+        kimi_switch_core::settings::AutoSwap {
+            enabled: true,
+            threshold: 0.99,
+            cooldown_ms: 5 * 60 * 1000,
+            settle_grace_ms: 60 * 1000,
+        }
+    }
+
+    fn auto_swap_acc(id: &str, active: bool) -> Account {
+        Account {
+            provider: "kimi".into(),
+            id: AccountId(id.into()),
+            label: id.into(),
+            active,
+            created_at: auto_swap_now(),
+            last_used_at: Some(auto_swap_now() - chrono::Duration::seconds(120)),
+            extra: Default::default(),
+        }
+    }
+
+    fn auto_swap_ready(id: &str, used: u64, limit: u64) -> QuotaSnapshot {
+        QuotaSnapshot {
+            account_id: AccountId(id.into()),
+            fetched_at: auto_swap_now(),
+            stale: false,
+            membership: None,
+            state: QuotaState::Ready(vec![Quota {
+                provider: "kimi".into(),
+                account_id: AccountId(id.into()),
+                window: QuotaWindow::FiveHour,
+                used,
+                limit,
+                reset_at: None,
+                status: QuotaStatus::Ok,
+                note: None,
+                membership: None,
+            }]),
+        }
+    }
+
+    fn last_audit(path: &std::path::Path) -> AuditEvent {
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(raw.trim()).unwrap()
+    }
+
+    /// 开关关闭：不 activate、不写审计、不碰冷却文件。
+    #[tokio::test]
+    async fn snapshot_auto_swap_disabled_has_no_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.enabled = false;
+        let effect = apply_snapshot_auto_swap(
+            &settings,
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready("alice", 100, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            |_id| async { panic!("disabled 不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.message.is_none());
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        assert!(!audit.path().exists());
+    }
+
+    /// 设备码授权进行中：不判定、不 activate、不写审计、不碰冷却。
+    #[tokio::test]
+    async fn snapshot_auto_swap_pending_auth_has_no_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || true,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            |_id| async { panic!("pending_auth 不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.message.is_none());
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        assert!(!audit.path().exists());
+    }
+
+    /// 触发成功：走 activate、写审计、持久化冷却、toast 用显示名。
+    #[tokio::test]
+    async fn snapshot_auto_swap_success_activates_audits_and_toasts_display_name() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut bob = auto_swap_acc("bob", false);
+        bob.label = "工作机".into();
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), bob],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("success toast");
+        assert_eq!(message.text, "已自动切换到 工作机");
+        assert_eq!(message.tone, "ok");
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob")
+        );
+        assert!(kimi_switch_core::read_last_auto_swap_at(&state).is_some());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.provider, "kimi");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        let detail = event.detail.expect("success audit has detail");
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("window=5h"), "{detail}");
+        assert!(detail.contains("used=99%"), "{detail}");
+    }
+
+    /// activate 失败：瞬时失败 toast、不写冷却、当前账号路径不视为已切换。
+    #[tokio::test]
+    async fn snapshot_auto_swap_activate_failure_toasts_without_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            |_id| async { Err(kimi_switch_core::Error::provider("disk full")) },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("failure toast");
+        assert_eq!(message.text, "自动切换失败");
+        assert_eq!(message.tone, "err");
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "error");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        assert!(
+            event.detail.as_deref().unwrap_or("").contains("disk full"),
+            "{:?}",
+            event.detail
+        );
+    }
+
+    /// 无合格候选：不切换、瞬时通知、记审计。
+    #[tokio::test]
+    async fn snapshot_auto_swap_no_candidate_toasts_and_audits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 99, 100),
+            ],
+            auto_swap_now(),
+            None,
+            |_id| async { panic!("无候选不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("no-candidate toast");
+        assert_eq!(message.text, "没有可自动切换的账号");
+        assert_eq!(message.tone, "err");
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "error");
+        assert_eq!(event.account.as_deref(), Some("alice"));
+        assert_eq!(event.detail.as_deref(), Some("no eligible candidate"));
+    }
+
+    /// 决定之后、activate 之前：pending / 当前账号已变则放弃，不 toast、不审计、不写冷却。
+    #[tokio::test]
+    async fn snapshot_auto_swap_stale_pending_or_current_skips_activate() {
+        async fn run(
+            pending_auth: impl Fn() -> bool,
+            current_active: impl Fn() -> Option<AccountId>,
+        ) -> (tempfile::TempDir, AutoSwapSnapshotEffect) {
+            let tmp = tempfile::tempdir().unwrap();
+            let audit = AuditLog::new(tmp.path().join("audit.log"));
+            let state = tmp.path().join("auto_swap.json");
+            let effect = apply_snapshot_auto_swap(
+                &auto_swap_on(),
+                pending_auth,
+                current_active,
+                &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+                &[
+                    auto_swap_ready("alice", 99, 100),
+                    auto_swap_ready("bob", 10, 100),
+                ],
+                auto_swap_now(),
+                None,
+                |_id| async { panic!("过期决策不得 activate") },
+                &audit,
+                &state,
+            )
+            .await;
+            (tmp, effect)
+        }
+
+        let pending = AtomicBool::new(false);
+        let (tmp, effect) = run(
+            || pending.swap(true, Ordering::SeqCst),
+            || Some(AccountId("alice".into())),
+        )
+        .await;
+        assert!(effect.message.is_none());
+        assert!(!effect.swapped);
+        assert!(!tmp.path().join("auto_swap.json").exists());
+        assert!(!tmp.path().join("audit.log").exists());
+
+        let (tmp, effect) = run(|| false, || Some(AccountId("carol".into()))).await;
+        assert!(effect.message.is_none());
+        assert!(!effect.swapped);
+        assert!(!tmp.path().join("auto_swap.json").exists());
+        assert!(!tmp.path().join("audit.log").exists());
+    }
+
+    /// 成功 auto-swap toast 优先于同一次 snapshot 里的「刚刚更新过」。
+    #[test]
+    fn auto_swap_success_toast_wins_over_skip_message() {
+        let stats = QuotaCollectStats {
+            queried: 0,
+            skipped_success_throttle: 1,
+            skipped_rate_limit: 0,
+            skipped_auth: 0,
+        };
+        let auto = UiMessage {
+            text: "已自动切换到 工作机".into(),
+            tone: "ok".into(),
+        };
+        let merged = attach_auto_swap_message(
+            None,
+            QuotaCollectReason::UserInitiated,
+            &stats,
+            Some(auto.clone()),
+        )
+        .expect("auto-swap toast");
+        assert_eq!(merged.text, "已自动切换到 工作机");
+        assert_eq!(merged.tone, "ok");
+        let skip = attach_auto_swap_message(None, QuotaCollectReason::UserInitiated, &stats, None)
+            .expect("skip toast");
+        assert_eq!(skip.text, "刚刚更新过");
     }
 }

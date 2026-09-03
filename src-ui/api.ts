@@ -46,6 +46,8 @@ export interface Snapshot {
   theme: ThemeId;
   /** 「当前账号主动续期」开关（issue #42）：与 CLI 同源，来自 config.toml。 */
   proactive_renewal: boolean;
+  /** 「额度耗尽自动切换」开关（issue #68）：与 CLI 同源，来自 config.toml。 */
+  auto_swap: boolean;
   message: UiMessage | null;
 }
 
@@ -117,6 +119,7 @@ export function createApi(invokeFn: InvokeFn) {
     setTheme: (theme: ThemeId) => call<ThemeId>("set_theme", { theme }),
     setProactiveRenewal: (enabled: boolean) =>
       call<boolean>("set_proactive_renewal", { enabled }),
+    setAutoSwap: (enabled: boolean) => call<boolean>("set_auto_swap", { enabled }),
   };
 }
 

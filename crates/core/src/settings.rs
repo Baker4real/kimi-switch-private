@@ -12,6 +12,7 @@
 //! 例：
 //! ```toml
 //! [auto_swap]
+//! enabled = false
 //! # threshold = <0.0~1.0>
 //!
 //! [daemon]
@@ -47,18 +48,17 @@ pub struct Settings {
     pub proactive_renewal: ProactiveRenewal,
 }
 
-/// 自动切换段：serde 接受存量 `config.toml`，运行时零消费。
+/// 自动切换段：CLI 默认 status 在额度收集完成后消费（issue #67）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoSwap {
-    /// 自动切换总开关。false 时 daemon 和默认入口均跳过所有自动切换决策。
+    /// 自动切换总开关。false 时跳过所有自动切换决策。默认关闭。
     pub enabled: bool,
     /// 自动切换触发阈值，0.0~1.0。任一窗口 used/limit ≥ 此值即触发。
     pub threshold: f64,
-    /// 切换后冷却期（毫秒）：刚被切走/切到的账号短期不再选回，避免抖动。
+    /// 两次自动切换成功之间的最短间隔（毫秒）。
     pub cooldown_ms: i64,
-    /// 新激活账号沉淀宽限期（毫秒）：刚 active 的账号在此窗口内不因 quota
-    /// loading / 拉取失败被自动切走，避免顶掉用户刚做的手动选择。
+    /// 刚被手动选中的当前账号在此窗口内不会被自动切走（毫秒）。
     pub settle_grace_ms: i64,
 }
 
@@ -126,7 +126,7 @@ pub struct ProactiveRenewal {
 impl Default for AutoSwap {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             threshold: defaults::AUTO_SWAP_THRESHOLD,
             cooldown_ms: defaults::AUTO_SWAP_COOLDOWN_MS,
             settle_grace_ms: defaults::AUTO_SWAP_SETTLE_GRACE_MS,
@@ -268,6 +268,43 @@ fn upsert_proactive_renewal(path: &Path, enabled: bool) -> Result<Arc<Settings>>
     Ok(Arc::new(parsed))
 }
 
+/// 把「额度耗尽自动切换」开关写入 `<config_dir>/config.toml`，返回新快照。
+///
+/// 只落盘，不改全局当前值：CLI 启动时 [`reload_from_file`] 自然读到；
+/// GUI 每次快照经 [`load_from`] 直读文件，也不依赖全局缓存。
+pub fn set_auto_swap_enabled(enabled: bool) -> Result<Arc<Settings>> {
+    let path = AppPaths::resolve()?.config_file();
+    upsert_auto_swap(&path, enabled)
+}
+
+/// 读-改-写指定配置文件里的 `auto_swap.enabled`。
+///
+/// - 用 toml_edit 只动一个键，保留用户手写的注释、顺序与其它字段；
+/// - 落盘前先确认成品仍是一份合法 [`Settings`]（存量文件有拼错的键时直接报错、不动盘）；
+/// - tmp + rename 原子写入，与 registry / 凭证仓库同一写序；
+/// - 文件缺失视为空文档。
+fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(Error::Config(format!("read {}: {e}", path.display()))),
+    };
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
+    if matches!(doc.get("auto_swap"), Some(item) if item.as_table_like().is_none()) {
+        // 存量同名键不是表（手误，反正也过不了 Settings 解析）；整体换成新表再落键。
+        doc["auto_swap"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["auto_swap"]["enabled"] = toml_edit::value(enabled);
+    let rendered = doc.to_string();
+    let parsed: Settings = toml::from_str(&rendered)?;
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, rendered)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(Arc::new(parsed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,9 +331,20 @@ threshold = 0.5
         .unwrap();
         let s = load_from(&path).unwrap();
         assert_eq!(s.auto_swap.threshold, 0.5);
-        // 其他字段保持默认
+        // 其他字段保持默认（含开关默认关闭）
+        assert!(!s.auto_swap.enabled);
         assert_eq!(s.auto_swap.cooldown_ms, defaults::AUTO_SWAP_COOLDOWN_MS);
         assert_eq!(s.daemon.poll_interval_ms, defaults::DAEMON_POLL_INTERVAL_MS);
+    }
+
+    /// issue #67：接入运行时前把遗留脚手架的默认开翻成关。
+    #[test]
+    fn auto_swap_defaults_off() {
+        assert!(!AutoSwap::default().enabled);
+        assert!(!Settings::default().auto_swap.enabled);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert!(!s.auto_swap.enabled);
     }
 
     #[test]
@@ -351,6 +399,18 @@ usage_cache_max_age_ms = 4000
         assert_eq!(s.quota.fetch_retries, defaults::QUOTA_FETCH_RETRIES);
     }
 
+    /// 存量手写 `enabled = true` 仍按文件生效，默认翻转不影响显式开启。
+    #[test]
+    fn stock_auto_swap_enabled_true_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let s = load_from(&path).unwrap();
+        assert!(s.auto_swap.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+        assert_eq!(s.auto_swap.cooldown_ms, defaults::AUTO_SWAP_COOLDOWN_MS);
+    }
+
     /// issue #42 验收 1：开关默认关闭（缺文件与空段都为 false）。
     #[test]
     fn proactive_renewal_defaults_off() {
@@ -387,11 +447,7 @@ usage_cache_max_age_ms = 4000
     fn upsert_preserves_comments_and_other_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "# 我的调优\n[auto_swap]\nthreshold = 0.5 # 别动\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "# 我的调优\n[auto_swap]\nthreshold = 0.5 # 别动\n").unwrap();
         upsert_proactive_renewal(&path, true).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("# 我的调优"), "{raw}");
@@ -431,7 +487,84 @@ usage_cache_max_age_ms = 4000
         let path = tmp.path().join("config.toml");
         let original = "[auto_swap]\nfoo = 1\n";
         std::fs::write(&path, original).unwrap();
-        let err = upsert_proactive_renewal(&path, true).unwrap_err().to_string();
+        let err = upsert_proactive_renewal(&path, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("foo"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// issue #68：写回后重读得到同一值（持久化）。
+    #[test]
+    fn upsert_auto_swap_creates_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let s = upsert_auto_swap(&path, true).unwrap();
+        assert!(s.auto_swap.enabled);
+        let reread = load_from(&path).unwrap();
+        assert!(reread.auto_swap.enabled);
+        assert_eq!(reread.as_ref(), s.as_ref());
+        assert!(!reread.proactive_renewal.enabled);
+    }
+
+    /// 写回只动 `auto_swap.enabled`：手写注释、阈值与其它段原样保留。
+    #[test]
+    fn upsert_auto_swap_preserves_comments_and_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# 我的调优\n[auto_swap]\nthreshold = 0.5 # 别动\n[proactive_renewal]\nenabled = true # 续期别动\n",
+        )
+        .unwrap();
+        upsert_auto_swap(&path, true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# 我的调优"), "{raw}");
+        assert!(raw.contains("threshold = 0.5 # 别动"), "{raw}");
+        assert!(raw.contains("enabled = true # 续期别动"), "{raw}");
+        let s = load_from(&path).unwrap();
+        assert!(s.auto_swap.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+        assert!(s.proactive_renewal.enabled);
+    }
+
+    #[test]
+    fn upsert_auto_swap_flips_existing_key_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auto_swap]\n# 风险自负\nenabled = false\nthreshold = 0.5\n",
+        )
+        .unwrap();
+        upsert_auto_swap(&path, true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# 风险自负"), "{raw}");
+        assert!(raw.contains("enabled = true"), "{raw}");
+        assert!(raw.contains("threshold = 0.5"), "{raw}");
+        let s = load_from(&path).unwrap();
+        assert!(s.auto_swap.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+    }
+
+    /// 存量同名键不是表：整体换成新表，最终能按 Settings 解析。
+    #[test]
+    fn upsert_auto_swap_repairs_non_table_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "auto_swap = 1\n").unwrap();
+        upsert_auto_swap(&path, true).unwrap();
+        assert!(load_from(&path).unwrap().auto_swap.enabled);
+    }
+
+    /// 成品不再是合法 Settings 时报错，且不动盘。
+    #[test]
+    fn upsert_auto_swap_rejects_invalid_settings_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "[auto_swap]\nfoo = 1\n";
+        std::fs::write(&path, original).unwrap();
+        let err = upsert_auto_swap(&path, true).unwrap_err().to_string();
         assert!(err.contains("foo"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }

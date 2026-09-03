@@ -2,6 +2,7 @@
 //!
 //! 命令面（刻意保持最小）：
 //! - `kimi-switch`              — 默认入口：同步本地激活账号，列出 Kimi 账号 + 5h/7d 额度。
+//!   `[auto_swap] enabled = true` 时，额度收集完成后若达阈值则自动切换并追加一行英文结果。
 //! - `kimi-switch login kimi`   — 导入当前本机 Kimi Code 已登录账号
 //!   （`~/.kimi-code/credentials/kimi-code.json`）。
 //! - `kimi-switch swap <id|N>`  — 切换激活账号。原子写 + 快照回滚，不依赖网络/quota。
@@ -17,15 +18,18 @@
 //! `<id>` 是账号 id（Kimi user_id）、label 或 `kimi/<id>`；`<N>` 是默认入口
 //! 显示的编号（1 起）。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    membership_expiry_from_extra, prettify_membership, settings, Account, AccountRegistry,
-    AuditEvent, AuditLog, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaState,
-    QuotaWindow, RemovedAccounts,
+    decide_auto_swap, membership_expiry_from_extra, prettify_membership, read_last_auto_swap_at,
+    settings, write_last_auto_swap_at, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
+    AutoSwapDecision, AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore,
+    Provider, Quota, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 
@@ -165,7 +169,7 @@ async fn status(ctx: &AppContext) -> Result<()> {
     sync_local_active(ctx);
 
     // 2. 列出账号。
-    let accounts = ctx.list_ordered()?;
+    let mut accounts = ctx.list_ordered()?;
     if accounts.is_empty() {
         println!("No accounts. Sign in to Kimi Code, then run `kimi-switch login kimi`.");
         return Ok(());
@@ -183,28 +187,189 @@ async fn status(ctx: &AppContext) -> Result<()> {
     )
     .await;
 
-    // 4. 渲染。账号 id 旁带档位名与会员到期（extra 有 → `有效期至 <日期>`；
+    // 4. 自动切换：开关关闭则短路（零判定、不读冷却文件）。触发时走既有 activate。
+    let auto_swap = maybe_run_status_auto_swap(ctx, &accounts, &snapshots).await;
+    if auto_swap.swapped {
+        sync_local_active(ctx);
+        accounts = ctx.list_ordered()?;
+    }
+
+    // 5. 渲染。账号 id 旁带档位名与会员到期（extra 有 → `有效期至 <日期>`；
     //    无 → 绑定弱提示）；节流命中不标 stale，失败回落标 `(stale)`。
     println!("kimi");
-    for (idx, (account, snapshot)) in accounts.iter().zip(snapshots.iter()).enumerate() {
+    for (idx, account) in accounts.iter().enumerate() {
         let n = idx + 1;
         let star = if account.active { "*" } else { " " };
-        let plan_text = membership_status_text(snapshot.membership.as_deref(), &account.extra)
+        let snapshot = snapshots.iter().find(|item| item.account_id == account.id);
+        let plan_text = snapshot
+            .and_then(|item| membership_status_text(item.membership.as_deref(), &account.extra))
             .map(|plan| format!(" {plan}"))
             .unwrap_or_default();
-        let quota_text = match &snapshot.state {
-            QuotaState::Failed(error) => format!("quota: {error}"),
-            QuotaState::Ready(quotas) | QuotaState::Cached(quotas) if snapshot.stale => {
-                format!("{} (stale)", format_quotas(quotas))
-            }
-            QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => format_quotas(quotas),
+        let quota_text = match snapshot {
+            None => "quota: n/a".to_string(),
+            Some(snapshot) => match &snapshot.state {
+                QuotaState::Failed(error) => format!("quota: {error}"),
+                QuotaState::Ready(quotas) | QuotaState::Cached(quotas) if snapshot.stale => {
+                    format!("{} (stale)", format_quotas(quotas))
+                }
+                QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => format_quotas(quotas),
+            },
         };
         println!(
             "  {star} {n:>2}  {:<24}{plan_text} {quota_text}",
             account.id
         );
     }
+    if let Some(line) = auto_swap.line {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// CLI status 自动切换的可观察结果：列表后追加的一行，以及是否已成功切换。
+struct AutoSwapStatusEffect {
+    line: Option<String>,
+    swapped: bool,
+}
+
+impl AutoSwapStatusEffect {
+    fn none() -> Self {
+        Self {
+            line: None,
+            swapped: false,
+        }
+    }
+}
+
+async fn maybe_run_status_auto_swap(
+    ctx: &AppContext,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+) -> AutoSwapStatusEffect {
+    let settings = settings::current();
+    if !settings.auto_swap.enabled {
+        return AutoSwapStatusEffect::none();
+    }
+    let Ok(paths) = AppPaths::resolve() else {
+        return AutoSwapStatusEffect::none();
+    };
+    let state_path = paths.auto_swap_state_file();
+    let last = read_last_auto_swap_at(&state_path);
+    let kimi = ctx.kimi.clone();
+    apply_status_auto_swap(
+        &settings.auto_swap,
+        accounts,
+        snapshots,
+        Utc::now(),
+        last,
+        move |id| async move { kimi.activate(&id).await },
+        &ctx.audit,
+        &state_path,
+    )
+    .await
+}
+
+/// collect 完成后的自动切换编排。开关关闭立即返回；activate 失败不写冷却。
+async fn apply_status_auto_swap<F, Fut>(
+    auto_swap: &kimi_switch_core::settings::AutoSwap,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    now: DateTime<Utc>,
+    last_auto_swap_at: Option<DateTime<Utc>>,
+    activate: F,
+    audit: &AuditLog,
+    state_path: &Path,
+) -> AutoSwapStatusEffect
+where
+    F: FnOnce(AccountId) -> Fut,
+    Fut: std::future::Future<Output = kimi_switch_core::Result<()>>,
+{
+    if !auto_swap.enabled {
+        return AutoSwapStatusEffect::none();
+    }
+    match decide_auto_swap(accounts, snapshots, auto_swap, now, last_auto_swap_at) {
+        AutoSwapDecision::Stay {
+            reason: AutoSwapSkipReason::NoEligibleCandidate,
+        } => {
+            let current = accounts.iter().find(|account| account.active);
+            audit.append(AuditEvent::err(
+                "auto_swap",
+                "kimi",
+                current.map(|account| account.id.0.as_str()),
+                "no eligible candidate",
+            ));
+            AutoSwapStatusEffect {
+                line: Some(auto_swap_no_candidate_line().to_string()),
+                swapped: false,
+            }
+        }
+        AutoSwapDecision::Stay { .. } => AutoSwapStatusEffect::none(),
+        AutoSwapDecision::Swap(target) => match activate(target.to.clone()).await {
+            Ok(()) => {
+                write_last_auto_swap_at(state_path, Utc::now());
+                audit.append(
+                    AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
+                        .with_detail(auto_swap_audit_detail(&target)),
+                );
+                AutoSwapStatusEffect {
+                    line: Some(auto_swap_success_line(&target)),
+                    swapped: true,
+                }
+            }
+            Err(err) => {
+                audit.append(AuditEvent::err(
+                    "auto_swap",
+                    "kimi",
+                    Some(target.to.0.as_str()),
+                    &err.to_string(),
+                ));
+                AutoSwapStatusEffect {
+                    line: Some(auto_swap_failed_line(&target.to, &err)),
+                    swapped: false,
+                }
+            }
+        },
+    }
+}
+
+fn auto_swap_pct(ratio: f64) -> i64 {
+    (ratio * 100.0).round() as i64
+}
+
+fn quota_window_short(window: QuotaWindow) -> &'static str {
+    match window {
+        QuotaWindow::FiveHour => "5h",
+        QuotaWindow::SevenDay => "7d",
+        QuotaWindow::Month => "30d",
+        _ => "custom",
+    }
+}
+
+fn auto_swap_success_line(target: &AutoSwapTarget) -> String {
+    format!(
+        "auto_swap kimi/{} → kimi/{} ({} {}%)",
+        target.from,
+        target.to,
+        quota_window_short(target.trigger_window),
+        auto_swap_pct(target.usage_ratio)
+    )
+}
+
+fn auto_swap_no_candidate_line() -> &'static str {
+    "auto_swap: no eligible candidate"
+}
+
+fn auto_swap_failed_line(to: &AccountId, err: impl std::fmt::Display) -> String {
+    format!("auto_swap kimi/{to} failed: {err}")
+}
+
+fn auto_swap_audit_detail(target: &AutoSwapTarget) -> String {
+    format!(
+        "from={} window={} used={}%",
+        target.from,
+        quota_window_short(target.trigger_window),
+        auto_swap_pct(target.usage_ratio)
+    )
 }
 
 /// 账号行的会员档位段（issue #49）：档位名 + `有效期至 <东八区日期>`
@@ -573,5 +738,197 @@ mod tests {
             super::membership_status_text(Some("LEVEL_ADVANCED"), &extra).as_deref(),
             Some("Allegro 有效期至 2027-08-27")
         );
+    }
+
+    use super::{
+        Account, AccountId, AuditEvent, AuditLog, Quota, QuotaSnapshot, QuotaState, QuotaWindow,
+    };
+    use chrono::{DateTime, Utc};
+
+    fn now() -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 9, 3, 12, 0, 0).unwrap()
+    }
+
+    fn auto_swap_on() -> kimi_switch_core::settings::AutoSwap {
+        kimi_switch_core::settings::AutoSwap {
+            enabled: true,
+            threshold: 0.99,
+            cooldown_ms: 5 * 60 * 1000,
+            settle_grace_ms: 60 * 1000,
+        }
+    }
+
+    fn acc(id: &str, active: bool) -> Account {
+        Account {
+            provider: "kimi".into(),
+            id: AccountId(id.into()),
+            label: id.into(),
+            active,
+            created_at: now(),
+            last_used_at: Some(now() - chrono::Duration::seconds(120)),
+            extra: Default::default(),
+        }
+    }
+
+    fn ready(id: &str, used: u64, limit: u64) -> QuotaSnapshot {
+        QuotaSnapshot {
+            account_id: AccountId(id.into()),
+            fetched_at: now(),
+            stale: false,
+            membership: None,
+            state: QuotaState::Ready(vec![Quota {
+                provider: "kimi".into(),
+                account_id: AccountId(id.into()),
+                window: QuotaWindow::FiveHour,
+                used,
+                limit,
+                reset_at: None,
+                status: kimi_switch_core::QuotaStatus::Ok,
+                note: None,
+                membership: None,
+            }]),
+        }
+    }
+
+    fn last_audit(path: &std::path::Path) -> AuditEvent {
+        let raw = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(raw.trim()).unwrap()
+    }
+
+    /// 开关关闭：不 activate、不写审计、不碰冷却文件。
+    #[tokio::test]
+    async fn status_auto_swap_disabled_has_no_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.enabled = false;
+        let effect = super::apply_status_auto_swap(
+            &settings,
+            &[acc("alice", true), acc("bob", false)],
+            &[ready("alice", 100, 100), ready("bob", 10, 100)],
+            now(),
+            None,
+            |_id| async { panic!("disabled 不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.line.is_none());
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        assert!(!audit.path().exists());
+    }
+
+    /// 触发成功：走 activate、写审计、持久化冷却、输出成功行。
+    #[tokio::test]
+    async fn status_auto_swap_success_activates_audits_and_persists() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", true), acc("bob", false)],
+            &[ready("alice", 99, 100), ready("bob", 10, 100)],
+            now(),
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            effect.line.as_deref(),
+            Some("auto_swap kimi/alice → kimi/bob (5h 99%)")
+        );
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob")
+        );
+        assert!(kimi_switch_core::read_last_auto_swap_at(&state).is_some());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.provider, "kimi");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        let detail = event.detail.expect("success audit has detail");
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("window=5h"), "{detail}");
+        assert!(detail.contains("used=99%"), "{detail}");
+    }
+
+    /// activate 失败：输出失败行、不写冷却、当前账号路径不视为已切换。
+    #[tokio::test]
+    async fn status_auto_swap_activate_failure_outputs_line_without_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", true), acc("bob", false)],
+            &[ready("alice", 99, 100), ready("bob", 10, 100)],
+            now(),
+            None,
+            |_id| async { Err(kimi_switch_core::Error::provider("disk full")) },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            effect.line.as_deref(),
+            Some("auto_swap kimi/bob failed: provider: disk full")
+        );
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "error");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        assert!(
+            event.detail.as_deref().unwrap_or("").contains("disk full"),
+            "{:?}",
+            event.detail
+        );
+    }
+
+    /// 无合格候选：不切换、输出说明行、记审计。
+    #[tokio::test]
+    async fn status_auto_swap_no_candidate_prints_line_and_audits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", true), acc("bob", false)],
+            &[ready("alice", 99, 100), ready("bob", 99, 100)],
+            now(),
+            None,
+            |_id| async { panic!("无候选不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            effect.line.as_deref(),
+            Some("auto_swap: no eligible candidate")
+        );
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "error");
+        assert_eq!(event.account.as_deref(), Some("alice"));
+        assert_eq!(event.detail.as_deref(), Some("no eligible candidate"));
     }
 }

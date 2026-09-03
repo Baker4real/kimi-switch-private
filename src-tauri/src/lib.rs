@@ -1,7 +1,9 @@
 //! Tauri 入口：把 `kimi-switch-gui` 的命令接到 webview。
 
 #[cfg(all(not(debug_assertions), dev))]
-compile_error!("生产构建不能走 Vite devUrl，请启用 feature custom-protocol（或用 npm run tauri build）");
+compile_error!(
+    "生产构建不能走 Vite devUrl，请启用 feature custom-protocol（或用 npm run tauri build）"
+);
 
 use std::sync::Arc;
 
@@ -107,6 +109,12 @@ fn set_proactive_renewal(enabled: bool) -> Result<bool, CommandError> {
     Backend::save_proactive_renewal(enabled).map_err(map_err)
 }
 
+/// 「额度耗尽自动切换」开关（issue #68）：写 config.toml，返回落盘后的生效值。
+#[tauri::command]
+fn set_auto_swap(enabled: bool) -> Result<bool, CommandError> {
+    Backend::save_auto_swap(enabled).map_err(map_err)
+}
+
 pub fn run() {
     let backend = match Backend::new() {
         Ok(backend) => {
@@ -130,9 +138,8 @@ pub fn run() {
         .manage(AppState { backend })
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_background_color(Some(tauri::utils::config::Color(
-                    244, 241, 236, 255,
-                )));
+                let _ = window
+                    .set_background_color(Some(tauri::utils::config::Color(244, 241, 236, 255)));
             }
             Ok(())
         })
@@ -149,6 +156,7 @@ pub fn run() {
             open_url,
             set_theme,
             set_proactive_renewal,
+            set_auto_swap,
         ])
         .run(tauri::generate_context!())
         .expect("error while running kimi-switch");

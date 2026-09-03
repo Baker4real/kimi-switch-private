@@ -25,6 +25,7 @@ describe("createApi 动词与命令字符串", () => {
     await api.openUrl("https://auth.kimi.com/x");
     await api.setTheme("jade-night");
     await api.setProactiveRenewal(true);
+    await api.setAutoSwap(true);
 
     expect(invoke.mock.calls).toEqual([
       ["list_accounts"],
@@ -41,6 +42,7 @@ describe("createApi 动词与命令字符串", () => {
       ["open_url", { url: "https://auth.kimi.com/x" }],
       ["set_theme", { theme: "jade-night" }],
       ["set_proactive_renewal", { enabled: true }],
+      ["set_auto_swap", { enabled: true }],
     ]);
   });
 

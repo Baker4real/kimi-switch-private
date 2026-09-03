@@ -1,14 +1,17 @@
 //! 账号库读写与额度快照渲染。所有出口都是 DTO，不含凭证。
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    display_name, membership_expiry_from_extra, membership_period_days,
+    decide_auto_swap, display_name, membership_expiry_from_extra, membership_period_days,
     membership_remaining_days, membership_start_from_extra, official_nickname_known,
-    prettify_membership, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
+    prettify_membership, read_last_auto_swap_at, write_last_auto_swap_at, Account, AccountId,
+    AccountRegistry, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapSkipReason, AutoSwapTarget,
     CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
     QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
     WEB_STORE_FIELD,
@@ -87,6 +90,85 @@ impl Backend {
         Ok(settings.proactive_renewal.enabled)
     }
 
+    /// 直读 config.toml 里的「额度耗尽自动切换」开关；文件缺失/损坏都回落默认关。
+    pub fn load_auto_swap() -> bool {
+        AppPaths::resolve()
+            .and_then(|p| {
+                Ok(kimi_switch_core::settings::load_from(&p.config_file())?
+                    .auto_swap
+                    .enabled)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 持久化开关到 config.toml（保注释原子写），返回落盘后的生效值。
+    pub fn save_auto_swap(enabled: bool) -> Result<bool> {
+        let settings =
+            kimi_switch_core::settings::set_auto_swap_enabled(enabled).context("写入设置失败")?;
+        Ok(settings.auto_swap.enabled)
+    }
+
+    fn has_pending_auth(&self) -> bool {
+        self.pending_auth
+            .lock()
+            .expect("pending_auth lock")
+            .is_some()
+    }
+
+    fn load_auto_swap_settings() -> kimi_switch_core::settings::AutoSwap {
+        AppPaths::resolve()
+            .and_then(|p| {
+                Ok(kimi_switch_core::settings::load_from(&p.config_file())?
+                    .auto_swap
+                    .clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// collect 完成后串行判定；`pending_auth` 或开关关则不读冷却、不 activate。
+    async fn maybe_run_snapshot_auto_swap(
+        &self,
+        accounts: &[Account],
+        snapshots: &[QuotaSnapshot],
+    ) -> AutoSwapSnapshotEffect {
+        if self.has_pending_auth() {
+            return AutoSwapSnapshotEffect::none();
+        }
+        let settings = Self::load_auto_swap_settings();
+        if !settings.enabled {
+            return AutoSwapSnapshotEffect::none();
+        }
+        let Ok(paths) = AppPaths::resolve() else {
+            return AutoSwapSnapshotEffect::none();
+        };
+        let state_path = paths.auto_swap_state_file();
+        let last = read_last_auto_swap_at(&state_path);
+        let kimi = self.kimi.clone();
+        apply_snapshot_auto_swap(
+            &settings,
+            || self.has_pending_auth(),
+            || {
+                self.registry
+                    .list_by_provider("kimi")
+                    .ok()
+                    .and_then(|listed| {
+                        listed
+                            .into_iter()
+                            .find(|account| account.active)
+                            .map(|account| account.id)
+                    })
+            },
+            accounts,
+            snapshots,
+            Utc::now(),
+            last,
+            move |id| async move { kimi.activate(&id).await },
+            &self.audit,
+            &state_path,
+        )
+        .await
+    }
+
     /// 扫本地 Kimi Code；当前激活账号没记录过就入库（已删除的有墓碑，跳过）。
     pub fn sync_local_active(&self) {
         let Ok(paths) = AppPaths::resolve() else {
@@ -123,38 +205,59 @@ impl Backend {
         message: Option<UiMessage>,
         reason: QuotaCollectReason,
     ) -> Snapshot {
-        let (accounts, stats) = self.load_rows(reason).await;
-        let urgent_count = accounts.iter().filter(|a| a.is_urgent()).count() as u32;
-        let current_label = accounts
+        let (accounts, rows, stats, snapshots) = self.load_rows(reason).await;
+        let effect = self
+            .maybe_run_snapshot_auto_swap(&accounts, &snapshots)
+            .await;
+        let (rows, stats) = if effect.swapped {
+            self.sync_local_active();
+            // 判定只用第一次 collect 的 snapshot；第二次组装走 Scheduled，避免用户点刷新后再打 www.kimi.com。
+            let (_, rows, stats, _) = self.load_rows(QuotaCollectReason::Scheduled).await;
+            (rows, stats)
+        } else {
+            (rows, stats)
+        };
+        let urgent_count = rows.iter().filter(|a| a.is_urgent()).count() as u32;
+        let current_label = rows
             .iter()
             .find(|a| a.active)
             .map(|a| a.display_name.clone())
             .unwrap_or_else(|| "--".to_string());
         Snapshot {
-            account_count: accounts.len() as u32,
+            account_count: rows.len() as u32,
             urgent_count,
             current_label,
-            accounts,
+            accounts: rows,
             theme: Self::load_theme(),
             proactive_renewal: Self::load_proactive_renewal(),
-            message: attach_skip_message(message, reason, &stats),
+            auto_swap: Self::load_auto_swap(),
+            message: attach_auto_swap_message(message, reason, &stats, effect.message),
         }
     }
 
-    async fn load_rows(&self, reason: QuotaCollectReason) -> (Vec<AccountRow>, QuotaCollectStats) {
+    async fn load_rows(
+        &self,
+        reason: QuotaCollectReason,
+    ) -> (
+        Vec<Account>,
+        Vec<AccountRow>,
+        QuotaCollectStats,
+        Vec<QuotaSnapshot>,
+    ) {
         let mut accounts = self.registry.list_by_provider("kimi").unwrap_or_default();
         accounts.sort_by_key(|a| !a.active);
         let cache_path = AppPaths::resolve()
             .map(|p| p.quota_cache_file())
             .unwrap_or_else(|_| std::path::PathBuf::from("quota-cache-missing.json"));
-        collect_account_rows(
+        let (rows, stats, snapshots) = collect_account_rows(
             self.kimi.clone(),
             Some(self.web_membership.clone()),
             &accounts,
             &cache_path,
             reason,
         )
-        .await
+        .await;
+        (accounts, rows, stats, snapshots)
     }
 
     pub async fn import(&self) -> Result<Snapshot> {
@@ -492,7 +595,7 @@ pub(crate) async fn collect_account_rows<P>(
     accounts: &[Account],
     cache_path: &std::path::Path,
     reason: QuotaCollectReason,
-) -> (Vec<AccountRow>, QuotaCollectStats)
+) -> (Vec<AccountRow>, QuotaCollectStats, Vec<QuotaSnapshot>)
 where
     P: Provider + 'static,
 {
@@ -553,7 +656,7 @@ where
             )
         })
         .collect();
-    (rows, outcome.stats)
+    (rows, outcome.stats, outcome.snapshots)
 }
 
 /// persist 官方昵称后，用 registry 里已带 `official_nickname` 的 Account 生成 toast。
@@ -575,6 +678,10 @@ pub(crate) fn swap_success_message(account: &Account, plan: Option<&str>) -> Str
         Some(plan) if !plan.is_empty() => format!("已切换到 {display}（{plan}）"),
         _ => format!("已切换到 {display}"),
     }
+}
+
+pub(crate) fn auto_swap_success_message(account: &Account) -> String {
+    format!("已自动切换到 {}", display_name(account))
 }
 
 /// 只读本地额度缓存里的会员等级，映射成官网档位名。读取失败或无缓存则 `None`，不打网。
@@ -643,6 +750,143 @@ pub(crate) fn attach_skip_message(
         }),
         _ => None,
     }
+}
+
+/// 成功/失败/无候选的自动切换 toast 优先于「刚刚更新过」类 skip 提示。
+pub(crate) fn attach_auto_swap_message(
+    message: Option<UiMessage>,
+    reason: QuotaCollectReason,
+    stats: &QuotaCollectStats,
+    auto_swap: Option<UiMessage>,
+) -> Option<UiMessage> {
+    if auto_swap.is_some() {
+        return auto_swap;
+    }
+    attach_skip_message(message, reason, stats)
+}
+
+/// collect 完成后的 GUI 自动切换可观察结果。
+pub(crate) struct AutoSwapSnapshotEffect {
+    pub message: Option<UiMessage>,
+    pub swapped: bool,
+}
+
+impl AutoSwapSnapshotEffect {
+    fn none() -> Self {
+        Self {
+            message: None,
+            swapped: false,
+        }
+    }
+}
+
+/// collect 完成后的自动切换编排。`pending_auth` 或开关关闭立即返回；activate 失败不写冷却。
+/// 决定之后、真正 activate 之前再读 pending 与当前账号：已变则放弃（不 toast、不审计、不写冷却）。
+pub(crate) async fn apply_snapshot_auto_swap<F, Fut, P, C>(
+    auto_swap: &kimi_switch_core::settings::AutoSwap,
+    pending_auth: P,
+    current_active: C,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    now: DateTime<Utc>,
+    last_auto_swap_at: Option<DateTime<Utc>>,
+    activate: F,
+    audit: &AuditLog,
+    state_path: &Path,
+) -> AutoSwapSnapshotEffect
+where
+    P: Fn() -> bool,
+    C: Fn() -> Option<AccountId>,
+    F: FnOnce(AccountId) -> Fut,
+    Fut: std::future::Future<Output = kimi_switch_core::Result<()>>,
+{
+    if pending_auth() || !auto_swap.enabled {
+        return AutoSwapSnapshotEffect::none();
+    }
+    match decide_auto_swap(accounts, snapshots, auto_swap, now, last_auto_swap_at) {
+        AutoSwapDecision::Stay {
+            reason: AutoSwapSkipReason::NoEligibleCandidate,
+        } => {
+            let current = accounts.iter().find(|account| account.active);
+            audit.append(AuditEvent::err(
+                "auto_swap",
+                "kimi",
+                current.map(|account| account.id.0.as_str()),
+                "no eligible candidate",
+            ));
+            AutoSwapSnapshotEffect {
+                message: Some(UiMessage {
+                    text: "没有可自动切换的账号".into(),
+                    tone: "err".into(),
+                }),
+                swapped: false,
+            }
+        }
+        AutoSwapDecision::Stay { .. } => AutoSwapSnapshotEffect::none(),
+        AutoSwapDecision::Swap(target) => {
+            if pending_auth() || current_active().as_ref() != Some(&target.from) {
+                return AutoSwapSnapshotEffect::none();
+            }
+            match activate(target.to.clone()).await {
+                Ok(()) => {
+                    write_last_auto_swap_at(state_path, Utc::now());
+                    audit.append(
+                        AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
+                            .with_detail(auto_swap_audit_detail(&target)),
+                    );
+                    let text = accounts
+                        .iter()
+                        .find(|account| account.id == target.to)
+                        .map(auto_swap_success_message)
+                        .unwrap_or_else(|| format!("已自动切换到 {}", target.to));
+                    AutoSwapSnapshotEffect {
+                        message: Some(UiMessage {
+                            text,
+                            tone: "ok".into(),
+                        }),
+                        swapped: true,
+                    }
+                }
+                Err(err) => {
+                    audit.append(AuditEvent::err(
+                        "auto_swap",
+                        "kimi",
+                        Some(target.to.0.as_str()),
+                        &err.to_string(),
+                    ));
+                    AutoSwapSnapshotEffect {
+                        message: Some(UiMessage {
+                            text: "自动切换失败".into(),
+                            tone: "err".into(),
+                        }),
+                        swapped: false,
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn auto_swap_pct(ratio: f64) -> i64 {
+    (ratio * 100.0).round() as i64
+}
+
+fn quota_window_short(window: QuotaWindow) -> &'static str {
+    match window {
+        QuotaWindow::FiveHour => "5h",
+        QuotaWindow::SevenDay => "7d",
+        QuotaWindow::Month => "30d",
+        _ => "custom",
+    }
+}
+
+fn auto_swap_audit_detail(target: &AutoSwapTarget) -> String {
+    format!(
+        "from={} window={} used={}%",
+        target.from,
+        quota_window_short(target.trigger_window),
+        auto_swap_pct(target.usage_ratio)
+    )
 }
 
 /// 绑定成功的 toast 文案（issue #51）。订阅无到期瞬间时到期展示回退弱提示，
@@ -792,9 +1036,11 @@ fn quota_views(quotas: &[Quota]) -> Vec<QuotaView> {
                 Some(r) => format!("{:.0}% ({}/{})", r * 100.0, q.used, q.limit),
                 None => format!("{}/{}", q.used, q.limit),
             };
-            let reset = q
-                .reset_at
-                .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string());
+            let reset = q.reset_at.map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            });
             QuotaView {
                 tone: QuotaView::tone(ratio),
                 window,
