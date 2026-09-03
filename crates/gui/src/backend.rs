@@ -941,7 +941,7 @@ pub(crate) fn account_row(
 /// - `Some(Ok(..))` = 刷新成功：行内直接用新到期日（extra 已由管道写回），
 ///   订阅无到期数据时日期为 `None` 并回到绑定弱提示（与绑定语义一致）；
 /// - `Some(Err(..))` = 刷新失败（缓存降级）：行内保留 extra 缓存旧日期，
-///   且 hint 再现——**日期与 hint 共存**，网页失败不单独把日期藏起来。
+///   `membership_expiry_hint` 仍为 true（GUI 按钮改「重新绑定」，不写常驻提示句）。
 ///
 /// `now` 是组装这批账号行时的 UTC 时钟，转到东八区日期后算剩余天数。
 pub(crate) fn account_row_at(
@@ -958,9 +958,8 @@ pub(crate) fn account_row_at(
         Some(Err(_)) => (membership_expiry_from_extra(&account.extra), true),
         None => (membership_expiry_from_extra(&account.extra), false),
     };
-    // 档位在且（无到期日，或本次用户发起刷新中会员获取失败）→ 绑定弱提示；
-    // 可与日期共存（#52 缓存降级）。档位缺失（无额度数据）保持现状不强加。
-    // hint 布尔算法不变：有档位且（无到期日或本次刷新会员获取失败）。
+    // 档位在且（无到期日，或本次用户发起刷新中会员获取失败）→ hint 为 true。
+    // 档位缺失（无额度数据）保持现状不强加。有到期日的刷新失败只改按钮文案，不写常驻提示。
     let membership_expiry_hint =
         membership.is_some() && (membership_expiry.is_none() || membership_refresh_failed);
     let membership_remaining_days = membership_expiry

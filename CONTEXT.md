@@ -2,17 +2,19 @@
 type: reference
 title: kimi-switch 领域词汇
 tags: [glossary, nickname, display-name, quota]
-intent: Define ubiquitous language for accounts, official nicknames, display names, swap, and quota.
+intent: Define ubiquitous language for accounts, official nicknames, display names, swap, auto-swap, and quota.
 documents:
   endpoints:
     - GET /coding/v1/me
     - GET /coding/v1/usages
   config_keys:
     - official_nickname
+    - auto_swap
   symbols:
     - display_name
     - EXTRA_OFFICIAL_NICKNAME
     - persist_official_nickname
+    - decide_auto_swap
 ---
 # kimi-switch
 
