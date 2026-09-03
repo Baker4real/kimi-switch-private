@@ -12,7 +12,7 @@ src-tauri/               Tauri 壳（kimi-switch.exe）
 src-ui/                  纸感前端（总览 / 账号库 / 设置；api.ts / store / deviceAuth / membership / auto-swap）
 scripts/generate-icons.mjs  图标确定性生成器（改图标改这里的常量后重跑，勿手改 icons/ 二进制）
 crates/providers/common/ 文件型 OAuth 账号切换共享引擎（FileBlobProvider/FileBlobRuntime）
-crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调、额度查询、官方昵称 /me、绑定网页登录）
+crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调、额度查询、官方昵称 /me、绑定网页登录）；网络发送统一走 src/net.rs（env 代理不可达回退直连，ADR-0005，新增请求勿内联建 client）
 ```
 
 ## 规则
