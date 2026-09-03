@@ -49,13 +49,6 @@ fn device_id() -> String {
     .clone()
 }
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| Error::provider(format!("kimi device flow client failed: {e}")))
-}
-
 /// 官方客户端同款 X-Msh-* 头。
 fn with_common_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     builder
@@ -77,11 +70,11 @@ async fn request_device_code_at(oauth_base: &str) -> Result<DeviceAuthorization>
         oauth_base.trim_end_matches('/')
     );
     let form = [("client_id", CLIENT_ID)];
-    let resp = with_common_headers(http_client()?.post(&url))
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| Error::provider(format!("kimi device code request failed: {e}")))?;
+    let resp = crate::net::send(Some(HTTP_TIMEOUT), crate::net::ProxyFallback::Always, |client| {
+        with_common_headers(client.post(&url)).form(&form)
+    })
+    .await
+    .map_err(|e| Error::provider(format!("kimi device code request failed: {e}")))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -122,7 +115,6 @@ async fn poll_for_token_at(
     cancel: Arc<AtomicBool>,
 ) -> Result<String> {
     let url = format!("{}/api/oauth/token", oauth_base.trim_end_matches('/'));
-    let client = http_client()?;
     let mut interval = MIN_POLL_INTERVAL.max(Duration::from_secs(auth.interval));
     let deadline = Instant::now()
         + MAX_POLL_DURATION.min(Duration::from_secs(auth.expires_in.max(1)));
@@ -144,11 +136,11 @@ async fn poll_for_token_at(
                 "urn:ietf:params:oauth:grant-type:device_code",
             ),
         ];
-        let resp = with_common_headers(client.post(&url))
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| Error::provider(format!("kimi token poll failed: {e}")))?;
+        let resp = crate::net::send(Some(HTTP_TIMEOUT), crate::net::ProxyFallback::Always, |client| {
+            with_common_headers(client.post(&url)).form(&form)
+        })
+        .await
+        .map_err(|e| Error::provider(format!("kimi token poll failed: {e}")))?;
         let body = resp.text().await.unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 

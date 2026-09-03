@@ -84,18 +84,19 @@ async fn refresh_blob_at(blob: &str, oauth_base: &str) -> Result<RefreshOutcome>
         ("refresh_token", refresh.as_str()),
     ];
 
-    let client = reqwest::Client::builder()
-        .timeout(REFRESH_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| Error::provider(format!("kimi refresh client failed: {e}")))?;
-    let resp = client
-        .post(&url)
-        .header("User-Agent", "kimi-switch")
-        .header("Accept", "application/json")
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| Error::provider(format!("kimi refresh request failed: {e}")))?;
+    let resp = crate::net::send(
+        Some(REFRESH_HTTP_TIMEOUT),
+        crate::net::ProxyFallback::ConnectOnly,
+        |client| {
+            client
+                .post(&url)
+                .header("User-Agent", "kimi-switch")
+                .header("Accept", "application/json")
+                .form(&form)
+        },
+    )
+    .await
+    .map_err(|e| Error::provider(format!("kimi refresh request failed: {e}")))?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();

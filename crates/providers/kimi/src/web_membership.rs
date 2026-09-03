@@ -230,23 +230,20 @@ fn web_identity(web_token: &str) -> Option<String> {
 /// 错误文案英文且不含 token：不回显响应 body（只带状态码），请求错误只带 URL 侧原因。
 async fn get_subscription_at(base_url: &str, web_token: &str) -> Result<serde_json::Value> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), GET_SUBSCRIPTION_PATH);
-    let client = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| Error::provider(format!("membership client failed: {e}")))?;
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("connect-protocol-version", "1")
-        .header("User-Agent", "kimi-switch")
-        .header("Authorization", format!("Bearer {web_token}"))
-        .body("{}")
-        .send()
-        .await
-        .map_err(|e| {
-            Error::provider(format!("membership subscription request failed: {e}"))
-        })?;
+    let resp = crate::net::send(Some(HTTP_TIMEOUT), crate::net::ProxyFallback::Always, |client| {
+        client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("connect-protocol-version", "1")
+            .header("User-Agent", "kimi-switch")
+            .header("Authorization", format!("Bearer {web_token}"))
+            .body("{}")
+    })
+    .await
+    .map_err(|e| {
+        Error::provider(format!("membership subscription request failed: {e}"))
+    })?;
     let status = resp.status();
     if !status.is_success() {
         return Err(Error::provider_http(

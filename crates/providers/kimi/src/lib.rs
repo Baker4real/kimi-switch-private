@@ -2,6 +2,7 @@
 
 mod kimi_files;
 mod kimi_usage;
+mod net;
 mod oauth;
 mod paths;
 

@@ -101,17 +101,18 @@ const OFFICIAL_NICKNAME_HTTP_TIMEOUT: std::time::Duration = std::time::Duration:
 
 async fn fetch_official_nickname(access_token: &str, api_base: &str) -> Option<String> {
     let url = format!("{}/me", api_base.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(OFFICIAL_NICKNAME_HTTP_TIMEOUT)
-        .build()
-        .ok()?;
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "kimi-switch")
-        .send()
-        .await
-        .ok()?;
+    let resp = crate::net::send(
+        Some(OFFICIAL_NICKNAME_HTTP_TIMEOUT),
+        crate::net::ProxyFallback::Always,
+        |client| {
+            client
+                .get(&url)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("User-Agent", "kimi-switch")
+        },
+    )
+    .await
+    .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -260,13 +261,14 @@ async fn fetch_quota_at(
     api_base: &str,
 ) -> Result<Vec<Quota>> {
     let url = format!("{}/usages", api_base.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "kimi-switch")
-        .send()
-        .await
-        .map_err(|e| Error::quota_network(format!("kimi usages request failed: {e}")))?;
+    let resp = crate::net::send(None, crate::net::ProxyFallback::Always, |client| {
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("User-Agent", "kimi-switch")
+    })
+    .await
+    .map_err(|e| Error::quota_network(format!("kimi usages request failed: {e}")))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
