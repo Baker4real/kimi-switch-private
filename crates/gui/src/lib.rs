@@ -915,6 +915,7 @@ mod tests {
             theme: ThemeId::Classic,
             proactive_renewal: false,
             auto_swap: false,
+            auto_swap_prefer_lower_tier: false,
             message: attach_skip_message(None, reason, stats),
         }
     }
@@ -1325,6 +1326,7 @@ mod tests {
             threshold: 0.99,
             cooldown_ms: 5 * 60 * 1000,
             settle_grace_ms: 60 * 1000,
+            prefer_lower_tier: false,
         }
     }
 

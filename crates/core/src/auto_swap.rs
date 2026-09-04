@@ -89,7 +89,7 @@ pub fn decide_auto_swap(
         return stay(AutoSwapSkipReason::BelowThreshold);
     };
 
-    let mut eligible: Vec<(&Account, &[Quota])> = accounts
+    let mut eligible: Vec<(&Account, &[Quota], Option<&str>)> = accounts
         .iter()
         .filter(|account| account.id != current.id)
         .filter_map(|account| {
@@ -98,7 +98,7 @@ pub fn decide_auto_swap(
             if !is_eligible_candidate(quotas, settings.threshold) {
                 return None;
             }
-            Some((account, quotas))
+            Some((account, quotas, snap.membership.as_deref()))
         })
         .collect();
 
@@ -106,8 +106,10 @@ pub fn decide_auto_swap(
         return stay(AutoSwapSkipReason::NoEligibleCandidate);
     }
 
-    eligible.sort_by(|(a, aq), (b, bq)| compare_candidates(a, aq, b, bq));
-    let (best, _) = eligible[0];
+    eligible.sort_by(|(a, aq, am), (b, bq, bm)| {
+        compare_candidates(a, aq, *am, b, bq, *bm, settings.prefer_lower_tier)
+    });
+    let (best, _, _) = eligible[0];
     AutoSwapDecision::Swap(AutoSwapTarget {
         from: current.id.clone(),
         to: best.id.clone(),
@@ -170,23 +172,50 @@ fn candidate_max_ratio(quotas: &[Quota]) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
+/// `/usages` 快照 `membership` 原始字符串的档位优先级。
+/// 序号越小越优先被选中；`None` 与未列出的字符串同为最低优先级（宁晚烧、不错烧高档）。
+///
+/// 全序按官网档位从低到高。`LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 已与本机
+/// `/usages` 及 `/me` 交叉；Andante / Moderato 无本机账号，按同一 `LEVEL_`
+/// 前缀对应官网顺序，不要求真实响应再核实。
+fn membership_tier_rank(membership: Option<&str>) -> u8 {
+    match membership {
+        Some("LEVEL_ANDANTE") => 0,
+        Some("LEVEL_MODERATO") => 1,
+        Some("LEVEL_INTERMEDIATE") => 2,
+        Some("LEVEL_ADVANCED") => 3,
+        Some("LEVEL_TEAM") => 4,
+        _ => 5,
+    }
+}
+
 fn compare_candidates(
     a: &Account,
     a_quotas: &[Quota],
+    a_membership: Option<&str>,
     b: &Account,
     b_quotas: &[Quota],
+    b_membership: Option<&str>,
+    prefer_lower_tier: bool,
 ) -> Ordering {
+    let tier = if prefer_lower_tier {
+        membership_tier_rank(a_membership).cmp(&membership_tier_rank(b_membership))
+    } else {
+        Ordering::Equal
+    };
     let ra = candidate_max_ratio(a_quotas);
     let rb = candidate_max_ratio(b_quotas);
-    ra.partial_cmp(&rb)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| match (a.last_used_at, b.last_used_at) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (Some(ta), Some(tb)) => ta.cmp(&tb),
-        })
-        .then_with(|| a.id.0.cmp(&b.id.0))
+    tier.then(
+        ra.partial_cmp(&rb)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| match (a.last_used_at, b.last_used_at) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(ta), Some(tb)) => ta.cmp(&tb),
+            })
+            .then_with(|| a.id.0.cmp(&b.id.0)),
+    )
 }
 
 fn in_cooldown(
@@ -267,12 +296,20 @@ mod tests {
             threshold: 0.99,
             cooldown_ms: 5 * 60 * 1000,
             settle_grace_ms: 60 * 1000,
+            prefer_lower_tier: false,
         }
     }
 
     fn off() -> AutoSwap {
         AutoSwap {
             enabled: false,
+            ..on()
+        }
+    }
+
+    fn prefer_lower() -> AutoSwap {
+        AutoSwap {
+            prefer_lower_tier: true,
             ..on()
         }
     }
@@ -327,6 +364,18 @@ mod tests {
 
     fn ready(id: &str, parts: &[(QuotaWindow, u64, u64)]) -> QuotaSnapshot {
         snap(id, false, QuotaState::Ready(quotas(id, parts)))
+    }
+
+    fn membered(id: &str, parts: &[(QuotaWindow, u64, u64)], level: &str) -> QuotaSnapshot {
+        let mut snap = ready(id, parts);
+        snap.membership = Some(level.into());
+        snap
+    }
+
+    fn cached_membered(id: &str, parts: &[(QuotaWindow, u64, u64)], level: &str) -> QuotaSnapshot {
+        let mut snap = cached(id, false, parts);
+        snap.membership = Some(level.into());
+        snap
     }
 
     fn cached(id: &str, stale: bool, parts: &[(QuotaWindow, u64, u64)]) -> QuotaSnapshot {
@@ -625,6 +674,186 @@ mod tests {
                     ready("bob", w10),
                 ],
                 expect: Expect::Swap("alice", "bob", seven),
+            },
+            Case {
+                name: "prefer on：低档高用量胜过高档低用量",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", &[(five, 50, 100)], "LEVEL_INTERMEDIATE"),
+                    membered("carol", w10, "LEVEL_ADVANCED"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer off：低档高用量 vs 高档低用量仍按比例选高档",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", &[(five, 50, 100)], "LEVEL_INTERMEDIATE"),
+                    membered("carol", w10, "LEVEL_ADVANCED"),
+                ],
+                expect: Expect::Swap("alice", "carol", five),
+            },
+            Case {
+                name: "prefer on：同档回落已用比例升序",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", &[(five, 50, 100)], "LEVEL_INTERMEDIATE"),
+                    membered("carol", &[(five, 20, 100)], "LEVEL_INTERMEDIATE"),
+                ],
+                expect: Expect::Swap("alice", "carol", five),
+            },
+            Case {
+                name: "prefer on：同档比例并列时 last_used_at 较久优先",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    acc("bob", false, None),
+                    acc("carol", false, Some(now() - chrono::Duration::hours(10))),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", w10, "LEVEL_INTERMEDIATE"),
+                    membered("carol", w10, "LEVEL_INTERMEDIATE"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer on：同档再并列按 id 字典序",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    acc("carol", false, None),
+                    acc("bob", false, None),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("carol", w10, "LEVEL_INTERMEDIATE"),
+                    membered("bob", w10, "LEVEL_INTERMEDIATE"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer on：None 与未识别档位排最后",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                    settled("dave", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", &[(five, 50, 100)], "LEVEL_INTERMEDIATE"),
+                    ready("carol", w10),
+                    membered("dave", &[(five, 5, 100)], "LEVEL_FUTURE"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer on：Allegro 胜 Team 即使 Team 用量更低",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", &[(five, 50, 100)], "LEVEL_ADVANCED"),
+                    membered("carol", w10, "LEVEL_TEAM"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer on：只剩更高档合格候选时仍然切换",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", w99, "LEVEL_INTERMEDIATE"),
+                    membered("bob", w10, "LEVEL_TEAM"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer on：Andante 胜 Moderato 即使 Moderato 用量更低",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", &[(five, 50, 100)], "LEVEL_ANDANTE"),
+                    membered("carol", w10, "LEVEL_MODERATO"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer on：未过期 Cached 快照上的档位同样参与排序",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    cached_membered("bob", &[(five, 50, 100)], "LEVEL_INTERMEDIATE"),
+                    membered("carol", w10, "LEVEL_ADVANCED"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "prefer on：会员到期日不参与排序",
+                settings: prefer_lower(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    acc("bob", false, None),
+                    {
+                        let mut carol = acc("carol", false, None);
+                        carol.extra.insert(
+                            crate::membership_expiry::EXTRA_NEXT_BILLING_TIME.into(),
+                            serde_json::Value::String("2026-01-01".into()),
+                        );
+                        carol
+                    },
+                ],
+                snapshots: vec![
+                    ready("alice", w99),
+                    membered("bob", w10, "LEVEL_INTERMEDIATE"),
+                    membered("carol", w10, "LEVEL_INTERMEDIATE"),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
             },
         ];
 

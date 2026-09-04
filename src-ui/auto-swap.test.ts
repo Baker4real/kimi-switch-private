@@ -4,7 +4,11 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { autoSwapSwitchView, silentQuotaMessage } from "./auto-swap";
+import {
+  autoSwapPreferLowerTierSwitchView,
+  autoSwapSwitchView,
+  silentQuotaMessage,
+} from "./auto-swap";
 
 const html = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "index.html"),
@@ -58,8 +62,63 @@ describe("设置页「额度耗尽自动切换」开关（issue #68）", () => {
 
   it("开关旁带阈值切换说明，不写 daemon / 403", () => {
     expect(settingsPage).toContain("额度耗尽自动切换");
-    expect(settingsPage).toContain("当前账号任一额度窗口达到阈值时，自动切到剩余最多的停泊账号。默认关闭。");
+    expect(settingsPage).toContain("当前账号任一额度窗口达到阈值时，自动切到合格停泊账号（默认按已用比例升序）。默认关闭。");
+    expect(settingsPage).not.toContain("剩余最多");
     expect(settingsPage).not.toContain("daemon");
     expect(settingsPage).not.toContain("403");
+  });
+});
+
+describe("autoSwapPreferLowerTierSwitchView", () => {
+  it("总开关关时子开关置灰，checked 仍反映持久化值", () => {
+    expect(autoSwapPreferLowerTierSwitchView(false, false)).toEqual({
+      checked: false,
+      disabled: true,
+      toast: "已关闭自动切换时优先低档位账号",
+    });
+    expect(autoSwapPreferLowerTierSwitchView(false, true)).toEqual({
+      checked: true,
+      disabled: true,
+      toast: "已开启自动切换时优先低档位账号",
+    });
+  });
+
+  it("总开关开时子开关可点，checked 反映持久化值", () => {
+    expect(autoSwapPreferLowerTierSwitchView(true, false)).toEqual({
+      checked: false,
+      disabled: false,
+      toast: "已关闭自动切换时优先低档位账号",
+    });
+    expect(autoSwapPreferLowerTierSwitchView(true, true)).toEqual({
+      checked: true,
+      disabled: false,
+      toast: "已开启自动切换时优先低档位账号",
+    });
+  });
+});
+
+describe("设置页「自动切换时优先低档位账号」子开关（issue #71）", () => {
+  it("紧挨总开关下方，role=switch，静态关且 disabled", () => {
+    expect(settingsPage).toContain('id="auto-swap-prefer-lower-tier-toggle"');
+    expect(settingsPage).toMatch(
+      /id="auto-swap-prefer-lower-tier-toggle"[^>]*role="switch"/,
+    );
+    expect(settingsPage).toMatch(
+      /id="auto-swap-prefer-lower-tier-toggle"[^>]*aria-checked="false"/,
+    );
+    expect(settingsPage).toMatch(
+      /id="auto-swap-prefer-lower-tier-toggle"[^>]*\sdisabled/,
+    );
+    const master = settingsPage.indexOf('id="auto-swap-toggle"');
+    const sub = settingsPage.indexOf('id="auto-swap-prefer-lower-tier-toggle"');
+    expect(sub).toBeGreaterThan(master);
+  });
+
+  it("文案为优先低档位，不写套餐或 plan", () => {
+    expect(settingsPage).toContain("自动切换时优先低档位账号");
+    const start = settingsPage.indexOf("auto-swap-prefer-lower-tier");
+    const snippet = settingsPage.slice(start, start + 900);
+    expect(snippet).not.toContain("套餐");
+    expect(snippet).not.toMatch(/\bplan\b/i);
   });
 });

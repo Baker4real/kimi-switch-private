@@ -5,7 +5,7 @@ import { escapeHtml } from "./escape";
 import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
-import { autoSwapSwitchView, silentQuotaMessage } from "./auto-swap";
+import { autoSwapPreferLowerTierSwitchView, autoSwapSwitchView, silentQuotaMessage } from "./auto-swap";
 import { renewalSwitchView } from "./renewal";
 import { createAppStore } from "./store";
 import {
@@ -94,6 +94,13 @@ function paintAutoSwap(enabled: boolean): void {
   );
 }
 
+function paintAutoSwapPreferLowerTier(autoSwapEnabled: boolean, preferLowerTier: boolean): void {
+  const view = autoSwapPreferLowerTierSwitchView(autoSwapEnabled, preferLowerTier);
+  const toggle = required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle");
+  toggle.setAttribute("aria-checked", String(view.checked));
+  toggle.disabled = view.disabled;
+}
+
 function showToast(text: string, isError = false): void {
   const toast = required<HTMLDivElement>("toast");
   toast.textContent = text;
@@ -168,6 +175,7 @@ function paintSnapshot(next: Snapshot): void {
   applyTheme(next.theme);
   paintProactiveRenewal(next.proactive_renewal);
   paintAutoSwap(next.auto_swap);
+  paintAutoSwapPreferLowerTier(next.auto_swap, next.auto_swap_prefer_lower_tier);
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
   paintCurrentPlan(next);
@@ -643,11 +651,36 @@ async function init(): Promise<void> {
     try {
       const saved = await api.setAutoSwap(next);
       paintAutoSwap(saved);
+      const prefer =
+        required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").getAttribute(
+          "aria-checked",
+        ) === "true";
+      paintAutoSwapPreferLowerTier(saved, prefer);
       showToast(autoSwapSwitchView(saved).toast);
     } catch (error) {
       showToast(commandError(error).message, true);
     }
   });
+  required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").addEventListener(
+    "click",
+    async () => {
+      const toggle = required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle");
+      if (toggle.disabled) {
+        return;
+      }
+      const next = toggle.getAttribute("aria-checked") !== "true";
+      try {
+        const saved = await api.setAutoSwapPreferLowerTier(next);
+        const masterOn =
+          required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
+          "true";
+        paintAutoSwapPreferLowerTier(masterOn, saved);
+        showToast(autoSwapPreferLowerTierSwitchView(masterOn, saved).toast);
+      } catch (error) {
+        showToast(commandError(error).message, true);
+      }
+    },
+  );
 
   wireDialogs();
   wireList();

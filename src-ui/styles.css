@@ -813,6 +813,10 @@ p {
   align-items: flex-start;
 }
 
+.settings-row--nested {
+  padding-left: 16px;
+}
+
 .settings-copy {
   display: flex;
   flex-direction: column;
@@ -841,6 +845,11 @@ p {
 .switch:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+.switch:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
 }
 
 .switch-thumb {

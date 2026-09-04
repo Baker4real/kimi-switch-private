@@ -17,6 +17,30 @@ export function autoSwapSwitchView(enabled: boolean): AutoSwapSwitchView {
   };
 }
 
+/** 「自动切换时优先低档位账号」子开关（issue #71）的展示决策。不碰 DOM。 */
+export interface AutoSwapPreferLowerTierSwitchView {
+  /** 开关是否处于开态（对应 aria-checked）。总开关关闭时仍反映持久化值。 */
+  checked: boolean;
+  /** 总开关关闭时置灰，不可点。 */
+  disabled: boolean;
+  /** 切换成功后的 toast 文案。 */
+  toast: string;
+}
+
+/** 总开关关只置灰子开关，不把持久化 checked 清掉。 */
+export function autoSwapPreferLowerTierSwitchView(
+  autoSwapEnabled: boolean,
+  preferLowerTier: boolean,
+): AutoSwapPreferLowerTierSwitchView {
+  return {
+    checked: preferLowerTier,
+    disabled: !autoSwapEnabled,
+    toast: preferLowerTier
+      ? "已开启自动切换时优先低档位账号"
+      : "已关闭自动切换时优先低档位账号",
+  };
+}
+
 /** 90s 静默列出只保留自动切换通知；「刚刚更新过」等节流提示仍丢弃。 */
 export function silentQuotaMessage(message: UiMessage | null): UiMessage | null {
   if (!message) {

@@ -28,6 +28,9 @@ where
     attempt_with_fallback(timeout, policy, None, env_proxy_present(), build_request).await
 }
 
+/// 回退直连至少还要剩这么多时间；更短就交回第一次错误，避免把短超时再花一遍。
+const MIN_FALLBACK_BUDGET: Duration = Duration::from_millis(50);
+
 /// `attempt1_proxy`：测试注入显式代理模拟「代理不可达」；生产传 `None` 走 env 默认。
 async fn attempt_with_fallback<F>(
     timeout: Option<Duration>,
@@ -39,6 +42,7 @@ async fn attempt_with_fallback<F>(
 where
     F: Fn(reqwest::Client) -> reqwest::RequestBuilder,
 {
+    let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
     let mut builder = reqwest::Client::builder();
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
@@ -52,9 +56,19 @@ where
             if !should_fallback(policy, env_proxy, e.is_connect()) {
                 return Err(e);
             }
+            let fallback_timeout = match deadline {
+                None => None,
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining < MIN_FALLBACK_BUDGET {
+                        return Err(e);
+                    }
+                    Some(remaining)
+                }
+            };
             tracing::warn!(err = %e, "env proxy unusable; retrying kimi request without proxy");
             let mut direct = reqwest::Client::builder().no_proxy();
-            if let Some(timeout) = timeout {
+            if let Some(timeout) = fallback_timeout {
                 direct = direct.timeout(timeout);
             }
             build_request(direct.build()?).send().await
@@ -140,6 +154,30 @@ mod tests {
             .unwrap();
             assert!(resp.status().is_success());
         }
+    }
+
+    #[tokio::test]
+    async fn timeout_does_not_double_spend_budget_on_always_fallback() {
+        // 对端挂起：第一次用尽短超时后不得再花一整份超时做 Always 回退
+        // （本机 HTTP_PROXY 常开，/me 的 2s 预算否则会变成 4s，踩中
+        // `me_timeout_keeps_old_nickname_and_does_not_hang` 的 4s 外壳）。
+        let server = MockServer::start_then_hang(vec![]);
+        let started = std::time::Instant::now();
+        let err = attempt_with_fallback(
+            Some(Duration::from_millis(500)),
+            ProxyFallback::Always,
+            Some(server.base_url()),
+            true,
+            |client| client.get(server.base_url()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_timeout(), "{err}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(850),
+            "短超时预算不得因 Always 回退加倍：{elapsed:?}"
+        );
     }
 
     #[tokio::test]

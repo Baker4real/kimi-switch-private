@@ -115,6 +115,12 @@ fn set_auto_swap(enabled: bool) -> Result<bool, CommandError> {
     Backend::save_auto_swap(enabled).map_err(map_err)
 }
 
+/// 「自动切换时优先低档位账号」子开关（issue #71）：写 config.toml，返回落盘后的生效值。
+#[tauri::command]
+fn set_auto_swap_prefer_lower_tier(enabled: bool) -> Result<bool, CommandError> {
+    Backend::save_auto_swap_prefer_lower_tier(enabled).map_err(map_err)
+}
+
 pub fn run() {
     let backend = match Backend::new() {
         Ok(backend) => {
@@ -157,6 +163,7 @@ pub fn run() {
             set_theme,
             set_proactive_renewal,
             set_auto_swap,
+            set_auto_swap_prefer_lower_tier,
         ])
         .run(tauri::generate_context!())
         .expect("error while running kimi-switch");

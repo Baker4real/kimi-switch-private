@@ -108,6 +108,24 @@ impl Backend {
         Ok(settings.auto_swap.enabled)
     }
 
+    /// 直读 config.toml 里的「自动切换时优先低档位账号」子开关；文件缺失/损坏都回落默认关。
+    pub fn load_auto_swap_prefer_lower_tier() -> bool {
+        AppPaths::resolve()
+            .and_then(|p| {
+                Ok(kimi_switch_core::settings::load_from(&p.config_file())?
+                    .auto_swap
+                    .prefer_lower_tier)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 持久化子开关到 config.toml（保注释原子写），返回落盘后的生效值。
+    pub fn save_auto_swap_prefer_lower_tier(enabled: bool) -> Result<bool> {
+        let settings = kimi_switch_core::settings::set_auto_swap_prefer_lower_tier(enabled)
+            .context("写入设置失败")?;
+        Ok(settings.auto_swap.prefer_lower_tier)
+    }
+
     fn has_pending_auth(&self) -> bool {
         self.pending_auth
             .lock()
@@ -231,6 +249,7 @@ impl Backend {
             theme: Self::load_theme(),
             proactive_renewal: Self::load_proactive_renewal(),
             auto_swap: Self::load_auto_swap(),
+            auto_swap_prefer_lower_tier: Self::load_auto_swap_prefer_lower_tier(),
             message: attach_auto_swap_message(message, reason, &stats, effect.message),
         }
     }

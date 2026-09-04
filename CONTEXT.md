@@ -1,7 +1,7 @@
 ---
 type: reference
 title: kimi-switch 领域词汇
-tags: [glossary, nickname, display-name, quota]
+tags: [glossary, nickname, display-name, quota, membership]
 intent: Define ubiquitous language for accounts, official nicknames, display names, swap, auto-swap, and quota.
 documents:
   endpoints:
@@ -10,6 +10,7 @@ documents:
   config_keys:
     - official_nickname
     - auto_swap
+    - prefer_lower_tier
   symbols:
     - display_name
     - EXTRA_OFFICIAL_NICKNAME
@@ -79,7 +80,7 @@ _Avoid_: 自动刷新（易和界面「刷新」按钮混淆）, 自动续费
 _Avoid_: swap（仅 CLI 内部子命令）, activate profile
 
 **自动切换**:
-设置项「额度耗尽自动切换」（默认关闭）。开启后，本工具在每次常规额度查询完成后检查当前账号：任一用量窗口已用比例达到阈值（默认 99%）时，经与手动切换相同的原子写入 + 快照回滚，把当前账号换成账号库里剩余额度最多的合格停泊账号。额度查询失败、数据未知、凭证待续期不触发；刚被手动选中的账号在安顿宽限期内不会被自动切走；两次自动切换之间有冷却。CLI 默认 status 与 GUI 额度快照完成后判定；工具未运行时不会切换。
+设置项「额度耗尽自动切换」（默认关闭）。开启后，本工具在每次常规额度查询完成后检查当前账号：任一用量窗口已用比例达到阈值（默认 99%）时，经与手动切换相同的原子写入 + 快照回滚，把当前账号换成账号库里合格停泊账号。默认仍按已用比例升序；`prefer_lower_tier` 开启后先按会员档位从低到高，同档再回落原比较链。额度查询失败、数据未知、凭证待续期不触发；刚被手动选中的账号在安顿宽限期内不会被自动切走；两次自动切换之间有冷却。CLI 默认 status 与 GUI 额度快照完成后判定；工具未运行时不会切换。
 _Avoid_: 自动轮换, daemon 换号, 按 403 被动换号
 
 **导入**:
@@ -95,7 +96,7 @@ _Avoid_: OAuth 登录（对用户）, device login
 _Avoid_: 续命, 重新登录, 换绑
 
 **会员等级**:
-官网订阅档位名（如 Allegretto、Allegro）。`/usages` 给的是 `LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 等内部枚举，GUI 展示层映射成官网名，只用于辨认账号。
+官网订阅档位名（如 Allegretto、Allegro）。`/usages` 给的是 `LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 等内部枚举，GUI 展示层映射成官网名。档位全序按官网从低到高（Andante → Moderato → Allegretto → Allegro → Team）；在自动切换候选排序中可作为偏好键。展示仍用官网名，决策用快照上原始 `/usages` 字符串。快照无档位（`None`）与未识别官方枚举排最后。
 _Avoid_: 套餐, plan；用户可见文案不要写 Intermediate / Advanced
 
 **会员到期**:

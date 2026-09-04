@@ -755,6 +755,7 @@ mod tests {
             threshold: 0.99,
             cooldown_ms: 5 * 60 * 1000,
             settle_grace_ms: 60 * 1000,
+            prefer_lower_tier: false,
         }
     }
 
@@ -855,6 +856,57 @@ mod tests {
         assert_eq!(
             activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
             Some("bob")
+        );
+        assert!(kimi_switch_core::read_last_auto_swap_at(&state).is_some());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.provider, "kimi");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        let detail = event.detail.expect("success audit has detail");
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("window=5h"), "{detail}");
+        assert!(detail.contains("used=99%"), "{detail}");
+    }
+
+    /// issue #69 故事 12：CLI 编排把整份 AutoSwap 交给决策，prefer_lower_tier 生效。
+    #[tokio::test]
+    async fn status_auto_swap_prefer_lower_tier_picks_lower_membership() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.prefer_lower_tier = true;
+        let mut bob = ready("bob", 50, 100);
+        bob.membership = Some("LEVEL_INTERMEDIATE".into());
+        let mut carol = ready("carol", 10, 100);
+        carol.membership = Some("LEVEL_ADVANCED".into());
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = super::apply_status_auto_swap(
+            &settings,
+            &[acc("alice", true), acc("bob", false), acc("carol", false)],
+            &[ready("alice", 99, 100), bob, carol],
+            now(),
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob"),
+            "低档高用量应胜过高级低用量"
         );
         assert!(kimi_switch_core::read_last_auto_swap_at(&state).is_some());
         let event = last_audit(audit.path());

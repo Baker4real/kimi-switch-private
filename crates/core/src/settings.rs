@@ -60,6 +60,8 @@ pub struct AutoSwap {
     pub cooldown_ms: i64,
     /// 刚被手动选中的当前账号在此窗口内不会被自动切走（毫秒）。
     pub settle_grace_ms: i64,
+    /// 合格停泊账号中优先选档位更低者。默认关闭，与现状比较链一致。
+    pub prefer_lower_tier: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -130,6 +132,7 @@ impl Default for AutoSwap {
             threshold: defaults::AUTO_SWAP_THRESHOLD,
             cooldown_ms: defaults::AUTO_SWAP_COOLDOWN_MS,
             settle_grace_ms: defaults::AUTO_SWAP_SETTLE_GRACE_MS,
+            prefer_lower_tier: false,
         }
     }
 }
@@ -277,13 +280,31 @@ pub fn set_auto_swap_enabled(enabled: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap(&path, enabled)
 }
 
+/// 把「优先选更低档位」写入 `<config_dir>/config.toml`，返回新快照。
+///
+/// 只落盘，不改全局当前值；写序与 [`set_auto_swap_enabled`] 相同。
+pub fn set_auto_swap_prefer_lower_tier(prefer: bool) -> Result<Arc<Settings>> {
+    let path = AppPaths::resolve()?.config_file();
+    upsert_auto_swap_prefer_lower_tier(&path, prefer)
+}
+
 /// 读-改-写指定配置文件里的 `auto_swap.enabled`。
+fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
+    upsert_auto_swap_bool(path, "enabled", enabled)
+}
+
+/// 读-改-写指定配置文件里的 `auto_swap.prefer_lower_tier`。
+fn upsert_auto_swap_prefer_lower_tier(path: &Path, prefer: bool) -> Result<Arc<Settings>> {
+    upsert_auto_swap_bool(path, "prefer_lower_tier", prefer)
+}
+
+/// 读-改-写指定配置文件里的一个 `auto_swap` 布尔键。
 ///
 /// - 用 toml_edit 只动一个键，保留用户手写的注释、顺序与其它字段；
 /// - 落盘前先确认成品仍是一份合法 [`Settings`]（存量文件有拼错的键时直接报错、不动盘）；
 /// - tmp + rename 原子写入，与 registry / 凭证仓库同一写序；
 /// - 文件缺失视为空文档。
-fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
+fn upsert_auto_swap_bool(path: &Path, key: &str, value: bool) -> Result<Arc<Settings>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -296,7 +317,7 @@ fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
         // 存量同名键不是表（手误，反正也过不了 Settings 解析）；整体换成新表再落键。
         doc["auto_swap"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
-    doc["auto_swap"]["enabled"] = toml_edit::value(enabled);
+    doc["auto_swap"][key] = toml_edit::value(value);
     let rendered = doc.to_string();
     let parsed: Settings = toml::from_str(&rendered)?;
     let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
@@ -345,6 +366,22 @@ threshold = 0.5
         let tmp = tempfile::tempdir().unwrap();
         let s = load_from(&tmp.path().join("config.toml")).unwrap();
         assert!(!s.auto_swap.enabled);
+    }
+
+    /// issue #70：键缺失或 Default 均为 false，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn prefer_lower_tier_defaults_off() {
+        assert!(!AutoSwap::default().prefer_lower_tier);
+        assert!(!Settings::default().auto_swap.prefer_lower_tier);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert!(!s.auto_swap.prefer_lower_tier);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert!(!stock.auto_swap.prefer_lower_tier);
     }
 
     #[test]
@@ -555,6 +592,29 @@ usage_cache_max_age_ms = 4000
         std::fs::write(&path, "auto_swap = 1\n").unwrap();
         upsert_auto_swap(&path, true).unwrap();
         assert!(load_from(&path).unwrap().auto_swap.enabled);
+    }
+
+    /// issue #70：写回只动 `auto_swap.prefer_lower_tier`：手写注释、其它键与其它段原样保留。
+    #[test]
+    fn upsert_auto_swap_prefer_lower_tier_preserves_comments_and_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# 我的调优\n[auto_swap]\nthreshold = 0.5 # 别动\nenabled = true # 开关别动\n[proactive_renewal]\nenabled = true # 续期别动\n",
+        )
+        .unwrap();
+        upsert_auto_swap_prefer_lower_tier(&path, true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# 我的调优"), "{raw}");
+        assert!(raw.contains("threshold = 0.5 # 别动"), "{raw}");
+        assert!(raw.contains("enabled = true # 开关别动"), "{raw}");
+        assert!(raw.contains("enabled = true # 续期别动"), "{raw}");
+        let s = load_from(&path).unwrap();
+        assert!(s.auto_swap.prefer_lower_tier);
+        assert!(s.auto_swap.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+        assert!(s.proactive_renewal.enabled);
     }
 
     /// 成品不再是合法 Settings 时报错，且不动盘。

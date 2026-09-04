@@ -55,3 +55,8 @@ GUI 从 Explorer 继承后 reqwest（`default-features = false`，不读 Windows
    quota_query），代理挂起耗尽外层预算时回退不会发生——与历史行为相同，
    非回归。非目标：不新增 Windows 系统代理（WinInet）支持，不改各调用点
    错误文案，不加代理探测常驻逻辑。
+
+5. **有 timeout 时回退只用剩余时间**：调用方传入的 `timeout` 是整次发送的
+   总预算。第一次尝试后按 deadline 计算剩余；不足 50ms 则交回第一次错误、
+   不再直连。`Always` 不得把同一超时再花一遍（本机常开代理时 `/me` 的 2s
+   否则会变成 ~4s）。无 timeout 的发送点（额度 `/usages`）不受此项约束。
