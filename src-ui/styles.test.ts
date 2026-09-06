@@ -57,3 +57,13 @@ describe("额度条字号与样式收尾", () => {
     expect(css).not.toMatch(/--radius-shell:/);
   });
 });
+
+describe("账号卡片日期列", () => {
+  it("为不同数量的操作按钮保留统一的右侧列宽", () => {
+    const card = ruleBody(".profile-card");
+    expect(card).toMatch(/--profile-actions-column:\s*264px\s*;/);
+    expect(card).toMatch(
+      /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+var\(--profile-actions-column\)\s*;/,
+    );
+  });
+});

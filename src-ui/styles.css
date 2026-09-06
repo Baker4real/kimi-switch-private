@@ -607,8 +607,9 @@ p {
 }
 
 .profile-card {
+  --profile-actions-column: 264px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content;
+  grid-template-columns: minmax(0, 1fr) var(--profile-actions-column);
   grid-template-areas:
     "title actions"
     "quotas actions";
@@ -645,6 +646,20 @@ p {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
+}
+
+@media (max-width: 760px) {
+  .profile-card {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "title"
+      "quotas"
+      "actions";
+  }
+
+  .profile-card-actions {
+    justify-content: flex-start;
+  }
 }
 
 .profile-title {
