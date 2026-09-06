@@ -245,7 +245,7 @@ describe("membershipTrackHtml", () => {
 });
 
 describe("quotaStackHtml", () => {
-  it("会员轨道在用量窗口之上", () => {
+  it("会员轨道在用量窗口之下", () => {
     const html = quotaStackHtml({
       ...trackFields(),
       quotas: [quota()],
@@ -256,10 +256,10 @@ describe("quotaStackHtml", () => {
     const memberAt = html.indexOf("quota-label\">会员");
     const windowAt = html.indexOf("quota-label\">5小时");
     expect(memberAt).toBeGreaterThanOrEqual(0);
-    expect(windowAt).toBeGreaterThan(memberAt);
+    expect(memberAt).toBeGreaterThan(windowAt);
   });
 
-  it("会员轨道在 n/a 与查询失败文案之上", () => {
+  it("会员轨道在 n/a 与查询失败文案之下", () => {
     const na = quotaStackHtml({
       ...trackFields(),
       quotas: [],
@@ -267,7 +267,7 @@ describe("quotaStackHtml", () => {
       cached_at: null,
       credential_expired: false,
     });
-    expect(na.indexOf("会员")).toBeLessThan(na.indexOf("额度: n/a"));
+    expect(na.indexOf("会员")).toBeGreaterThan(na.indexOf("额度: n/a"));
 
     const failed = quotaStackHtml({
       ...trackFields(),
@@ -276,7 +276,7 @@ describe("quotaStackHtml", () => {
       cached_at: null,
       credential_expired: false,
     });
-    expect(failed.indexOf("会员")).toBeLessThan(failed.indexOf("额度查询失败"));
+    expect(failed.indexOf("会员")).toBeGreaterThan(failed.indexOf("额度查询失败"));
   });
 
   it("无档位时不画轨道，额度条保持原样", () => {
@@ -295,4 +295,3 @@ describe("quotaStackHtml", () => {
     expect(html).toContain("quota-fill--ok");
   });
 });
-

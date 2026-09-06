@@ -108,7 +108,7 @@ function fallbackPeriodDays(membership: string): number | null {
   }
 }
 
-/** 额度 stack 顶部的会员轨道：有档位且有到期日（含剩余天数，0 与负数也算）才画。
+/** 额度 stack 底部的会员轨道：有档位且有到期日（含剩余天数，0 与负数也算）才画。
  * 填充=已度过比例（朝到期日推进：真实周期来自 currentStartTime 的日历天数，
  * 缺失时按档位近似回退），最后一天走满；不是用量压力，四档 tone 仍按剩余天数。 */
 export function membershipTrackHtml(row: MembershipTrackFields): string {
@@ -147,7 +147,7 @@ export function membershipTrackHtml(row: MembershipTrackFields): string {
       </div>`;
 }
 
-/** 总览额度面板与账号卡 `.profile-quota-stack` 共用：会员轨道在用量窗口 / n/a / 失败文案之上。 */
+/** 总览额度面板与账号卡 `.profile-quota-stack` 共用：会员轨道排在用量窗口 / n/a / 失败文案之后。 */
 export function quotaStackHtml(
   row: MembershipTrackFields & {
     quotas: QuotaView[];
@@ -156,5 +156,5 @@ export function quotaStackHtml(
     credential_expired: boolean;
   },
 ): string {
-  return `${membershipTrackHtml(row)}${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired)}`;
+  return `${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired)}${membershipTrackHtml(row)}`;
 }
