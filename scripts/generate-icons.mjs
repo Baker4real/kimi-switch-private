@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// 变形 K 图标生成器（issue #4）。
+// 变形 K 图标生成器（issue #4；2026-09 高级感重设计：方向 D「宣纸墨印」）。
 //
-// 设计目标：Windows 任务栏可见的圆角实心底变形 K，小尺寸下仍是实心块且 K 可辨认；
+// 设计目标：Windows 任务栏可见的圆角底变形 K，小尺寸下仍是实心块且 K 可辨认；
+// 米白纸感底（微渐变）+ 墨绿实心 K + 印刷双线框（>=64px 帧），K 缩小至 84% 留白；
 // 图形为自绘几何（竖干胶囊 + 双斜臂胶囊的并集），不复制官方 Kimi 商标路径。
 //
 // 实现说明：零运行时依赖（仅用 Node 内置 zlib 做 DEFLATE），手写 PNG 编码器与
@@ -17,10 +18,19 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT_DIR = path.join(ROOT, 'src-tauri', 'icons');
 
 // ---------------------------------------------------------------------------
-// 配色：取自项目纸感色系（src-ui/styles.css 的暗色主题墨绿 + 浅色主题米白），
-// 深底 + 近白前景在浅色/深色任务栏下都保持高对比。
-const COL_BG = [0x1f, 0x3d, 0x33]; // 墨绿实心底
-const COL_FG = [0xf7, 0xf2, 0xe7]; // 米白 K 字形
+// 配色：「宣纸墨印」——米白纸感底 + 墨绿实心 K，与 src-ui/styles.css 纸感色系同源。
+// 高级感来自纸墨反差与印刷双线框，不依赖投影/柔光。
+const COL_PAPER_TOP = [0xf8, 0xf4, 0xe9]; // 纸面亮部（左上）
+const COL_PAPER_BOT = [0xe9, 0xe1, 0xcf]; // 纸面暗部（右下）
+const COL_INK = [0x1f, 0x3d, 0x33]; // 墨绿（K 字形与双线框共用）
+
+// 精饰参数：双线框只在 >=64px 的帧启用，小尺寸只留纸底 + 墨 K 保证剪影可读。
+const FINISH = {
+  glyphScale: 0.84, // K 形整体缩小比例（美术馆式留白）
+  ringInsets: [0.03, 0.052], // 双线框各自距底板边缘的内缩量（归一化）
+  ringHalfW: 0.0032, // 单根线框半宽
+  ringAlpha: 0.5, // 线框不透明度
+};
 
 // ---------------------------------------------------------------------------
 // 几何参数（归一化到单位画布 [0,1]×[0,1]，变形 K 的全部自绘形状）：
@@ -69,27 +79,49 @@ function sdfSegment(px, py, ax, ay, bx, by, r) {
   return Math.hypot(dx, dy) - r;
 }
 
-// 小尺寸（<64px）底板用近满幅参数，保证 16px 帧也有完整实心底；见 insideBackground。
-function insideBackground(nx, ny, smallMode) {
+// 字形 SDF 距离（< 0 表示在 K 内部）；s 为整体缩放（<1 缩小留白），距离值随缩放等比换算。
+function glyphDist(nx, ny, s = 1) {
   const g = GEO;
-  const pad = smallMode ? g.padSm : g.padBig;
-  const rad = smallMode ? g.radSm : g.radBig;
-  const cx = 0.5;
-  const cy = 0.5;
-  const hw = 0.5 - pad;
-  return sdfRoundRect(nx, ny, cx, cy, hw, hw, rad) <= 0;
-}
-
-function insideGlyph(nx, ny) {
-  const g = GEO;
+  const x = (nx - 0.5) / s + 0.5;
+  const y = (ny - 0.5) / s + 0.5;
   const stem = sdfRoundRect(
-    nx, ny,
+    x, y,
     g.stemCx, g.stemCy, g.stemHalfW, g.stemHalfH, g.stemCorner,
   );
-  const armUp = sdfSegment(nx, ny, g.joinX, g.joinY, g.armUpX, g.armUpY, g.armHalfW);
-  const armDn = sdfSegment(nx, ny, g.joinX, g.joinY, g.armDnX, g.armDnY, g.armHalfW);
-  const d = Math.min(stem, armUp, armDn);
-  return d <= 0;
+  const armUp = sdfSegment(x, y, g.joinX, g.joinY, g.armUpX, g.armUpY, g.armHalfW);
+  const armDn = sdfSegment(x, y, g.joinX, g.joinY, g.armDnX, g.armDnY, g.armHalfW);
+  return Math.min(stem, armUp, armDn) * s;
+}
+
+// ---------------------------------------------------------------------------
+// 逐采样点颜色：纸面微渐变 + 印刷双线框 + 墨绿 K 分层叠加，返回 RGBA。
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+function sampleColor(nx, ny, size) {
+  const g = GEO;
+  const smallMode = size < 64;
+  const pad = smallMode ? g.padSm : g.padBig;
+  const rad = smallMode ? g.radSm : g.radBig;
+  const dBg = sdfRoundRect(nx, ny, 0.5, 0.5, 0.5 - pad, 0.5 - pad, rad);
+  if (dBg > 0) return [0, 0, 0, 0];
+
+  // 纸面底板：左上亮 -> 右下暗的微弱斜向渐变。
+  let col = mix(COL_PAPER_TOP, COL_PAPER_BOT, clamp01(0.25 * nx + 0.75 * ny));
+
+  // 印刷双线框：贴近底板边缘的两根低透明度墨绿细线（书装框感）。
+  if (!smallMode) {
+    for (const inset of FINISH.ringInsets) {
+      const ra = FINISH.ringAlpha * clamp01(1 - Math.abs(dBg + inset + FINISH.ringHalfW) / FINISH.ringHalfW);
+      if (ra > 0) col = mix(col, COL_INK, ra);
+    }
+  }
+
+  // K 形：实心墨绿，缩小后盖在最上层。
+  if (glyphDist(nx, ny, FINISH.glyphScale) <= 0) {
+    col = COL_INK;
+  }
+  return [col[0], col[1], col[2], 255];
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +131,6 @@ const TARGET_SAMPLES = 1600; // 每轴目标采样数上限（控制耗时与平
 function render(size) {
   const k = Math.max(1, Math.min(Math.ceil(TARGET_SAMPLES / size), 256));
   const M = size * k;
-  const smallMode = size < 64;
   const inv = 1 / (k * k);
 
   const out = new Uint8Array(size * size * 4);
@@ -110,17 +141,9 @@ function render(size) {
         const ny = (by * k + sy + 0.5) / M;
         for (let sx = 0; sx < k; sx++) {
           const nx = (bx * k + sx + 0.5) / M;
-          let r = 0, gg = 0, b = 0, a = 0;
-          if (insideBackground(nx, ny, smallMode)) {
-            if (insideGlyph(nx, ny)) {
-              r = COL_FG[0]; gg = COL_FG[1]; b = COL_FG[2];
-            } else {
-              r = COL_BG[0]; gg = COL_BG[1]; b = COL_BG[2];
-            }
-            a = 255;
-          }
+          const c = sampleColor(nx, ny, size);
           // 预乘累计，避免直线平均 RGBA 在边缘产生色晕。
-          sr += r * a; sg += gg * a; sb += b * a; sa += a;
+          sr += c[0] * c[3]; sg += c[1] * c[3]; sb += c[2] * c[3]; sa += c[3];
         }
       }
       const o = (by * size + bx) * 4;
