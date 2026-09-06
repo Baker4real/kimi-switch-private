@@ -121,6 +121,59 @@ fn set_auto_swap_prefer_lower_tier(enabled: bool) -> Result<bool, CommandError> 
     Backend::save_auto_swap_prefer_lower_tier(enabled).map_err(map_err)
 }
 
+/// 任务栏图标修正（Windows）：tao 只给窗口设 16px 的 ICON_SMALL，从不设 ICON_BIG；
+/// Win11 任务栏按钮在 >100% 缩放下读 ICON_BIG 槽位，为空时渲染白色占位图、
+/// 不会回退到 SMALL，表现为「任务栏图标空白」。
+///
+/// 实测 explorer 只在按钮建立时读一次图标，之后仅对 BIG 槽位「NULL -> 非空」
+/// 的变化刷新（等值换句柄不刷新）；而启动瞬间设置又赶不上 explorer 首读。
+/// 因此这里延迟 1s 再按窗口 DPI 从 exe 图标资源（tauri-build 嵌入，ID 32512）
+/// 取最佳尺寸补齐 BIG/SMALL（alt-tab 缩略图同样取 BIG，一并修复）。
+#[cfg(windows)]
+fn fix_taskbar_icon(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
+        WM_SETICON,
+    };
+
+    let Ok(hwnd) = window.hwnd() else {
+        eprintln!("kimi-switch: 任务栏图标修正跳过：拿不到窗口句柄");
+        return;
+    };
+    let scale: f64 = window.scale_factor().unwrap_or(1.0).clamp(1.0, 4.0);
+    let big = (32.0 * scale).round() as i32;
+    let small = (16.0 * scale).round() as i32;
+    let hwnd = hwnd.0 as isize; // 裸指针不能跨线程，按整数传递
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        unsafe {
+            let hinst = GetModuleHandleW(std::ptr::null());
+            let make = |size: i32| {
+                LoadImageW(
+                    hinst,
+                    32512usize as *const u16, // tauri-winres 嵌入的应用图标资源 ID
+                    IMAGE_ICON as u32,
+                    size,
+                    size,
+                    LR_DEFAULTCOLOR,
+                ) as HICON
+            };
+            let (h_big, h_small) = (make(big), make(small));
+            if h_big.is_null() || h_small.is_null() {
+                eprintln!("kimi-switch: 任务栏图标修正失败：LoadImageW 返回空句柄");
+                return;
+            }
+            let hwnd = hwnd as *mut _;
+            SendMessageW(hwnd, WM_SETICON as u32, ICON_BIG as usize, h_big as isize);
+            SendMessageW(hwnd, WM_SETICON as u32, ICON_SMALL as usize, h_small as isize);
+            // HICON 不转移所有权给窗口，须存活到进程结束；GUI 生命周期内有意不释放。
+            let _ = (h_big, h_small);
+        }
+    });
+}
+
 pub fn run() {
     let backend = match Backend::new() {
         Ok(backend) => {
@@ -146,6 +199,8 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window
                     .set_background_color(Some(tauri::utils::config::Color(244, 241, 236, 255)));
+                #[cfg(windows)]
+                fix_taskbar_icon(&window);
             }
             Ok(())
         })
