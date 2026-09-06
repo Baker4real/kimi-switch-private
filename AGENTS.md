@@ -17,7 +17,7 @@ crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调�
 
 ## 规则
 
-1. **改完必须验证**：Rust 走 `cargo check --workspace && cargo test --workspace`；改了 `src-ui/` 再加 `npx tsc --noEmit && npm test && npm run build`；通过后再 `cargo build --release`。
+1. **按改动面验证**：Rust 核心、Provider、凭证或共享契约改动运行 `cargo check --workspace` 及受影响的 `cargo test --workspace`；改了 `src-ui/` 再运行对应的 typecheck、测试和构建。跨层、发布或共享契约变化再扩大到完整组合；通过后按任务需要运行 release build。
 2. **凭证安全是最高优先级**：token 只能写用户本机私有文件；网络请求只允许发往 Kimi 官方域名（`auth.kimi.com` / `api.kimi.com` / `www.kimi.com`）。`www.kimi.com` 仅限「绑定网页登录」的会员到期读取路径（ADR-0004）。官方昵称只允许在既有导入/授权/额度流程上额外 `GET api.kimi.com/coding/v1/me`，禁止 `www.kimi.com/me`；禁止引入遥测。
 3. **手动切换永远可用**：`swap` 不依赖额度查询、`/me` 和网络，原子写入 + 快照回滚的逻辑不得破坏。额度查询成功后不得 await `/me`（后台缓存即可）；`/me` 失败不失败主流程。额度耗尽自动切换默认关闭；子开关 `prefer_lower_tier`（优先低档位）亦默认关，只改自动切换候选排序、不影响手动切换。判定只用已收集的额度快照、不新打网；执行只走既有 `activate`；不引入常驻 daemon。
 4. **token 刷新必须与官方客户端协调**：有官方锁协议的平台只能复用官方锁，不得自创并行刷新机制；仅在无官方锁的平台组合（当前：Windows + TS 客户端），允许经「主动续期」开关（默认关）依赖官方 100ms 重读采纳机制做查询前轮换，前提是原子写回（先账号库后 live，写序见 ADR-0002）。refresh token 是一次性轮换，被拒绝后记录指纹并停止重试。
@@ -50,4 +50,3 @@ GitHub Issues 写在 `Baker4real/kimi-switch-private`；`gh` 必须带 `-R`，�
 
 single-context：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/domain.md`.
 ownership / endpoint / extra 键 / agent 文档查找：仓库 OKF（`.okf-frontmatter.json`，含 `docs/agents/`）。
-
