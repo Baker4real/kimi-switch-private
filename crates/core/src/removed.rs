@@ -91,7 +91,18 @@ impl RemovedAccounts {
                 .collect(),
         };
         let json = serde_json::to_string_pretty(&file)?;
-        std::fs::write(&self.path, json)?;
+        // tmp + rename：崩溃时要么仍是旧墓碑，要么已是完整新文件，避免半截 JSON。
+        // 后缀带 pid，避免并发 save 互踩固定的 `removed.json.tmp`。
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
 }
@@ -119,5 +130,83 @@ mod tests {
         assert!(!removed.contains("gamma", "auth0|user_a"));
         let reloaded = RemovedAccounts::load(&path);
         assert!(!reloaded.contains("gamma", "auth0|user_a"));
+    }
+
+    /// issue #76：墓碑落盘后必须是完整 JSON，不能留下半截文件。
+    #[test]
+    fn add_replaces_corrupt_file_with_complete_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed.json");
+        std::fs::write(&path, "{not-json").unwrap();
+
+        RemovedAccounts::load(&path).add("kimi", "alice").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("墓碑必须是完整 JSON");
+        assert_eq!(parsed["accounts"]["kimi"], serde_json::json!(["alice"]));
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("removed.json")],
+            "成功写入后不得留下 tmp 残留"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tombstone_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed.json");
+        RemovedAccounts::load(&path).add("kimi", "alice").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "tombstone file must be 0600");
+    }
+
+    /// tmp 不得固定为 `removed.json.tmp`：该路径被占用时 save 仍须成功。
+    #[test]
+    fn save_tmp_does_not_use_fixed_json_tmp_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed.json");
+        let colliding = dir.path().join("removed.json.tmp");
+        std::fs::create_dir(&colliding).unwrap();
+
+        RemovedAccounts::load(&path).add("kimi", "alice").unwrap();
+
+        assert!(
+            RemovedAccounts::load(&path).contains("kimi", "alice"),
+            "占用 removed.json.tmp 不得挡住墓碑落盘"
+        );
+        assert!(colliding.is_dir(), "不得把碰撞名目录改写成墓碑内容");
+    }
+
+    /// rename 失败时残留 tmp 必须带本进程 pid，避免与其它进程互踩。
+    #[test]
+    fn save_tmp_name_includes_process_id_when_rename_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = RemovedAccounts::load(&path)
+            .add("kimi", "alice")
+            .expect_err("目标是目录时 rename 应失败并留下 tmp");
+        let _ = err;
+
+        let pid = std::process::id().to_string();
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name != "removed.json")
+            .collect();
+        assert!(
+            leftovers
+                .iter()
+                .any(|name| name.contains("tmp") && name.contains(&pid)),
+            "残留 tmp 名必须含 pid={pid}，实际={leftovers:?}"
+        );
     }
 }

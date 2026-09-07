@@ -8,6 +8,7 @@ import {
   parseMirroredTheme,
   persistThemeMirror,
   resolveTheme,
+  THEME_IDS,
   THEME_STORAGE_KEY,
   themeApplication,
 } from "./theme";
@@ -87,5 +88,37 @@ describe("index.html 首帧脚本", () => {
     expect(script).not.toMatch(/invoke/);
     expect(script).not.toMatch(/token/i);
     expect(script).not.toMatch(/kimi-code/i);
+  });
+
+  it("主题值白名单与 THEME_IDS 同步", () => {
+    const start = head.indexOf("<script>");
+    const end = head.indexOf("</script>");
+    const script = head.slice(start, end);
+    const htmlIds = [...script.matchAll(/t === ["']([^"']+)["']/g)].map((m) => m[1]);
+    expect([...htmlIds].sort()).toEqual([...THEME_IDS].sort());
+    for (const id of THEME_IDS) {
+      expect(parseMirroredTheme(id)).toBe(id);
+    }
+  });
+});
+
+function clickHandlerSource(source: string, buttonId: string): string {
+  const needle = `required<HTMLButtonElement>("${buttonId}").addEventListener("click"`;
+  const start = source.indexOf(needle);
+  expect(start, `${buttonId} 应有 click 监听`).toBeGreaterThan(-1);
+  const after = source.slice(start);
+  const nextRequired = after.indexOf("required<", needle.length);
+  return nextRequired === -1 ? after : after.slice(0, nextRequired);
+}
+
+describe("主题钮失败 toast", () => {
+  const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "main.ts"), "utf8");
+
+  it("两颗主题钮的 click 处理走 runSettingsAction", () => {
+    for (const id of ["theme-classic", "theme-jade-night"] as const) {
+      const handler = clickHandlerSource(main, id);
+      expect(handler, id).toContain("runSettingsAction");
+      expect(handler, id).toContain("api.setTheme");
+    }
   });
 });

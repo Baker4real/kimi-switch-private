@@ -18,7 +18,7 @@ export function membershipRefreshToast(
     return null;
   }
   const names = failed.map((row) => row.display_name).join("、");
-  return `会员有效期未更新：${names} 网页登录已失效，可重新绑定`;
+  return `会员到期未更新：${names} 网页登录已失效，可重新绑定`;
 }
 
 /** 用户主动刷新列出成功之后调用。启动 / 静默 / 定时列出不要走这里。 */

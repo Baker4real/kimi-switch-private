@@ -33,7 +33,7 @@ pub fn oauth_lock_dir_path(home: &Path) -> PathBuf {
     home.join("oauth").join("kimi-code.lock")
 }
 
-/// kimi-switch 对已被上游拒绝的 refresh token 保存 SHA-256 指纹，避免后台反复请求。
+/// kimi-switch 对被上游拒绝的 refresh token 保存 SHA-256 指纹集合（一行一个哈希），避免后台反复请求。
 pub fn dead_refresh_fingerprint_path(home: &Path) -> PathBuf {
     home.join("credentials").join(".kimi-switch-dead-refresh")
 }

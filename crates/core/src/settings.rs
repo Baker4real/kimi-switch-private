@@ -1,12 +1,13 @@
-//! 运行时可热加载的数值调优配置。
+//! 运行时可加载的数值调优配置。
 //!
 //! 设计：
 //! - **唯一 source of truth**：`<config_dir>/config.toml`（缺失则用 [`crate::defaults`] 编译期默认值）。
-//! - **热更新**：daemon 每轮循环开头 [`reload_from_file`]；CLI 启动时调一次即可（CLI 短命）。
-//! - **失败兜底**：文件不存在 → 用默认值；文件存在但解析失败 → 沿用上一次成功加载的值并打 warn，
-//!   防止配置 typo 把 daemon 拖挂。
-//! - **访问入口**：[`current`] 返回 `Arc<Settings>`，所有调用点都从这里读，避免在长生命周期对象里
-//!   缓存可能过期的副本。
+//! - **加载**：[`current`] 每次从默认 `config.toml` 补水并更新内存快照，因此 GUI 不必调用
+//!   [`reload_from_file`]，设置页落盘后下一次读取可见新值。单元测试跳过补水，以免本机配置污染并行用例。
+//! - **显式重载**：[`reload_from_file`] 供 CLI 启动时把解析/校验错误返回给调用方（CLI 短命）。
+//! - **失败兜底**：文件不存在 → 用默认值；文件存在但解析或校验失败 → 沿用上一次成功加载的值并打 warn。
+//! - **校验**：`auto_swap.threshold` 收敛到 `0.0..=1.0`；冷却/宽限等时间类拒绝负值。
+//! - **访问入口**：[`current`] 返回 `Arc<Settings>`，所有调用点都从这里读，不要长期缓存返回值。
 //!
 //! 字段命名遵循「按 domain 分组」的 TOML 表，方便 `vim ~/.config/kimi-switch/config.toml`。
 //! 例：
@@ -195,21 +196,77 @@ fn cell() -> &'static RwLock<Arc<Settings>> {
 
 /// 读取当前生效的配置快照。
 ///
-/// 各模块**每次访问**都调一次，不要把返回值长期缓存——daemon 会在循环开头 [`reload_from_file`]，
-/// 长期缓存会拿到过期值。
+/// 各模块**每次访问**都调一次，不要把返回值长期缓存。生产路径每次从默认 `config.toml` 补水，
+/// 设置页只落盘时下一次读取仍能看到新值；文件损坏则 warn 并沿用上次成功值。
 pub fn current() -> Arc<Settings> {
+    hydrate_from_default_file();
     cell().read().expect("settings rwlock poisoned").clone()
+}
+
+fn hydrate_from_default_file() {
+    // 单元测试保持编译期默认，避免本机 config.toml 或并行用例的 KIMI_SWITCH_HOME 串台。
+    if cfg!(test) {
+        return;
+    }
+    match load_from_default_path() {
+        Ok(parsed) => install(parsed),
+        Err(e) => tracing::warn!(err = %e, "配置文件无效，沿用当前值"),
+    }
+}
+
+fn load_from_default_path() -> Result<Arc<Settings>> {
+    let path = AppPaths::resolve()?.config_file();
+    load_from(&path)
+}
+
+/// 把解析后的配置收敛到合法区间；时间类负值返回明确错误。
+fn validate_and_normalize(settings: &mut Settings) -> Result<()> {
+    let threshold = settings.auto_swap.threshold;
+    if !threshold.is_finite() {
+        return Err(Error::Config("auto_swap.threshold 必须是有限数值".into()));
+    }
+    settings.auto_swap.threshold = threshold.clamp(0.0, 1.0);
+
+    fn reject_negative(name: &str, value: i64) -> Result<()> {
+        if value < 0 {
+            Err(Error::Config(format!("{name} 不能为负（当前 {value}）")))
+        } else {
+            Ok(())
+        }
+    }
+
+    reject_negative("auto_swap.cooldown_ms", settings.auto_swap.cooldown_ms)?;
+    reject_negative(
+        "auto_swap.settle_grace_ms",
+        settings.auto_swap.settle_grace_ms,
+    )?;
+    reject_negative("token.refresh_slack_ms", settings.token.refresh_slack_ms)?;
+    reject_negative(
+        "daemon.idle_threshold_ms",
+        settings.daemon.idle_threshold_ms,
+    )?;
+    reject_negative(
+        "beta.usage_cache_max_age_ms",
+        settings.beta.usage_cache_max_age_ms,
+    )?;
+    Ok(())
+}
+
+fn settings_from_toml(raw: &str, path: &Path) -> Result<Settings> {
+    let mut parsed: Settings =
+        toml::from_str(raw).map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
+    validate_and_normalize(&mut parsed)?;
+    Ok(parsed)
 }
 
 /// 重新从默认路径 `<config_dir>/config.toml` 读取配置。
 ///
 /// 行为：
-/// - 文件不存在 → 写入 [`Settings::default`] 并返回。
-/// - 解析成功 → 替换全局当前值并返回新快照。
-/// - 解析失败 → 保留旧值，返回 `Err`（调用方一般 warn 一行就继续）。
+/// - 文件不存在 → 装入 [`Settings::default`] 并返回。
+/// - 解析且校验成功 → 替换全局当前值并返回新快照。
+/// - 解析或校验失败 → 保留旧值，返回 `Err`（调用方一般 warn 一行就继续）。
 pub fn reload_from_file() -> Result<Arc<Settings>> {
-    let path = AppPaths::resolve()?.config_file();
-    let parsed = load_from(&path)?;
+    let parsed = load_from_default_path()?;
     install(parsed.clone());
     Ok(parsed)
 }
@@ -224,9 +281,7 @@ pub fn load_from(path: &Path) -> Result<Arc<Settings>> {
     if raw.trim().is_empty() {
         return Ok(Arc::new(Settings::default()));
     }
-    let parsed: Settings = toml::from_str(&raw)
-        .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
-    Ok(Arc::new(parsed))
+    Ok(Arc::new(settings_from_toml(&raw, path)?))
 }
 
 /// 直接替换全局当前值。测试与 CLI doctor 使用。
@@ -264,7 +319,7 @@ fn upsert_proactive_renewal(path: &Path, enabled: bool) -> Result<Arc<Settings>>
     }
     doc["proactive_renewal"]["enabled"] = toml_edit::value(enabled);
     let rendered = doc.to_string();
-    let parsed: Settings = toml::from_str(&rendered)?;
+    let parsed = settings_from_toml(&rendered, path)?;
     let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, rendered)?;
     std::fs::rename(&tmp, path)?;
@@ -319,7 +374,7 @@ fn upsert_auto_swap_bool(path: &Path, key: &str, value: bool) -> Result<Arc<Sett
     }
     doc["auto_swap"][key] = toml_edit::value(value);
     let rendered = doc.to_string();
-    let parsed: Settings = toml::from_str(&rendered)?;
+    let parsed = settings_from_toml(&rendered, path)?;
     let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, rendered)?;
     std::fs::rename(&tmp, path)?;
@@ -627,5 +682,125 @@ usage_cache_max_age_ms = 4000
         let err = upsert_auto_swap(&path, true).unwrap_err().to_string();
         assert!(err.contains("foo"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// issue #74：阈值收敛到 0..=1；冷却/宽限等时间类拒绝负值。
+    #[test]
+    fn out_of_range_numbers_are_clamped_or_rejected() {
+        enum Expect {
+            Threshold(f64),
+            ErrContains(&'static str),
+        }
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "threshold_above_one",
+                "[auto_swap]\nthreshold = 1.5\n",
+                Expect::Threshold(1.0),
+            ),
+            (
+                "threshold_below_zero",
+                "[auto_swap]\nthreshold = -0.2\n",
+                Expect::Threshold(0.0),
+            ),
+            (
+                "threshold_zero",
+                "[auto_swap]\nthreshold = 0.0\n",
+                Expect::Threshold(0.0),
+            ),
+            (
+                "threshold_one",
+                "[auto_swap]\nthreshold = 1.0\n",
+                Expect::Threshold(1.0),
+            ),
+            (
+                "cooldown_negative",
+                "[auto_swap]\ncooldown_ms = -1\n",
+                Expect::ErrContains("cooldown_ms"),
+            ),
+            (
+                "settle_grace_negative",
+                "[auto_swap]\nsettle_grace_ms = -1\n",
+                Expect::ErrContains("settle_grace_ms"),
+            ),
+            (
+                "refresh_slack_negative",
+                "[token]\nrefresh_slack_ms = -1\n",
+                Expect::ErrContains("refresh_slack_ms"),
+            ),
+            (
+                "idle_threshold_negative",
+                "[daemon]\nidle_threshold_ms = -1\n",
+                Expect::ErrContains("idle_threshold_ms"),
+            ),
+            (
+                "usage_cache_max_age_negative",
+                "[beta]\nusage_cache_max_age_ms = -1\n",
+                Expect::ErrContains("usage_cache_max_age_ms"),
+            ),
+        ];
+
+        for (name, body, expect) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            let got = load_from(&path);
+            match expect {
+                Expect::Threshold(want) => {
+                    let s = got.unwrap_or_else(|e| panic!("{name}: unexpected error {e}"));
+                    assert_eq!(s.auto_swap.threshold, *want, "{name}");
+                }
+                Expect::ErrContains(needle) => {
+                    let err = got.unwrap_err().to_string();
+                    assert!(
+                        err.contains(needle),
+                        "{name}: error should mention {needle}: {err}"
+                    );
+                    assert!(
+                        err.contains("负") || err.to_ascii_lowercase().contains("negative"),
+                        "{name}: error should say the value is negative: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// issue #74：`[quota]` 段加载后覆盖编译期默认，供收集/查询/着色消费。
+    #[test]
+    fn quota_section_overrides_compile_time_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[quota]
+warn_pct = 70.0
+exhausted_pct = 95.0
+fetch_timeout_ms = 12345
+fetch_retries = 3
+fetch_retry_delay_ms = 7
+min_refresh_interval_ms = 1000
+failure_backoff_max_ms = 2000
+"#,
+        )
+        .unwrap();
+        let s = load_from(&path).unwrap();
+        assert_eq!(s.quota.warn_pct, 70.0);
+        assert_eq!(s.quota.exhausted_pct, 95.0);
+        assert_eq!(s.quota.fetch_timeout_ms, 12345);
+        assert_eq!(s.quota.fetch_retries, 3);
+        assert_eq!(s.quota.fetch_retry_delay_ms, 7);
+        assert_eq!(s.quota.min_refresh_interval_ms, 1000);
+        assert_eq!(s.quota.failure_backoff_max_ms, 2000);
+    }
+
+    /// issue #74：零冷却仍合法；负值才拒绝。
+    #[test]
+    fn zero_cooldown_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[auto_swap]\ncooldown_ms = 0\nsettle_grace_ms = 0\n").unwrap();
+        let s = load_from(&path).unwrap();
+        assert_eq!(s.auto_swap.cooldown_ms, 0);
+        assert_eq!(s.auto_swap.settle_grace_ms, 0);
     }
 }

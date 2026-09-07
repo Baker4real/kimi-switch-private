@@ -1,14 +1,20 @@
-export type ThemeId = "classic" | "jade-night";
+export const THEME_IDS = ["classic", "jade-night"] as const;
+
+export type ThemeId = (typeof THEME_IDS)[number];
 
 /** 须与 `index.html` 首帧内联脚本中的 key 保持一致。 */
 export const THEME_STORAGE_KEY = "kimi-switch.theme";
 
+function isThemeId(value: string): value is ThemeId {
+  return (THEME_IDS as readonly string[]).includes(value);
+}
+
 export function resolveTheme(theme: string): ThemeId {
-  return theme === "jade-night" ? "jade-night" : "classic";
+  return isThemeId(theme) ? theme : "classic";
 }
 
 export function parseMirroredTheme(raw: string | null | undefined): ThemeId | null {
-  return raw === "classic" || raw === "jade-night" ? raw : null;
+  return raw != null && isThemeId(raw) ? raw : null;
 }
 
 export interface ThemeButtonState {

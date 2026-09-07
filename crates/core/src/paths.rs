@@ -6,26 +6,6 @@ use crate::error::{Error, Result};
 use directories::ProjectDirs;
 use std::path::PathBuf;
 
-/// 从旧版本数据目录一次性迁移（老用户的账号库不丢）。
-fn migrate_legacy_dirs(new_dirs: &ProjectDirs) {
-    let Some(old) = ProjectDirs::from("dev", "kimi-switch", "kimi-switch") else {
-        return;
-    };
-    for (old_dir, new_dir) in [
-        (old.config_dir(), new_dirs.config_dir()),
-        (old.data_dir(), new_dirs.data_dir()),
-        (old.cache_dir(), new_dirs.cache_dir()),
-    ] {
-        if old_dir.exists() && !new_dir.exists() {
-            // Windows 下 rename 要求目标父目录已存在，先补齐。
-            if let Some(parent) = new_dir.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::rename(old_dir, new_dir);
-        }
-    }
-}
-
 /// 项目维度的标准路径集合。
 pub struct AppPaths {
     /// 配置：registry.toml、provider 元数据。
@@ -57,7 +37,6 @@ impl AppPaths {
             None => {
                 let dirs = ProjectDirs::from("dev", "kimi-switch", "kimi-switch")
                     .ok_or_else(|| Error::Config("cannot resolve user directories".into()))?;
-                migrate_legacy_dirs(&dirs);
                 (
                     dirs.config_dir().to_path_buf(),
                     dirs.data_dir().to_path_buf(),
@@ -124,5 +103,32 @@ impl AppPaths {
     /// 默认入口自动导入会跳过这些 id，直到 `kimi-switch login` 再导入。
     pub fn removed_file(&self) -> PathBuf {
         self.config_dir.join("removed.json")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use directories::ProjectDirs;
+    #[cfg(windows)]
+    use std::path::PathBuf;
+
+    /// 钉死 `directories` 5.0.1 在 Windows 上的真实布局，避免 README 再写成 `%APPDATA%\kimi-switch\`。
+    #[test]
+    fn project_dirs_windows_layout() {
+        let dirs =
+            ProjectDirs::from("dev", "kimi-switch", "kimi-switch").expect("无法解析用户目录");
+        eprintln!("config={}", dirs.config_dir().display());
+        eprintln!("data={}", dirs.data_dir().display());
+        eprintln!("cache={}", dirs.cache_dir().display());
+
+        #[cfg(windows)]
+        {
+            let roaming = PathBuf::from(std::env::var("APPDATA").expect("APPDATA"));
+            let local = PathBuf::from(std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA"));
+            let project = PathBuf::from("kimi-switch").join("kimi-switch");
+            assert_eq!(dirs.config_dir(), roaming.join(&project).join("config"));
+            assert_eq!(dirs.data_dir(), roaming.join(&project).join("data"));
+            assert_eq!(dirs.cache_dir(), local.join(&project).join("cache"));
+        }
     }
 }

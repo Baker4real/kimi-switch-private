@@ -1,9 +1,11 @@
 //! Kimi OAuth 刷新：POST {oauth_host}/api/oauth/token（form-urlencoded, grant_type=refresh_token）。
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::thread::JoinHandle;
@@ -24,6 +26,9 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const TYPESCRIPT_STALE_AFTER: Duration = Duration::from_secs(10);
 const STALE_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
+const OFFICIAL_OAUTH_HOST: &str = "https://auth.kimi.com";
+/// 同进程内私有 tmp 名序号；与 pid 一起保证并发不撞名。
+static PRIVATE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RefreshLockProtocol {
@@ -46,12 +51,24 @@ pub(crate) enum LockProbeOutcome {
     Unknown,
 }
 
-/// 解析 OAuth host：`KIMI_CODE_OAUTH_HOST` > `https://auth.kimi.com`。
+/// 解析 OAuth host。release 固定官方常量；仅 debug 构建允许 `KIMI_CODE_OAUTH_HOST` 覆写。
 pub(crate) fn oauth_host() -> String {
-    std::env::var("KIMI_CODE_OAUTH_HOST")
-        .unwrap_or_else(|_| "https://auth.kimi.com".into())
-        .trim_end_matches('/')
-        .to_string()
+    oauth_host_from(std::env::var("KIMI_CODE_OAUTH_HOST").ok().as_deref())
+}
+
+/// 注入式 host 解析（测试标杆）。release 忽略覆写，避免环境变量把流量打到非官方域名。
+fn oauth_host_from(override_host: Option<&str>) -> String {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(host) = override_host.map(str::trim).filter(|s| !s.is_empty()) {
+            return host.trim_end_matches('/').to_string();
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = override_host;
+    }
+    OFFICIAL_OAUTH_HOST.to_string()
 }
 
 /// 从 blob 的 access_token JWT 里取 client_id（刷新请求需要）。
@@ -111,7 +128,7 @@ async fn refresh_blob_at(blob: &str, oauth_base: &str) -> Result<RefreshOutcome>
     if !status.is_success() {
         return Err(Error::provider_http(
             status.as_u16(),
-            format!("kimi refresh HTTP {status}: {body}"),
+            format!("kimi refresh HTTP {status}"),
         ));
     }
     let access = parsed.get("access_token").and_then(|v| v.as_str());
@@ -332,7 +349,7 @@ impl Drop for RefreshLockGuard {
 struct LockedCredentials {
     guard: RefreshLockGuard,
     raw: String,
-    dead_refresh_fingerprint: Option<String>,
+    dead_refresh_fingerprints: HashSet<String>,
 }
 
 pub(crate) async fn recover_active_401_at(
@@ -367,8 +384,9 @@ pub(crate) async fn recover_active_401_at(
 
     let current_refresh = extract_refresh_token(&locked.raw);
     let current_refresh_fingerprint = current_refresh.as_deref().map(refresh_fingerprint);
-    if current_refresh_fingerprint.is_some()
-        && current_refresh_fingerprint.as_deref() == locked.dead_refresh_fingerprint.as_deref()
+    if current_refresh_fingerprint
+        .as_ref()
+        .is_some_and(|fp| locked.dead_refresh_fingerprints.contains(fp))
     {
         release_lock(locked.guard).await;
         return Ok(None);
@@ -382,6 +400,7 @@ pub(crate) async fn recover_active_401_at(
                 locked.guard,
                 credential_path,
                 paths::dead_refresh_fingerprint_path(home),
+                current_refresh_fingerprint,
                 rotated,
             )
             .await;
@@ -498,15 +517,13 @@ async fn acquire_and_read_with_timeout(
                 }
             }
         });
-        let dead_refresh_fingerprint =
-            std::fs::read_to_string(paths::dead_refresh_fingerprint_path(&home))
-                .ok()
-                .map(|value| value.trim().to_string());
+        let dead_refresh_fingerprints =
+            load_dead_refresh_fingerprints(&paths::dead_refresh_fingerprint_path(&home));
         match std::fs::read_to_string(credential_path) {
             Ok(raw) => Ok(Some(LockedCredentials {
                 guard,
                 raw,
-                dead_refresh_fingerprint,
+                dead_refresh_fingerprints,
             })),
             Err(error) => {
                 release_lock_blocking(guard);
@@ -607,30 +624,14 @@ async fn write_credentials_and_release(
     guard: RefreshLockGuard,
     path: PathBuf,
     dead_fingerprint_path: PathBuf,
+    fingerprint_to_clear: Option<String>,
     contents: String,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let result = (|| {
-            let parent = path.parent().ok_or_else(|| {
-                Error::provider("kimi credential path has no parent directory")
-            })?;
-            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-            temporary.write_all(contents.as_bytes())?;
-            temporary.as_file().sync_all()?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                temporary
-                    .as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            temporary
-                .persist(&path)
-                .map_err(|error| Error::Io(error.error))?;
-            match std::fs::remove_file(dead_fingerprint_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            atomic_private_write(&path, &contents)?;
+            if let Some(fingerprint) = fingerprint_to_clear {
+                remove_dead_refresh_fingerprint(&dead_fingerprint_path, &fingerprint)?;
             }
             Ok(())
         })();
@@ -647,7 +648,7 @@ async fn write_dead_fingerprint_and_release(
     fingerprint: String,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
-        let result = atomic_private_write(&path, &fingerprint);
+        let result = insert_dead_refresh_fingerprint(&path, fingerprint);
         release_lock_blocking(guard);
         result
     })
@@ -658,9 +659,14 @@ async fn write_dead_fingerprint_and_release(
 fn atomic_private_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| Error::provider("kimi guard path has no parent directory"))?;
+        .ok_or_else(|| Error::provider("kimi private write path has no parent directory"))?;
     std::fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let target_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("blob");
+    let mut temporary = create_private_tempfile(parent, target_name)?;
+    let mut leftover = TmpLeftover::new(temporary.path().to_path_buf());
     temporary.write_all(contents.as_bytes())?;
     temporary.as_file().sync_all()?;
     #[cfg(unix)]
@@ -670,10 +676,65 @@ fn atomic_private_write(path: &Path, contents: &str) -> Result<()> {
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    temporary
-        .persist(path)
-        .map_err(|error| Error::Io(error.error))?;
+    persist_private_tempfile(temporary, path)?;
+    leftover.disarm();
     Ok(())
+}
+
+/// 创建即私有的 NamedTempFile。Unix 用 mode 0600 打开；tmp 名带 pid+原子序号，同进程并发不撞名。
+/// persist 仍走 NamedTempFile，以便 Windows 覆盖已有目标。
+///
+/// Windows 无 POSIX 0600，沿用 NamedTempFile 默认 ACL（继承父目录），不声称已强化。
+fn create_private_tempfile(
+    parent: &Path,
+    target_name: &str,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    let seq = PRIVATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let prefix = format!(".{target_name}.tmp.{}-{seq}-", std::process::id());
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).rand_bytes(0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    builder.tempfile_in(parent)
+}
+
+fn persist_private_tempfile(temporary: tempfile::NamedTempFile, dest: &Path) -> Result<()> {
+    match temporary.persist(dest) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let tempfile::PersistError { error, file } = error;
+            let leftover = file.path().to_path_buf();
+            drop(file);
+            let _ = std::fs::remove_file(&leftover);
+            Err(error.into())
+        }
+    }
+}
+
+/// persist / set_permissions 失败时清掉仍留在目录里的 tmp。
+struct TmpLeftover {
+    path: Option<PathBuf>,
+}
+
+impl TmpLeftover {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TmpLeftover {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -725,40 +786,84 @@ fn proactive_renewal_setting_enabled() -> bool {
     }
 }
 
-/// DeadToken 纪律检查：blob 的 refresh token 指纹已在案（曾被官方 invalid_grant
-/// 拒绝）→ 停止重试。与协调恢复路径共用同一指纹文件与哈希。
-pub(crate) fn proactive_renewal_blocked(home: &Path, blob: &str) -> bool {
-    let Some(refresh) = extract_refresh_token(blob) else {
-        return false;
-    };
-    let Ok(recorded) = std::fs::read_to_string(paths::dead_refresh_fingerprint_path(home)) else {
-        return false;
-    };
-    recorded.trim() == refresh_fingerprint(&refresh)
+/// 解析指纹集合：一行一个哈希；旧版「整文件一个哈希」读取时仍算成员。
+fn parse_dead_refresh_fingerprints(recorded: &str) -> HashSet<String> {
+    recorded
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
-/// DeadToken 纪律处置：记录被拒 refresh token 的指纹（幂等）并停止重试；
+fn load_dead_refresh_fingerprints(path: &Path) -> HashSet<String> {
+    match std::fs::read_to_string(path) {
+        Ok(recorded) => parse_dead_refresh_fingerprints(&recorded),
+        Err(_) => HashSet::new(),
+    }
+}
+
+fn persist_dead_refresh_fingerprints(path: &Path, fingerprints: &HashSet<String>) -> Result<()> {
+    if fingerprints.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    } else {
+        let mut lines: Vec<&str> = fingerprints.iter().map(String::as_str).collect();
+        lines.sort_unstable();
+        atomic_private_write(path, &lines.join("\n"))
+    }
+}
+
+fn insert_dead_refresh_fingerprint(path: &Path, fingerprint: String) -> Result<()> {
+    let mut fingerprints = load_dead_refresh_fingerprints(path);
+    fingerprints.insert(fingerprint);
+    persist_dead_refresh_fingerprints(path, &fingerprints)
+}
+
+fn remove_dead_refresh_fingerprint(path: &Path, fingerprint: &str) -> Result<()> {
+    let mut fingerprints = load_dead_refresh_fingerprints(path);
+    if fingerprints.remove(fingerprint) {
+        persist_dead_refresh_fingerprints(path, &fingerprints)?;
+    }
+    Ok(())
+}
+
+fn blob_refresh_fingerprint(blob: &str) -> Option<String> {
+    extract_refresh_token(blob).map(|token| refresh_fingerprint(&token))
+}
+
+/// DeadToken 纪律检查：blob 的 refresh token 指纹已在集合中（曾被官方 invalid_grant
+/// 拒绝）→ 停止重试。与协调恢复路径共用同一指纹文件与哈希。
+pub(crate) fn proactive_renewal_blocked(home: &Path, blob: &str) -> bool {
+    let Some(fingerprint) = blob_refresh_fingerprint(blob) else {
+        return false;
+    };
+    load_dead_refresh_fingerprints(&paths::dead_refresh_fingerprint_path(home))
+        .contains(&fingerprint)
+}
+
+/// DeadToken 纪律处置：把被拒 refresh token 的指纹加入集合（幂等）并停止重试；
 /// 本地凭证不删除、不墓碑化。返回本次查询应呈现的「凭证过期型 401」引导错误
 /// （文案复用 issue #41，不新造）。
 pub(crate) fn proactive_renewal_reject(home: &Path, blob: &str) -> Result<Error> {
-    if let Some(refresh) = extract_refresh_token(blob) {
-        atomic_private_write(
-            &paths::dead_refresh_fingerprint_path(home),
-            &refresh_fingerprint(&refresh),
-        )?;
+    if let Some(fingerprint) = blob_refresh_fingerprint(blob) {
+        insert_dead_refresh_fingerprint(&paths::dead_refresh_fingerprint_path(home), fingerprint)?;
     }
     Ok(Error::quota_credential_expired(
         crate::kimi_usage::CREDENTIAL_EXPIRED_GUIDANCE,
     ))
 }
 
-/// 轮换成功收尾：refresh 已轮换，旧拒止指纹作废清除（与协调恢复写回路径同款）。
-pub(crate) fn proactive_renewal_rotated(home: &Path) -> Result<()> {
-    match std::fs::remove_file(paths::dead_refresh_fingerprint_path(home)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+/// 轮换成功收尾：只从集合去掉这次轮换前 blob 的指纹，不得清空其他账号的拒止记录。
+/// 集合空了再删文件。
+pub(crate) fn proactive_renewal_rotated(home: &Path, blob: &str) -> Result<()> {
+    let Some(fingerprint) = blob_refresh_fingerprint(blob) else {
+        return Ok(());
+    };
+    remove_dead_refresh_fingerprint(&paths::dead_refresh_fingerprint_path(home), &fingerprint)
 }
 
 fn refresh_fingerprint(refresh_token: &str) -> String {
@@ -1146,6 +1251,126 @@ mod tests {
         }
     }
 
+    /// issue #81：OAuth 刷新 HTTP 错误只带状态码，不得回显响应 body（body 可能含 token / 内部细节）。
+    #[tokio::test]
+    async fn oauth_refresh_http_error_omits_response_body() {
+        use crate::test_support::MockServer;
+
+        let leak = "should-not-leak-refresh-body";
+        let server = MockServer::start(vec![(
+            "500 Internal Server Error",
+            r#"{"error":"server_exploded","secret":"should-not-leak-refresh-body"}"#,
+        )]);
+        let blob = r#"{"access_token":"header.eyJ1c2VyX2lkIjoidS0xMjMiLCJjbGllbnRfaWQiOiJjLTEifQ.sig","refresh_token":"R1"}"#;
+
+        let err = match refresh_blob_at(blob, server.base_url()).await {
+            Ok(_) => panic!("非 2xx 刷新应失败"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert_eq!(err.http_status(), Some(500), "{msg}");
+        assert!(msg.contains("500"), "错误文案须含状态码：{msg}");
+        assert!(!msg.contains(leak), "错误文案不得含响应 body：{msg}");
+        assert!(
+            !msg.contains("server_exploded"),
+            "错误文案不得含响应 body：{msg}"
+        );
+        assert_eq!(server.finish(), vec!["POST /api/oauth/token HTTP/1.1"]);
+    }
+
+    #[test]
+    fn oauth_host_from_pins_official_constant() {
+        assert_eq!(oauth_host_from(None), "https://auth.kimi.com");
+        assert_eq!(oauth_host_from(Some("")), "https://auth.kimi.com");
+        assert_eq!(oauth_host_from(Some("  ")), "https://auth.kimi.com");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn oauth_host_from_honors_override_in_debug() {
+        assert_eq!(
+            oauth_host_from(Some("http://127.0.0.1:9/")),
+            "http://127.0.0.1:9"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn oauth_host_from_ignores_override_in_release() {
+        assert_eq!(
+            oauth_host_from(Some("http://evil.example")),
+            "https://auth.kimi.com"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_tempfile_is_0600_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = create_private_tempfile(dir.path(), "kimi-code.json").unwrap();
+        assert_eq!(
+            tmp.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn private_tempfile_names_are_unique_under_concurrency() {
+        use std::collections::HashSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                scope.spawn(|| {
+                    let tmp = create_private_tempfile(dir.path(), "kimi-code.json").unwrap();
+                    paths.lock().unwrap().push(tmp.path().to_path_buf());
+                });
+            }
+        });
+        let paths = paths.into_inner().unwrap();
+        let unique: HashSet<_> = paths.iter().cloned().collect();
+        assert_eq!(unique.len(), paths.len(), "同进程并发不得写同一 tmp 名");
+    }
+
+    #[test]
+    fn atomic_private_write_cleans_tmp_when_persist_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("not-a-file");
+        std::fs::create_dir(&target).unwrap();
+
+        let err = atomic_private_write(&target, "secret-token-value").unwrap_err();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "not-a-file")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "persist 失败须清理 tmp 残留：{leftovers:?}; {err}"
+        );
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn atomic_private_write_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cred.json");
+        atomic_private_write(&path, "first").unwrap();
+        atomic_private_write(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
     /// 主动续期的 DeadToken 纪律（issue #44）：与协调恢复共用同一指纹文件与哈希，
     /// 拒绝后记录在案 → 停止重试 → 成功轮换后清除。全平台可跑（不触碰锁）。
     #[test]
@@ -1168,8 +1393,7 @@ mod tests {
                 .contains(crate::kimi_usage::CREDENTIAL_EXPIRED_GUIDANCE),
             "复用 #41 引导文案，不新造：{err}"
         );
-        let recorded =
-            std::fs::read_to_string(paths::dead_refresh_fingerprint_path(home)).unwrap();
+        let recorded = std::fs::read_to_string(paths::dead_refresh_fingerprint_path(home)).unwrap();
         assert_eq!(recorded, refresh_fingerprint("R1"));
         assert!(!recorded.contains("R1"), "指纹不得含 token 原文");
         assert!(proactive_renewal_blocked(home, blob), "指纹在案 → 停止重试");
@@ -1178,13 +1402,84 @@ mod tests {
             home,
             r#"{"access_token":"a","refresh_token":"R2"}"#
         ));
-        // 轮换成功收尾清除指纹；重复清除是 no-op。
-        proactive_renewal_rotated(home).unwrap();
+        // 轮换成功收尾只清掉这次 blob 的指纹；重复清除是 no-op。
+        proactive_renewal_rotated(home, blob).unwrap();
         assert!(!paths::dead_refresh_fingerprint_path(home).exists());
-        proactive_renewal_rotated(home).unwrap();
+        proactive_renewal_rotated(home, blob).unwrap();
         // 无 refresh token 的 blob：不写指纹，仍给出引导错误。
         let err = proactive_renewal_reject(home, r#"{"access_token":"a"}"#).unwrap();
         assert_eq!(err.http_status(), Some(401));
         assert!(!paths::dead_refresh_fingerprint_path(home).exists());
+    }
+
+    /// 旧版整文件一个哈希仍须挡住对应 token（集合读取兼容）。
+    #[test]
+    fn legacy_single_hash_dead_refresh_file_still_blocks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let path = paths::dead_refresh_fingerprint_path(home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, refresh_fingerprint("R1")).unwrap();
+        assert!(proactive_renewal_blocked(
+            home,
+            r#"{"access_token":"a","refresh_token":"R1"}"#
+        ));
+        assert!(!proactive_renewal_blocked(
+            home,
+            r#"{"access_token":"a","refresh_token":"R2"}"#
+        ));
+    }
+
+    /// 两账号先后 reject：后写加入集合，不得覆盖前一个指纹。
+    #[test]
+    fn proactive_renewal_reject_keeps_both_fingerprints() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let blob1 = r#"{"access_token":"a","refresh_token":"R1"}"#;
+        let blob2 = r#"{"access_token":"a","refresh_token":"R2"}"#;
+        proactive_renewal_reject(home, blob1).unwrap();
+        proactive_renewal_reject(home, blob2).unwrap();
+        assert!(proactive_renewal_blocked(home, blob1));
+        assert!(proactive_renewal_blocked(home, blob2));
+        let recorded = std::fs::read_to_string(paths::dead_refresh_fingerprint_path(home)).unwrap();
+        let h1 = refresh_fingerprint("R1");
+        let h2 = refresh_fingerprint("R2");
+        assert!(
+            recorded.lines().any(|line| line.trim() == h1),
+            "R1 指纹必须仍在：{recorded}"
+        );
+        assert!(
+            recorded.lines().any(|line| line.trim() == h2),
+            "R2 指纹必须写入且不得覆盖 R1：{recorded}"
+        );
+        assert!(!recorded.contains("R1"));
+        assert!(!recorded.contains("R2"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(paths::dead_refresh_fingerprint_path(home))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    /// 轮换成功只去掉这次 blob 的指纹，其它停泊死号仍停试。
+    #[test]
+    fn proactive_renewal_rotated_removes_only_that_fingerprint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let blob1 = r#"{"access_token":"a","refresh_token":"R1"}"#;
+        let blob2 = r#"{"access_token":"a","refresh_token":"R2"}"#;
+        proactive_renewal_reject(home, blob1).unwrap();
+        proactive_renewal_reject(home, blob2).unwrap();
+        proactive_renewal_rotated(home, blob1).unwrap();
+        assert!(!proactive_renewal_blocked(home, blob1));
+        assert!(proactive_renewal_blocked(home, blob2));
+        assert!(paths::dead_refresh_fingerprint_path(home).exists());
     }
 }

@@ -7,8 +7,8 @@ mod dto;
 
 pub use backend::Backend;
 pub use dto::{
-    AccountRow, AuthLink, CommandError, QuotaTone, QuotaView, Snapshot, ThemeId, UiMessage,
-    URGENT_USED_RATIO,
+    AccountRow, AuthLink, CommandError, MessageTone, QuotaTone, QuotaView, Snapshot, ThemeId,
+    UiMessage, UiMessageKind, URGENT_USED_RATIO,
 };
 pub use kimi_switch_core::QuotaCollectReason;
 
@@ -54,6 +54,109 @@ mod tests {
         assert_eq!(serde_json::to_value(QuotaTone::Warn).unwrap(), "warn");
         assert_eq!(serde_json::to_value(QuotaTone::High).unwrap(), "high");
         assert_eq!(serde_json::to_value(QuotaTone::Full).unwrap(), "full");
+    }
+
+    #[test]
+    fn message_tone_and_kind_serialize_as_wire_string() {
+        assert_eq!(serde_json::to_value(MessageTone::Ok).unwrap(), "ok");
+        assert_eq!(serde_json::to_value(MessageTone::Err).unwrap(), "err");
+        assert_eq!(serde_json::to_value(MessageTone::Info).unwrap(), "info");
+        assert_eq!(
+            serde_json::to_value(UiMessageKind::Generic).unwrap(),
+            "generic"
+        );
+        assert_eq!(
+            serde_json::to_value(UiMessageKind::AutoSwapSuccess).unwrap(),
+            "auto_swap_success"
+        );
+        assert_eq!(
+            serde_json::to_value(UiMessageKind::AutoSwapNoCandidate).unwrap(),
+            "auto_swap_no_candidate"
+        );
+        assert_eq!(
+            serde_json::to_value(UiMessageKind::AutoSwapFailed).unwrap(),
+            "auto_swap_failed"
+        );
+        for tone in MessageTone::ALL {
+            assert_eq!(serde_json::to_value(tone).unwrap(), tone.as_str());
+        }
+        for kind in UiMessageKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
+    }
+
+    fn json_object_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().expect("object").keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    fn sorted_key_list(keys: &[&str]) -> Vec<String> {
+        let mut keys: Vec<String> = keys.iter().map(|s| (*s).to_string()).collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn dto_json_keys_match_frontend_contract() {
+        let quota = QuotaView {
+            window: "5小时".into(),
+            ratio: Some(0.5),
+            text: "50%".into(),
+            reset: None,
+            tone: QuotaTone::Warn,
+        };
+        assert_eq!(
+            json_object_keys(&serde_json::to_value(&quota).unwrap()),
+            sorted_key_list(crate::dto::QUOTA_VIEW_JSON_KEYS)
+        );
+
+        let row = AccountRow {
+            id: "a".into(),
+            label: "a".into(),
+            active: false,
+            membership: None,
+            membership_expiry: None,
+            membership_remaining_days: None,
+            membership_period_days: None,
+            membership_expiry_hint: false,
+            quotas: vec![quota],
+            error: None,
+            credential_expired: false,
+            cached_at: None,
+            display_name: "a".into(),
+            official_nickname_known: false,
+        };
+        assert_eq!(
+            json_object_keys(&serde_json::to_value(&row).unwrap()),
+            sorted_key_list(crate::dto::ACCOUNT_ROW_JSON_KEYS)
+        );
+
+        let message = UiMessage::auto_swap_success("已自动切换到 工作机");
+        assert_eq!(
+            json_object_keys(&serde_json::to_value(&message).unwrap()),
+            sorted_key_list(crate::dto::UI_MESSAGE_JSON_KEYS)
+        );
+        assert_eq!(
+            serde_json::to_value(&message).unwrap()["kind"],
+            "auto_swap_success"
+        );
+
+        let snapshot = Snapshot {
+            accounts: vec![row],
+            current_label: "--".into(),
+            account_count: 1,
+            urgent_count: 0,
+            theme: ThemeId::Classic,
+            proactive_renewal: false,
+            auto_swap: false,
+            auto_swap_prefer_lower_tier: false,
+            message: Some(message),
+        };
+        assert_eq!(
+            json_object_keys(&serde_json::to_value(&snapshot).unwrap()),
+            sorted_key_list(crate::dto::SNAPSHOT_JSON_KEYS)
+        );
     }
 
     /// 告急新语义（issue #43）：只有用量窗口真实达到 ≥80% 才告急；
@@ -408,14 +511,16 @@ mod tests {
             period_days: None,
         });
         assert_eq!(with_expiry.text, "绑定成功，有效期至 2027-08-27");
-        assert_eq!(with_expiry.tone, "ok");
+        assert_eq!(with_expiry.tone, MessageTone::Ok);
+        assert_eq!(with_expiry.kind, UiMessageKind::Generic);
 
         let without = bind_web_success_message(&kimi_switch_kimi::web_membership::WebBinding {
             expiry_text: None,
             period_days: None,
         });
         assert_eq!(without.text, "绑定成功，暂无会员到期信息");
-        assert_eq!(without.tone, "ok");
+        assert_eq!(without.tone, MessageTone::Ok);
+        assert_eq!(without.kind, UiMessageKind::Generic);
     }
 
     /// bind-web 失败文案（issue #51）：身份门两类失败按结构化载荷映射为简洁中文，
@@ -949,7 +1054,8 @@ mod tests {
         let snapshot = snapshot_message_of(rows, QuotaCollectReason::UserInitiated, &stats);
         let message = snapshot.message.expect("刚刚更新过");
         assert_eq!(message.text, "刚刚更新过");
-        assert_eq!(message.tone, "info");
+        assert_eq!(message.tone, MessageTone::Info);
+        assert_eq!(message.kind, UiMessageKind::Generic);
     }
 
     #[tokio::test]
@@ -1013,7 +1119,8 @@ mod tests {
         let snapshot = snapshot_message_of(rows, QuotaCollectReason::UserInitiated, &stats);
         let message = snapshot.message.expect("429 提示");
         assert_eq!(message.text, "请求过于频繁，请稍后再试");
-        assert_eq!(message.tone, "info");
+        assert_eq!(message.tone, MessageTone::Info);
+        assert_eq!(message.kind, UiMessageKind::Generic);
     }
 
     #[tokio::test]
@@ -1461,7 +1568,8 @@ mod tests {
         .await;
         let message = effect.message.expect("success toast");
         assert_eq!(message.text, "已自动切换到 工作机");
-        assert_eq!(message.tone, "ok");
+        assert_eq!(message.tone, MessageTone::Ok);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapSuccess);
         assert!(effect.swapped);
         assert_eq!(
             activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
@@ -1503,7 +1611,8 @@ mod tests {
         .await;
         let message = effect.message.expect("failure toast");
         assert_eq!(message.text, "自动切换失败");
-        assert_eq!(message.tone, "err");
+        assert_eq!(message.tone, MessageTone::Err);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapFailed);
         assert!(!effect.swapped);
         assert!(!state.exists());
         let event = last_audit(audit.path());
@@ -1541,7 +1650,8 @@ mod tests {
         .await;
         let message = effect.message.expect("no-candidate toast");
         assert_eq!(message.text, "没有可自动切换的账号");
-        assert_eq!(message.tone, "err");
+        assert_eq!(message.tone, MessageTone::Err);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapNoCandidate);
         assert!(!effect.swapped);
         assert!(!state.exists());
         let event = last_audit(audit.path());
@@ -1607,10 +1717,7 @@ mod tests {
             skipped_rate_limit: 0,
             skipped_auth: 0,
         };
-        let auto = UiMessage {
-            text: "已自动切换到 工作机".into(),
-            tone: "ok".into(),
-        };
+        let auto = UiMessage::auto_swap_success("已自动切换到 工作机");
         let merged = attach_auto_swap_message(
             None,
             QuotaCollectReason::UserInitiated,
@@ -1619,9 +1726,11 @@ mod tests {
         )
         .expect("auto-swap toast");
         assert_eq!(merged.text, "已自动切换到 工作机");
-        assert_eq!(merged.tone, "ok");
+        assert_eq!(merged.tone, MessageTone::Ok);
+        assert_eq!(merged.kind, UiMessageKind::AutoSwapSuccess);
         let skip = attach_auto_swap_message(None, QuotaCollectReason::UserInitiated, &stats, None)
             .expect("skip toast");
         assert_eq!(skip.text, "刚刚更新过");
+        assert_eq!(skip.kind, UiMessageKind::Generic);
     }
 }

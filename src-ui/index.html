@@ -20,7 +20,7 @@
           <span class="window-app-mark" aria-hidden="true"></span>
           <span class="window-app-title">Kimi 换号器</span>
         </div>
-        <div class="window-controls" aria-label="窗口控制">
+        <div class="window-controls" role="group" aria-label="窗口控制">
           <button id="window-minimize-button" class="window-control-button" type="button" aria-label="最小化">
             <span class="window-control-icon window-control-icon--minimize" aria-hidden="true"></span>
           </button>
@@ -33,13 +33,17 @@
         </div>
       </header>
 
-      <main class="dashboard dashboard-shell">
+      <main id="app-shell" class="dashboard dashboard-shell" aria-busy="false">
         <section class="app-toolbar">
           <nav class="route-tabs" aria-label="主导航">
             <a class="route-tab active" href="#overview" data-route="overview" aria-current="page">总览</a>
             <a class="route-tab" href="#library" data-route="library">账号库</a>
             <a class="route-tab" href="#settings" data-route="settings">设置</a>
           </nav>
+          <div id="app-busy" class="quota-monitor-pill" aria-live="polite">
+            <span class="quota-monitor-dot" aria-hidden="true"></span>
+            <span id="app-busy-label">额度就绪</span>
+          </div>
         </section>
 
         <section class="page active" id="page-overview">
@@ -53,10 +57,6 @@
             <article class="rail-card current-account-card current-account-card--hero">
               <div class="current-account-topbar">
                 <h2 class="section-title">当前账号</h2>
-                <div class="quota-monitor-pill">
-                  <span id="quota-monitor-dot" class="quota-monitor-dot" aria-hidden="true"></span>
-                  <span id="quota-monitor-label">额度就绪</span>
-                </div>
               </div>
               <div class="current-identity">
                 <h3 id="current-title" class="current-account-title">--</h3>
@@ -108,6 +108,12 @@
               </div>
             </div>
             <div id="accounts-empty" class="empty-state hidden">暂无账号。用「添加账号」浏览器授权，或先在 Kimi Code 登录后点「导入当前账号」。</div>
+            <div id="library-action-error" class="action-retry hidden">
+              <p id="library-action-error-text"></p>
+              <button id="library-retry-button" class="action-button action-button-primary" type="button">
+                重试
+              </button>
+            </div>
             <div id="accounts-list" class="profiles-grid"></div>
           </div>
         </section>
@@ -129,7 +135,7 @@
             <div class="settings-row settings-row--switch">
               <div class="settings-copy">
                 <span id="renewal-toggle-label">当前账号主动续期</span>
-                <p class="settings-note" id="renewal-toggle-note">仅在 Windows 生效。允许本工具为当前账号主动续期登录凭证；极端情况下官方会话可能要求重新登录。</p>
+                <p class="settings-note" id="renewal-toggle-note">仅在 Windows 生效。允许本工具为当前账号主动续期登录凭证；极端情况下官方会话可能要求重新登录。本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」。</p>
               </div>
               <button id="renewal-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="renewal-toggle-label" aria-describedby="renewal-toggle-note">
                 <span class="switch-thumb" aria-hidden="true"></span>
@@ -158,7 +164,7 @@
       </main>
     </div>
 
-    <dialog id="auth-dialog" class="app-dialog">
+    <dialog id="auth-dialog" class="app-dialog" aria-labelledby="auth-dialog-title">
       <h3 id="auth-dialog-title">添加账号 · 浏览器授权</h3>
       <p id="auth-dialog-copy">正在获取授权链接…</p>
       <label class="field">
@@ -171,20 +177,29 @@
       </div>
       <p class="dialog-kicker">页面如要求输入授权码：</p>
       <p id="auth-user-code" class="device-code">----</p>
+      <div id="auth-action-error" class="dialog-action-error hidden">
+        <p id="auth-action-error-text"></p>
+        <button id="auth-retry-button" class="action-button action-button-primary" type="button">重试</button>
+      </div>
       <div class="dialog-actions">
         <button id="auth-copy-code" class="action-button" type="button">复制</button>
         <button id="auth-cancel" class="action-button" type="button">取消</button>
       </div>
     </dialog>
 
-    <dialog id="rename-dialog" class="app-dialog">
+    <dialog id="rename-dialog" class="app-dialog" aria-labelledby="rename-dialog-title">
       <form id="rename-form">
-        <h3>重命名账号</h3>
+        <h3 id="rename-dialog-title">重命名账号</h3>
         <p id="rename-copy"></p>
         <label class="field">
           <span>别名</span>
-          <input id="rename-input" type="text" name="alias" autocomplete="off" />
+          <input id="rename-input" type="text" name="alias" autocomplete="off" aria-describedby="rename-error" />
+          <p id="rename-error" class="field-error hidden"></p>
         </label>
+        <div id="rename-action-error" class="dialog-action-error hidden">
+          <p id="rename-action-error-text"></p>
+          <button id="rename-retry-button" class="action-button action-button-primary" type="button">重试</button>
+        </div>
         <div class="dialog-actions">
           <button id="rename-cancel" class="action-button" type="button">取消</button>
           <button id="rename-submit" class="action-button action-button-primary" type="submit">确定</button>
@@ -192,33 +207,46 @@
       </form>
     </dialog>
 
-    <dialog id="bind-dialog" class="app-dialog">
-      <h3>绑定网页登录</h3>
+    <dialog id="bind-dialog" class="app-dialog" aria-labelledby="bind-dialog-title">
+      <h3 id="bind-dialog-title">绑定网页登录</h3>
       <p id="bind-copy" class="dialog-kicker"></p>
       <div class="dialog-actions">
         <button id="bind-open" class="action-button" type="button">打开控制台</button>
       </div>
       <label class="field">
         <span>网页 token（kimi.com 控制台的 access_token）</span>
-        <textarea id="bind-token" class="token-input" rows="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="粘贴 access_token"></textarea>
+        <textarea id="bind-token" class="token-input" rows="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="粘贴 access_token" aria-describedby="bind-token-error"></textarea>
+        <p id="bind-token-error" class="field-error hidden"></p>
       </label>
+      <div id="bind-action-error" class="dialog-action-error hidden">
+        <p id="bind-action-error-text"></p>
+        <button id="bind-retry-button" class="action-button action-button-primary" type="button">重试</button>
+      </div>
       <div class="dialog-actions">
         <button id="bind-cancel" class="action-button" type="button">取消</button>
         <button id="bind-submit" class="action-button action-button-primary" type="button">绑定</button>
       </div>
     </dialog>
 
-    <dialog id="delete-dialog" class="app-dialog">
-      <h3>确认删除</h3>
+    <dialog id="delete-dialog" class="app-dialog" aria-labelledby="delete-dialog-title">
+      <h3 id="delete-dialog-title">确认删除</h3>
       <p id="delete-copy"></p>
       <p class="dialog-kicker">Kimi Code 当前的登录文件不受影响，仅移除账号库中的凭证副本。</p>
+      <div id="delete-action-error" class="dialog-action-error hidden">
+        <p id="delete-action-error-text"></p>
+        <button id="delete-retry-button" class="action-button action-button-primary" type="button">重试</button>
+      </div>
       <div class="dialog-actions">
         <button id="delete-cancel" class="action-button action-button-primary" type="button">取消</button>
         <button id="delete-confirm" class="action-button action-button-danger" type="button">确认删除</button>
       </div>
     </dialog>
 
-    <div id="toast" class="toast hidden" role="status"></div>
+    <div id="toast-status" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <div id="toast-alert" class="toast is-error hidden" role="alert" aria-live="assertive" aria-atomic="true">
+      <span id="toast-alert-text"></span>
+      <button id="toast-alert-dismiss" class="toast-dismiss" type="button">关闭</button>
+    </div>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

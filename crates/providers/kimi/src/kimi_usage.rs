@@ -7,11 +7,25 @@ use kimi_switch_core::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
 
 use crate::kimi_files;
 
+const OFFICIAL_USAGE_BASE: &str = "https://api.kimi.com/coding/v1";
+
 fn base_url() -> String {
-    std::env::var("KIMI_CODE_BASE_URL")
-        .unwrap_or_else(|_| "https://api.kimi.com/coding/v1".into())
-        .trim_end_matches('/')
-        .to_string()
+    usage_base_from(std::env::var("KIMI_CODE_BASE_URL").ok().as_deref())
+}
+
+/// 注入式用量 host 解析（测试标杆）。release 忽略覆写，避免环境变量把流量打到非官方域名。
+fn usage_base_from(override_host: Option<&str>) -> String {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(host) = override_host.map(str::trim).filter(|s| !s.is_empty()) {
+            return host.trim_end_matches('/').to_string();
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = override_host;
+    }
+    OFFICIAL_USAGE_BASE.to_string()
 }
 
 fn to_u64(v: Option<&serde_json::Value>) -> Option<u64> {
@@ -294,6 +308,34 @@ mod tests {
                   "detail":{"limit":"100","used":"18","remaining":"82","resetTime":"2026-07-17T12:52:15Z"}}]
     }"#;
 
+    #[test]
+    fn usage_base_from_pins_official_api_host() {
+        assert_eq!(usage_base_from(None), "https://api.kimi.com/coding/v1");
+        assert_eq!(usage_base_from(Some("")), "https://api.kimi.com/coding/v1");
+        assert_eq!(
+            usage_base_from(Some("  ")),
+            "https://api.kimi.com/coding/v1"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn usage_base_from_honors_override_in_debug() {
+        assert_eq!(
+            usage_base_from(Some("http://127.0.0.1:9/coding/v1/")),
+            "http://127.0.0.1:9/coding/v1"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn usage_base_from_ignores_override_in_release() {
+        assert_eq!(
+            usage_base_from(Some("http://evil.example/coding/v1")),
+            "https://api.kimi.com/coding/v1"
+        );
+    }
+
     async fn wait_received(server: &MockServer, n: usize) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -301,7 +343,10 @@ mod tests {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("timeout waiting for {n} mock requests, got {}", server.received());
+                panic!(
+                    "timeout waiting for {n} mock requests, got {}",
+                    server.received()
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

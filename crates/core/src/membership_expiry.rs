@@ -443,12 +443,12 @@ mod tests {
 
     #[test]
     fn start_from_extra_reads_and_degrades() {
-        let mut extra = extra_with(&[(
-            EXTRA_CURRENT_START_TIME,
-            "2026-08-28T00:00:00Z",
-        )]);
+        let mut extra = extra_with(&[(EXTRA_CURRENT_START_TIME, "2026-08-28T00:00:00Z")]);
         let start = membership_start_from_extra(&extra);
-        assert_eq!(start, Some("2026-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap()));
+        assert_eq!(
+            start,
+            Some("2026-08-28T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
         // 非法瞬间 → 宽容降级为 None。
         extra.insert(
             EXTRA_CURRENT_START_TIME.into(),

@@ -5,6 +5,15 @@ import type { ThemeId } from "./theme";
 
 export type MessageTone = "ok" | "err" | "info";
 
+/** 快照 toast 语义；自动切换通知靠 kind 过滤，不靠中文。 */
+export type UiMessageKind =
+  "generic" | "auto_swap_success" | "auto_swap_no_candidate" | "auto_swap_failed";
+
+/** 未知 tone 一律当错误，避免新值被当成 ok/info 吞掉。 */
+export function isErrorMessageTone(tone: string): boolean {
+  return tone !== "ok" && tone !== "info";
+}
+
 export interface AccountRow {
   id: string;
   label: string;
@@ -36,6 +45,7 @@ export interface AccountRow {
 export interface UiMessage {
   text: string;
   tone: MessageTone;
+  kind: UiMessageKind;
 }
 
 export interface Snapshot {

@@ -95,12 +95,12 @@ pub(crate) async fn bind_web_at(
     base_url: &str,
 ) -> Result<WebBinding> {
     // 目标账号必须存在：extra 要写回它的 registry 行。
-    let account = registry.find(PROVIDER_ID, target)?.ok_or_else(|| {
-        Error::AccountNotFound {
+    let account = registry
+        .find(PROVIDER_ID, target)?
+        .ok_or_else(|| Error::AccountNotFound {
             provider: PROVIDER_ID.into(),
             id: target.to_string(),
-        }
-    })?;
+        })?;
 
     // 身份门在一切写入与网络之前（与按卡重新授权同型，见 ADR-0002/0004）。
     let observed = web_identity(web_token).ok_or_else(Error::bind_web_unidentifiable)?;
@@ -175,19 +175,17 @@ pub(crate) async fn refresh_web_membership_at(
     base_url: &str,
 ) -> Result<WebBinding> {
     // 目标账号必须存在：extra 要写回它的 registry 行。
-    let account = registry.find(PROVIDER_ID, target)?.ok_or_else(|| {
-        Error::AccountNotFound {
+    let account = registry
+        .find(PROVIDER_ID, target)?
+        .ok_or_else(|| Error::AccountNotFound {
             provider: PROVIDER_ID.into(),
             id: target.to_string(),
-        }
-    })?;
+        })?;
     // 只有已绑定（凭证仓库里有网页 field）才可刷新；未绑定说明调用方越过了
     // 触发口径，英文错误、不打网络。
     let web_token = store
         .get(PROVIDER_ID, account.id.0.as_str(), WEB_STORE_FIELD)?
-        .ok_or_else(|| {
-            Error::provider("membership refresh requires an existing web binding")
-        })?;
+        .ok_or_else(|| Error::provider("membership refresh requires an existing web binding"))?;
 
     let payload = get_subscription_at(base_url, &web_token).await?;
     // 只读三个会员瞬间（口径与绑定一致，ADR-0004）。
@@ -197,12 +195,12 @@ pub(crate) async fn refresh_web_membership_at(
 
     // 成功才写 extra：网络往返后重读 registry 行再改写（与绑定同一写序）；
     // 行被并发删除按账号不存在失败——网页凭证是绑定管道写的，不在这里清理。
-    let mut fresh = registry.find(PROVIDER_ID, target)?.ok_or_else(|| {
-        Error::AccountNotFound {
+    let mut fresh = registry
+        .find(PROVIDER_ID, target)?
+        .ok_or_else(|| Error::AccountNotFound {
             provider: PROVIDER_ID.into(),
             id: target.to_string(),
-        }
-    })?;
+        })?;
     write_membership_extra(&mut fresh.extra, current_start, current_end, next_billing);
     registry.upsert(fresh)?;
 
@@ -229,21 +227,27 @@ fn web_identity(web_token: &str) -> Option<String> {
 /// 请求 `GetSubscription`（Connect RPC：JSON 编码 + `connect-protocol-version: 1`）。
 /// 错误文案英文且不含 token：不回显响应 body（只带状态码），请求错误只带 URL 侧原因。
 async fn get_subscription_at(base_url: &str, web_token: &str) -> Result<serde_json::Value> {
-    let url = format!("{}{}", base_url.trim_end_matches('/'), GET_SUBSCRIPTION_PATH);
-    let resp = crate::net::send(Some(HTTP_TIMEOUT), crate::net::ProxyFallback::Always, |client| {
-        client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .header("connect-protocol-version", "1")
-            .header("User-Agent", "kimi-switch")
-            .header("Authorization", format!("Bearer {web_token}"))
-            .body("{}")
-    })
+    let url = format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        GET_SUBSCRIPTION_PATH
+    );
+    let resp = crate::net::send(
+        Some(HTTP_TIMEOUT),
+        crate::net::ProxyFallback::Always,
+        |client| {
+            client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("connect-protocol-version", "1")
+                .header("User-Agent", "kimi-switch")
+                .header("Authorization", format!("Bearer {web_token}"))
+                .body("{}")
+        },
+    )
     .await
-    .map_err(|e| {
-        Error::provider(format!("membership subscription request failed: {e}"))
-    })?;
+    .map_err(|e| Error::provider(format!("membership subscription request failed: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(Error::provider_http(
@@ -409,9 +413,15 @@ mod tests {
         let web_token = token_for("u1");
         let server = MockServer::start(vec![("200 OK", SUBSCRIPTION_FIXTURE)]);
 
-        let binding = bind_web_at(&h.registry, &h.store, &AccountId("u1".into()), &web_token, server.base_url())
-            .await
-            .unwrap();
+        let binding = bind_web_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            &web_token,
+            server.base_url(),
+        )
+        .await
+        .unwrap();
 
         // 到期日：nextBillingTime 2027-08-27（东八区日历日），不是干扰项 2026-09-28。
         assert_eq!(binding.expiry_text.as_deref(), Some("2027-08-27"));
@@ -420,7 +430,10 @@ mod tests {
 
         // 网页凭证独立 field；Code blob 原样。
         assert_eq!(
-            h.store.get("kimi", "u1", WEB_STORE_FIELD).unwrap().as_deref(),
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
             Some(web_token.as_str())
         );
         assert_eq!(
@@ -432,15 +445,24 @@ mod tests {
         // 不落任何取消/档位语义。
         let bound = h.bound_account("u1");
         assert_eq!(
-            bound.extra.get(EXTRA_CURRENT_START_TIME).and_then(|v| v.as_str()),
+            bound
+                .extra
+                .get(EXTRA_CURRENT_START_TIME)
+                .and_then(|v| v.as_str()),
             Some("2026-08-28T00:00:00Z")
         );
         assert_eq!(
-            bound.extra.get(EXTRA_CURRENT_END_TIME).and_then(|v| v.as_str()),
+            bound
+                .extra
+                .get(EXTRA_CURRENT_END_TIME)
+                .and_then(|v| v.as_str()),
             Some("2027-08-28T00:00:00Z")
         );
         assert_eq!(
-            bound.extra.get(EXTRA_NEXT_BILLING_TIME).and_then(|v| v.as_str()),
+            bound
+                .extra
+                .get(EXTRA_NEXT_BILLING_TIME)
+                .and_then(|v| v.as_str()),
             Some("2027-08-27T01:25:37.930341Z")
         );
         assert_eq!(
@@ -452,8 +474,14 @@ mod tests {
             Some("kimi-code")
         );
         let extra_json = serde_json::to_string(&bound.extra).unwrap();
-        assert!(!extra_json.contains("CANCEL"), "不产生取消语义：{extra_json}");
-        assert!(!extra_json.contains("membershipLevel"), "档位不落库：{extra_json}");
+        assert!(
+            !extra_json.contains("CANCEL"),
+            "不产生取消语义：{extra_json}"
+        );
+        assert!(
+            !extra_json.contains("membershipLevel"),
+            "档位不落库：{extra_json}"
+        );
         assert_eq!(
             membership_expiry_from_extra(&bound.extra).as_deref(),
             Some("2027-08-27")
@@ -464,13 +492,18 @@ mod tests {
         assert_eq!(requests.len(), 1, "绑定时只请求一次 GetSubscription");
         let full = requests.join("\n").to_lowercase();
         assert!(
-            full.contains("post /apiv2/kimi.gateway.membership.v2.membershipservice/getsubscription"),
+            full.contains(
+                "post /apiv2/kimi.gateway.membership.v2.membershipservice/getsubscription"
+            ),
             "请求行应为 GetSubscription 路径：{full}"
         );
         assert!(full.contains("connect-protocol-version: 1"), "{full}");
         assert!(full.contains("user-agent: kimi-switch"), "{full}");
         assert!(
-            full.contains(&format!("authorization: bearer {}", web_token.to_lowercase())),
+            full.contains(&format!(
+                "authorization: bearer {}",
+                web_token.to_lowercase()
+            )),
             "{full}"
         );
     }
@@ -504,7 +537,10 @@ mod tests {
         }
         let message = err.to_string();
         assert!(message.contains("nothing written"), "{message}");
-        assert!(!message.contains("LEAK-MARKER"), "错误不得含 token：{message}");
+        assert!(
+            !message.contains("LEAK-MARKER"),
+            "错误不得含 token：{message}"
+        );
         assert!(!message.contains(&web_token), "{message}");
 
         // 库存逐项不变：网页 field、Code blob、registry 行（含 extra）。
@@ -578,7 +614,10 @@ mod tests {
 
         assert_eq!(binding.expiry_text.as_deref(), Some("2027-08-27"));
         assert_eq!(
-            h.store.get("kimi", "u1", WEB_STORE_FIELD).unwrap().as_deref(),
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
             Some(web_token.as_str())
         );
         assert_eq!(server.finish().len(), 1);
@@ -605,12 +644,18 @@ mod tests {
 
         assert_eq!(err.http_status(), Some(500));
         let message = err.to_string();
-        assert!(!message.contains("LEAK-MARKER"), "错误不得含 token：{message}");
+        assert!(
+            !message.contains("LEAK-MARKER"),
+            "错误不得含 token：{message}"
+        );
         assert!(!message.contains(&web_token), "{message}");
         assert!(!message.contains("boom"), "不回显响应 body：{message}");
 
         assert_eq!(
-            h.store.get("kimi", "u1", WEB_STORE_FIELD).unwrap().as_deref(),
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
             Some(web_token.as_str()),
             "网页凭证按写序保留（身份门已过）"
         );
@@ -638,7 +683,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(h.bound_account("u1").extra.contains_key(EXTRA_NEXT_BILLING_TIME));
+        assert!(h
+            .bound_account("u1")
+            .extra
+            .contains_key(EXTRA_NEXT_BILLING_TIME));
         assert!(h
             .bound_account("u1")
             .extra
@@ -726,7 +774,10 @@ mod tests {
         assert_eq!(binding.period_days, None);
         let bound = h.bound_account("u1");
         assert_eq!(
-            bound.extra.get(EXTRA_CURRENT_END_TIME).and_then(|v| v.as_str()),
+            bound
+                .extra
+                .get(EXTRA_CURRENT_END_TIME)
+                .and_then(|v| v.as_str()),
             Some("2028-08-28T00:00:00Z")
         );
         assert!(
@@ -745,18 +796,19 @@ mod tests {
         );
         // 网页凭证原样（刷新不重写绑定）。
         assert_eq!(
-            h.store.get("kimi", "u1", WEB_STORE_FIELD).unwrap().as_deref(),
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
             Some(token_for("u1").as_str())
         );
         // 只请求一次，且带 Connect 协议头。
         let requests = server.finish_full();
         assert_eq!(requests.len(), 1);
-        assert!(
-            requests
-                .join("\n")
-                .to_lowercase()
-                .contains("connect-protocol-version: 1")
-        );
+        assert!(requests
+            .join("\n")
+            .to_lowercase()
+            .contains("connect-protocol-version: 1"));
     }
 
     /// 刷新后订阅已无到期数据：成功也清掉三个键（回到「无到期日」，不残留旧日期）。
@@ -804,16 +856,19 @@ mod tests {
 
         assert_eq!(err.http_status(), Some(401));
         let message = err.to_string();
+        assert!(!message.contains(&web_token), "错误不得含 token：{message}");
         assert!(
-            !message.contains(&web_token),
-            "错误不得含 token：{message}"
+            !message.contains("unauthorized}"),
+            "不回显响应 body：{message}"
         );
-        assert!(!message.contains("unauthorized}"), "不回显响应 body：{message}");
 
         // 缓存降级：extra 旧日期原样保留，网页凭证不动。
         assert_eq!(h.bound_account("u1").extra, seeded.extra);
         assert_eq!(
-            h.store.get("kimi", "u1", WEB_STORE_FIELD).unwrap().as_deref(),
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
             Some(web_token.as_str())
         );
         assert_eq!(server.finish().len(), 1);
@@ -837,8 +892,7 @@ mod tests {
 
         assert_eq!(err.http_status(), None);
         assert!(
-            err.to_string()
-                .contains("requires an existing web binding"),
+            err.to_string().contains("requires an existing web binding"),
             "英文错误说明缺少绑定：{err}"
         );
         assert_eq!(h.bound_account("u1").extra, seeded.extra);

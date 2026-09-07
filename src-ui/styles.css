@@ -46,7 +46,8 @@
   --track: #ebe7e1;
   --blue-fill: #8fd4f3;
   --monitor-dot: #94dbf1;
-  --focus-ring: rgba(143, 212, 243, 0.95);
+  /* 焦点环叠在 --canvas-bg / --field-background 上 ≥ 3:1（实测 canvas 4.00:1）。 */
+  --focus-ring: rgba(47, 118, 158, 0.95);
   --app-background:
     radial-gradient(circle at 12% 12%, rgba(255, 255, 255, 0.92), transparent 26rem),
     radial-gradient(circle at 88% 14%, rgba(222, 231, 244, 0.54), transparent 22rem),
@@ -100,13 +101,14 @@
 :root[data-theme="jade-night"] {
   color-scheme: dark;
   --canvas-bg: #151816;
-  /* 与主色同色相；叠底后激活 Tab 深字 4.98:1，主按钮 5.11:1，muted 5.79:1，body 11.95:1。 */
+  /* 与主色同色相；叠底后激活 Tab 深字 4.98:1，主按钮 5.11:1，body 11.95:1。
+     muted #9aa89c：canvas 7.20:1，表单底 6.29:1，面板浅沿 5.76:1，账号卡浅沿 5.47:1（均 ≥ 5.0）。 */
   --surface-pressed: rgba(96, 149, 132, 0.94);
   --border: rgba(83, 96, 86, 0.75);
   --border-accent: rgba(98, 164, 147, 0.9);
   --text-strong: #ecf1e8;
   --text-body: #cbd6cc;
-  --text-muted: #89968b;
+  --text-muted: #9aa89c;
   --text-inverse: #0f1411;
   --track: #303831;
   --blue-fill: #67c3ad;
@@ -177,6 +179,7 @@ button {
 
 button:focus-visible,
 input:focus-visible,
+textarea:focus-visible,
 a:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
@@ -336,8 +339,20 @@ p {
 }
 
 .app-toolbar {
-  display: flex;
-  justify-content: center;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-toolbar .route-tabs {
+  grid-column: 2;
+  justify-self: center;
+}
+
+.app-toolbar .quota-monitor-pill {
+  grid-column: 3;
+  justify-self: end;
 }
 
 .route-tabs {
@@ -472,9 +487,10 @@ p {
   color: var(--text-muted);
 }
 
-/* 绑定入口（issue #51）：档位行旁的弱样式小按钮，复用 profile-pill 基样式（非错误红）。 */
+/* 绑定入口（issue #51 / #85）：档位行旁的弱样式小按钮，复用 profile-pill 基样式（非错误红）。
+   min-height 24px：WCAG 2.2 目标尺寸下限，不再压成约 20px。 */
 .plan-bind {
-  min-height: 0;
+  min-height: 24px;
   margin-left: 8px;
   padding: 2px 10px;
   font-size: 0.72rem;
@@ -927,6 +943,32 @@ p {
   color: var(--text-body);
 }
 
+.field-error {
+  margin: 0;
+  color: var(--danger-text);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.dialog-action-error,
+.action-retry {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0 0;
+  color: var(--danger-text);
+  font-size: 0.82rem;
+  text-align: center;
+}
+
+.action-retry {
+  padding: 16px 18px;
+  border: 1px dashed var(--danger-border);
+  border-radius: var(--radius-metric);
+  background: var(--empty-background);
+}
+
 /* 绑定对话框 token 输入（issue #51）：遮蔽回显防肩窥（WebView2/Chromium 支持
  * -webkit-text-security；不支持时退化为普通回显，功能不受影响）。 */
 .token-input {
@@ -965,6 +1007,9 @@ p {
 }
 
 .toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
   position: fixed;
   right: 20px;
   bottom: 20px;
@@ -982,6 +1027,18 @@ p {
 .toast.is-error {
   color: var(--danger-text);
   border-color: var(--danger-border);
+}
+
+.toast-dismiss {
+  flex-shrink: 0;
+  margin-left: auto;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid currentColor;
+  color: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
 }
 
 @media (max-width: 1100px) {

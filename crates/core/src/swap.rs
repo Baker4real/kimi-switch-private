@@ -6,7 +6,8 @@
 //! 设计要点：
 //! - 阻塞 IO。调用方需要确保自己已在 `tokio::task::spawn_blocking` 内。
 //! - 每个目标按顺序：(a) 备份到 snapshot 目录 + 内存；(b) 调用 writer 写新内容。
-//! - 任一步失败：把所有 target 回滚到备份状态（原本存在的恢复内容；原本不存在的删除）。
+//! - 任一步失败：把所有 target 回滚到备份状态（原本存在的按字节原子恢复；原本不存在的删除）。
+//!   回滚失败并入返回错误，以便区分「已恢复」与「live 可能处于中间态」。
 //! - writer 成功后还会调用 `commit`，常见用途是 `AccountRegistry::set_active`。
 //!   commit 失败同样回滚已写入的文件。
 //! - 锁文件位于账号注册表同目录（`config_dir/.kimi-switch.lock`），
@@ -20,6 +21,9 @@ use chrono::{DateTime, Utc};
 
 use crate::error::{Error, Result};
 use crate::paths::AppPaths;
+
+/// 每个 provider 保留的最近切换快照份数。默认 10；不写入 settings。
+const SNAPSHOT_KEEP_LAST: usize = 10;
 
 #[cfg(test)]
 thread_local! {
@@ -61,6 +65,70 @@ fn try_create_dir(path: &Path) -> Result<bool> {
     }
 }
 
+/// `{provider}-{ts}` / `{provider}-{ts}-{n}`；ts 以年份数字开头，避免误伤 `foo` vs `foo-bar`。
+fn is_snapshot_dir_name_for(name: &str, provider_id: &str) -> bool {
+    let Some(rest) = name.strip_prefix(provider_id) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    rest.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// 按目录名排序后只留最近 [`SNAPSHOT_KEEP_LAST`] 份；失败只记警告，不向上传播。
+fn prune_old_snapshots(root: &Path, provider_id: &str) {
+    let mut dirs = match list_provider_snapshot_dirs(root, provider_id) {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                provider = provider_id,
+                keep = SNAPSHOT_KEEP_LAST,
+                "failed to list swap snapshots for pruning"
+            );
+            return;
+        }
+    };
+    dirs.sort();
+    let excess = dirs.len().saturating_sub(SNAPSHOT_KEEP_LAST);
+    for path in dirs.into_iter().take(excess) {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                err = %e,
+                path = %path.display(),
+                provider = provider_id,
+                keep = SNAPSHOT_KEEP_LAST,
+                "failed to prune old swap snapshot"
+            ),
+        }
+    }
+}
+
+fn list_provider_snapshot_dirs(root: &Path, provider_id: &str) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if is_snapshot_dir_name_for(name, provider_id) {
+            dirs.push(path);
+        }
+    }
+    Ok(dirs)
+}
+
 /// 写入新内容到目标路径的函数对象。各 Provider 用 [`Box::new`] 自己造，
 /// 把序列化、权限设置等细节封进去。
 pub type SwapWriter<'a> = Box<dyn FnOnce(&Path) -> Result<()> + Send + 'a>;
@@ -84,7 +152,7 @@ pub struct SwapTarget<'a> {
 /// - `targets`：要原子写入的文件列表。
 /// - `commit`：所有文件写入成功后执行的最后一步（典型：把 registry 标 active）。
 ///
-/// 失败时已写入的文件会回滚到调用前的状态。
+/// 失败时已写入的文件会回滚到调用前的状态；回滚自身失败会并入返回错误。
 pub fn swap_with_snapshot<'a, C>(
     provider_id: &str,
     provider_home: &Path,
@@ -110,14 +178,15 @@ where
     // 2. 备份现有文件（原本存在的进 snapshot 目录 + 内存）。
     let mut plans: Vec<TargetPlan> = Vec::with_capacity(targets.len());
     for target in targets {
-        let backup = if target.live_path.exists() {
-            let raw = fs::read_to_string(&target.live_path)?;
-            let snapshot_path = snap_dir.join(target.snapshot_name);
-            fs::write(&snapshot_path, &raw)?;
-            restrict_permissions(&snapshot_path)?;
-            Some(raw)
-        } else {
-            None
+        let backup = match fs::read(&target.live_path) {
+            Ok(raw) => {
+                let snapshot_path = snap_dir.join(target.snapshot_name);
+                fs::write(&snapshot_path, &raw)?;
+                restrict_permissions(&snapshot_path)?;
+                Some(raw)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
         };
         plans.push(TargetPlan {
             live_path: target.live_path,
@@ -128,7 +197,7 @@ where
     tracing::info!(snapshot = %snap_dir.display(), "pre-swap snapshot saved");
 
     // 3. 顺序写入；任一失败回滚所有 plan（即使 writer 没跑到也尝试 restore，让状态一致）。
-    let backups: Vec<(PathBuf, Option<String>)> = plans
+    let backups: Vec<(PathBuf, Option<Vec<u8>>)> = plans
         .iter()
         .map(|p| (p.live_path.clone(), p.backup.clone()))
         .collect();
@@ -138,15 +207,18 @@ where
             live_path, writer, ..
         } = plan;
         if let Err(e) = writer(&live_path) {
-            rollback(&backups);
-            return Err(e);
+            return Err(with_rollback(e, rollback(&backups)));
         }
     }
 
     // 4. 收尾 commit（典型：registry.set_active）。失败同样回滚。
     if let Err(e) = commit() {
-        rollback(&backups);
-        return Err(e);
+        return Err(with_rollback(e, rollback(&backups)));
+    }
+
+    // 5. 提交成功后再按上限清理本 provider 历史快照；失败只记警告，不阻断切换。
+    if let Some(root) = snap_dir.parent() {
+        prune_old_snapshots(root, provider_id);
     }
 
     Ok(())
@@ -167,24 +239,62 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
 struct TargetPlan<'a> {
     live_path: PathBuf,
     writer: SwapWriter<'a>,
-    backup: Option<String>,
+    backup: Option<Vec<u8>>,
 }
 
-fn rollback(backups: &[(PathBuf, Option<String>)]) {
+fn with_rollback(origin: Error, rolled: std::result::Result<(), String>) -> Error {
+    match rolled {
+        Ok(()) => origin,
+        Err(details) => Error::provider(format!("{origin}; {details}")),
+    }
+}
+
+/// 同目录临时文件 + rename；Unix 下临时文件经 [`restrict_permissions`] 收为 0600。
+fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let tmp = {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".tmp.{}", std::process::id()));
+        PathBuf::from(name)
+    };
+    let written: Result<()> = (|| {
+        fs::write(&tmp, contents)?;
+        restrict_permissions(&tmp)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn restore_one(path: &Path, backup: Option<&[u8]>) -> Result<()> {
+    match backup {
+        Some(raw) => atomic_write_file(path, raw),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            // 原本就不存在：视为已恢复到「未登录」状态。
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
+fn rollback(backups: &[(PathBuf, Option<Vec<u8>>)]) -> std::result::Result<(), String> {
+    let mut errors = Vec::new();
     for (path, backup) in backups {
-        match backup {
-            Some(raw) => {
-                if let Err(e) = fs::write(path, raw)
-                    .and_then(|()| restrict_permissions(path).map_err(std::io::Error::other))
-                {
-                    tracing::error!(err=%e, path=%path.display(), "rollback restore failed");
-                }
-            }
-            None => {
-                // 原本不存在 → 把刚写入的删掉，保持「未登录」状态。
-                let _ = fs::remove_file(path);
-            }
+        if let Err(e) = restore_one(path, backup.as_deref()) {
+            tracing::error!(err=%e, path=%path.display(), "rollback restore failed");
+            errors.push(format!("{}: {e}", path.display()));
         }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "rollback failed; live files may be in an intermediate state ({})",
+            errors.join("; ")
+        ))
     }
 }
 
@@ -300,6 +410,10 @@ mod tests {
             )
             .unwrap_err();
             assert!(err.to_string().contains("injected writer failure"), "{err}");
+            assert!(
+                !err.to_string().contains("rollback failed"),
+                "回滚成功时错误不应声称回滚失败: {err}"
+            );
             assert_eq!(fs::read_to_string(&live).unwrap(), "old");
         });
     }
@@ -323,6 +437,10 @@ mod tests {
             )
             .unwrap_err();
             assert!(err.to_string().contains("injected commit failure"), "{err}");
+            assert!(
+                !err.to_string().contains("rollback failed"),
+                "回滚成功时错误不应声称回滚失败: {err}"
+            );
             assert_eq!(fs::read_to_string(&live).unwrap(), "old");
         });
     }
@@ -347,10 +465,184 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("injected commit failure"), "{err}");
             assert!(
+                !err.to_string().contains("rollback failed"),
+                "回滚成功时错误不应声称回滚失败: {err}"
+            );
+            assert!(
                 !live.exists(),
                 "原本不存在的 live 文件在回滚后应被删除，仍在: {}",
                 live.display()
             );
+        });
+    }
+
+    #[test]
+    fn non_utf8_live_file_can_still_complete_swap() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, [0xff, 0xfe, 0x00, b'!']).unwrap();
+
+            swap_with_snapshot(
+                "ticket75",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("new"),
+                }],
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(fs::read_to_string(&live).unwrap(), "new");
+        });
+    }
+
+    #[test]
+    fn partial_write_restores_first_already_written_target() {
+        with_isolated_home(|home| {
+            let first = home.join("first.txt");
+            let second = home.join("second.txt");
+            fs::write(&first, "old-first").unwrap();
+            fs::write(&second, "old-second").unwrap();
+
+            let err = swap_with_snapshot(
+                "ticket75",
+                home,
+                &lock_dir(),
+                vec![
+                    SwapTarget {
+                        snapshot_name: "first",
+                        live_path: first.clone(),
+                        writer: write_then_ok("new-first"),
+                    },
+                    SwapTarget {
+                        snapshot_name: "second",
+                        live_path: second.clone(),
+                        writer: Box::new(|_| Err(Error::provider("second target failed"))),
+                    },
+                ],
+                || Ok(()),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("second target failed"), "{err}");
+            assert!(
+                !err.to_string().contains("rollback failed"),
+                "回滚成功时错误不应声称回滚失败: {err}"
+            );
+            assert_eq!(fs::read_to_string(&first).unwrap(), "old-first");
+            assert_eq!(fs::read_to_string(&second).unwrap(), "old-second");
+        });
+    }
+
+    #[test]
+    fn rollback_failure_is_returned_and_live_left_in_intermediate_state() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+
+            let err = swap_with_snapshot(
+                "ticket75",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: Box::new(|path| {
+                        fs::write(path, "new")?;
+                        fs::remove_file(path)?;
+                        fs::create_dir(path)?;
+                        Err(Error::provider("injected writer failure"))
+                    }),
+                }],
+                || Ok(()),
+            )
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("injected writer failure"), "{text}");
+            assert!(
+                text.contains("rollback failed"),
+                "回滚失败必须并入返回错误: {text}"
+            );
+            assert!(
+                text.contains("intermediate state"),
+                "应能区分 live 中间态: {text}"
+            );
+            assert!(
+                live.is_dir(),
+                "回滚失败后 live 应仍是写入制造的目录中间态: {}",
+                live.display()
+            );
+        });
+    }
+
+    #[test]
+    fn missing_live_delete_failure_is_returned() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            assert!(!live.exists());
+
+            let err = swap_with_snapshot(
+                "ticket75",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: Box::new(|path| {
+                        fs::create_dir(path)?;
+                        fs::write(path.join("keep"), b"x")?;
+                        Err(Error::provider("injected writer failure"))
+                    }),
+                }],
+                || Ok(()),
+            )
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("injected writer failure"), "{text}");
+            assert!(
+                text.contains("rollback failed"),
+                "原本不存在的 live 删除失败不得静默: {text}"
+            );
+            assert!(
+                live.is_dir(),
+                "删除失败后目录中间态应仍在: {}",
+                live.display()
+            );
+            assert_eq!(fs::read(live.join("keep")).unwrap(), b"x");
+        });
+    }
+
+    #[test]
+    fn damaged_registry_blocks_swap_but_keeps_live_file_intact() {
+        with_isolated_home(|home| {
+            let paths = AppPaths::resolve().unwrap();
+            let registry = AccountRegistry::new(paths.registry_file());
+            registry.upsert(sample_account("alice")).unwrap();
+
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+            fs::write(paths.registry_file(), "this is not valid toml {{{").unwrap();
+
+            let err = swap_with_snapshot(
+                "ticket75",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("new"),
+                }],
+                || registry.set_active("kimi", &AccountId("alice".into())),
+            )
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("toml"), "损坏的 registry 应阻断切换: {text}");
+            assert!(
+                !text.contains("rollback failed"),
+                "live 已恢复时不应报告回滚失败: {text}"
+            );
+            assert_eq!(fs::read_to_string(&live).unwrap(), "old");
         });
     }
 
@@ -563,6 +855,193 @@ mod tests {
             );
             assert!(!bob.active, "{all:?}");
             assert_eq!(fs::read_to_string(&live).unwrap(), "new");
+        });
+    }
+
+    fn plant_snapshot_dir(root: &Path, name: &str, contents: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("live"), contents).unwrap();
+        dir
+    }
+
+    #[test]
+    fn successful_swap_drops_oldest_snapshot_when_over_keep_last() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+            let root = AppPaths::resolve().unwrap().snapshots_dir();
+            for day in 1..=10 {
+                plant_snapshot_dir(
+                    &root,
+                    &format!("ticket77-202001{day:02}T000000.000000Z"),
+                    &format!("old-{day}"),
+                );
+            }
+            let other = plant_snapshot_dir(&root, "other-20200101T000000.000000Z", "other-keep");
+
+            with_frozen_now(parse_utc("2026-06-07T08:09:10.000001Z"), || {
+                swap_with_snapshot(
+                    "ticket77",
+                    home,
+                    &lock_dir(),
+                    vec![SwapTarget {
+                        snapshot_name: "live",
+                        live_path: live.clone(),
+                        writer: write_then_ok("new"),
+                    }],
+                    || Ok(()),
+                )
+                .unwrap();
+            });
+
+            let kept = snapshot_dirs("ticket77");
+            assert_eq!(kept.len(), 10, "超过保留上限时应只留最近 10 份: {kept:?}");
+            let names: Vec<String> = kept
+                .iter()
+                .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n == "ticket77-20200101T000000.000000Z"),
+                "最旧快照应被清理: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n.contains("20200102T000000")),
+                "次旧快照应仍保留: {names:?}"
+            );
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == "ticket77-20260607T080910.000001Z"),
+                "本次切换快照应保留: {names:?}"
+            );
+            assert!(
+                other.is_dir(),
+                "其他 provider 的快照不得被清理: {}",
+                other.display()
+            );
+            assert_eq!(
+                fs::read_to_string(other.join("live")).unwrap(),
+                "other-keep"
+            );
+            assert_eq!(fs::read_to_string(&live).unwrap(), "new");
+        });
+    }
+
+    #[test]
+    fn same_microsecond_suffix_is_newer_than_unsuffixed_dir() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+            let root = AppPaths::resolve().unwrap().snapshots_dir();
+            plant_snapshot_dir(&root, "ticket77-20200101T000000.000000Z", "base");
+            for n in 1..=9 {
+                plant_snapshot_dir(
+                    &root,
+                    &format!("ticket77-20200101T000000.000000Z-{n}"),
+                    &format!("sfx-{n}"),
+                );
+            }
+
+            with_frozen_now(parse_utc("2026-06-07T08:09:10.000001Z"), || {
+                swap_with_snapshot(
+                    "ticket77",
+                    home,
+                    &lock_dir(),
+                    vec![SwapTarget {
+                        snapshot_name: "live",
+                        live_path: live.clone(),
+                        writer: write_then_ok("new"),
+                    }],
+                    || Ok(()),
+                )
+                .unwrap();
+            });
+
+            let kept = snapshot_dirs("ticket77");
+            let names: Vec<String> = kept
+                .iter()
+                .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(kept.len(), 10, "应只留最近 10 份: {names:?}");
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n == "ticket77-20200101T000000.000000Z"),
+                "无后缀同微秒目录更旧，应被清理: {names:?}"
+            );
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == "ticket77-20200101T000000.000000Z-1"),
+                "带 -n 后缀的同微秒目录应视为更新而保留: {names:?}"
+            );
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == "ticket77-20260607T080910.000001Z"),
+                "本次切换快照应保留: {names:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn snapshot_prune_failure_does_not_fail_swap() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+            let root = AppPaths::resolve().unwrap().snapshots_dir();
+            let oldest = plant_snapshot_dir(&root, "ticket77-20200101T000000.000000Z", "oldest");
+            for day in 2..=10 {
+                plant_snapshot_dir(
+                    &root,
+                    &format!("ticket77-202001{day:02}T000000.000000Z"),
+                    "kept",
+                );
+            }
+
+            #[cfg(windows)]
+            let _held = {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(oldest.join("live"))
+                    .unwrap()
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&oldest, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+
+            let result = swap_with_snapshot(
+                "ticket77",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("new"),
+                }],
+                || Ok(()),
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&oldest, fs::Permissions::from_mode(0o755));
+            }
+
+            result.expect("清理失败不得阻断切换");
+            assert_eq!(fs::read_to_string(&live).unwrap(), "new");
+            assert!(
+                oldest.is_dir(),
+                "删不掉的最旧快照应仍在: {}",
+                oldest.display()
+            );
         });
     }
 }

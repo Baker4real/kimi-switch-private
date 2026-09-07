@@ -57,8 +57,8 @@ impl FileBlobRuntime for KimiRuntime {
     fn proactive_renewal_reject(&self, home: &Path, blob: &str) -> Result<Error> {
         oauth::proactive_renewal_reject(home, blob)
     }
-    fn proactive_renewal_rotated(&self, home: &Path) -> Result<()> {
-        oauth::proactive_renewal_rotated(home)
+    fn proactive_renewal_rotated(&self, home: &Path, blob: &str) -> Result<()> {
+        oauth::proactive_renewal_rotated(home, blob)
     }
 }
 

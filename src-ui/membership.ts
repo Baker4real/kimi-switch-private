@@ -10,10 +10,10 @@ export interface MembershipFields {
 /** 档位行展示 HTML（总览与账号卡共用）。
  *
  * - 有档位 + 到期日：只档位名（日期改由会员轨道右列承担，#60）
- * - 有档位无到期日 + hint：`档位 <span class="plan-expiry">绑定后可显示有效期</span>`
- *   （弱提示，非错误红；#49 票面原文，从未绑定不回归）
+ * - 有档位无到期日 + hint：`档位 <span class="plan-expiry">绑定后可显示会员到期</span>`
+ *   （弱提示，非错误红；概念名「会员到期」，从未绑定不回归）
  * - 有档位 + 到期日 + hint（刷新失败缓存降级）：仍只档位名，不写常驻
- *   「重新绑定后可刷新有效期」；重新绑定入口在按钮（#63）
+ *   「重新绑定后可更新会员到期」；重新绑定入口在按钮（#63）
  * - 无档位（无额度数据）：返回 null，调用方保持现状，不强加提示
  *
  * 日期由 Rust 侧格式化为东八区日历日，前端只拼接不解析。 */
@@ -27,7 +27,7 @@ export function membershipPlanHtml(row: MembershipFields): string | null {
     return plan;
   }
   if (row.membership_expiry_hint) {
-    return `${plan} <span class="plan-expiry">绑定后可显示有效期</span>`;
+    return `${plan} <span class="plan-expiry">绑定后可显示会员到期</span>`;
   }
   return plan;
 }
@@ -49,7 +49,7 @@ export function bindWebButtonHtml(
   const label = rebind ? "重新绑定" : "绑定";
   const title = rebind
     ? "重新绑定网页登录，覆盖旧网页 token"
-    : "绑定网页登录，刷新会员有效期";
+    : "绑定网页登录，更新会员到期";
   const disabled = busy ? " disabled" : "";
   return `<button class="profile-pill plan-bind" data-bind="${escapeHtml(row.id)}" type="button" title="${title}"${disabled}>${label}</button>`;
 }

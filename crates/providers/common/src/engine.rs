@@ -555,7 +555,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                     &new_blob,
                 )?;
                 Self::write_blob(&self.live_path(), &new_blob)?;
-                self.runtime.proactive_renewal_rotated(&self.home)?;
+                self.runtime.proactive_renewal_rotated(&self.home, &live)?;
                 Ok(new_blob)
             }
             RefreshOutcome::DeadToken => {
@@ -568,11 +568,20 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// parked 账号刷新一次并写回 store。返回 `Some(新 blob)` 表示已轮换。
+    ///
+    /// DeadToken（issue #80）：复用当前账号主动续期的指纹纪律——发前若指纹在案则跳过
+    /// refresh；被拒时记录指纹并停止后续重试。查询仍用现有 access token 继续（不把
+    /// 停泊路径改成凭证过期硬失败）。
     async fn refresh_parked_if_needed(
         &self,
         account: &Account,
         raw: &str,
     ) -> Result<Option<String>> {
+        // DeadToken 纪律：指纹在案 → 停止重试，继续用现有 access token 查询。
+        if self.runtime.proactive_renewal_blocked(&self.home, raw) {
+            tracing::warn!(account = %account.id, "refresh token dead; skip retry");
+            return Ok(None);
+        }
         match self.runtime.refresh(raw).await? {
             RefreshOutcome::Rotated(new_blob) => {
                 self.store.set(
@@ -585,6 +594,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             }
             RefreshOutcome::DeadToken => {
                 tracing::warn!(account = %account.id, "refresh token dead; needs re-login");
+                // 记录指纹后仍返回 None：本次查询继续用旧 access token。
+                let _ = self.runtime.proactive_renewal_reject(&self.home, raw)?;
                 Ok(None)
             }
             RefreshOutcome::Unsupported => Ok(None),
@@ -629,6 +640,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -655,6 +667,8 @@ mod tests {
         proactive_wanted: bool,
         /// 模拟官方在判定期间抢先改写 live：wanted 判定时把 live 改成这份 blob。
         official_live_during_wanted: Option<String>,
+        /// 这些 uid 的 refresh 一律 DeadToken，便于同一 runtime 里混测「当前号轮换 / 停泊死号」。
+        dead_uids: HashSet<String>,
     }
 
     impl FakeRuntime {
@@ -672,6 +686,7 @@ mod tests {
                 dedup_extra_key: "dedup_key",
                 proactive_wanted: false,
                 official_live_during_wanted: None,
+                dead_uids: HashSet::new(),
             }
         }
 
@@ -728,6 +743,12 @@ mod tests {
         }
         async fn refresh(&self, blob: &str) -> Result<RefreshOutcome> {
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            let uid = serde_json::from_str::<serde_json::Value>(blob)
+                .ok()
+                .and_then(|v| v.get("uid")?.as_str().map(str::to_string));
+            if uid.as_deref().is_some_and(|id| self.dead_uids.contains(id)) {
+                return Ok(RefreshOutcome::DeadToken);
+            }
             Ok(match self.refresh_behavior {
                 RefreshBehavior::Unsupported => RefreshOutcome::Unsupported,
                 RefreshBehavior::Dead => RefreshOutcome::DeadToken,
@@ -756,28 +777,65 @@ mod tests {
             self.proactive_wanted
         }
 
-        // 测试版 DeadToken 纪律：指纹文件 = home/fake-dead-refresh，内容直接是
-        // refresh token 原文（测试不需要哈希）。
+        // 测试版 DeadToken 纪律：指纹文件 = home/fake-dead-refresh，一行一个 refresh
+        // token 原文（测试不需要哈希）；旧版整文件一个 token 读取时仍算成员。
         fn proactive_renewal_blocked(&self, home: &Path, blob: &str) -> bool {
-            let Ok(recorded) = fs::read_to_string(home.join("fake-dead-refresh")) else {
+            let Some(refresh) = extract_refresh_token(blob) else {
                 return false;
             };
-            extract_refresh_token(blob).as_deref() == Some(recorded.trim())
+            load_fake_dead_refresh(home).contains(&refresh)
         }
 
         fn proactive_renewal_reject(&self, home: &Path, blob: &str) -> Result<Error> {
             if let Some(refresh) = extract_refresh_token(blob) {
-                fs::write(home.join("fake-dead-refresh"), refresh)?;
+                let mut fingerprints = load_fake_dead_refresh(home);
+                fingerprints.insert(refresh);
+                persist_fake_dead_refresh(home, &fingerprints)?;
             }
             Ok(Error::quota_credential_expired("凭证已过期（fake 引导）"))
         }
 
-        fn proactive_renewal_rotated(&self, home: &Path) -> Result<()> {
-            match fs::remove_file(home.join("fake-dead-refresh")) {
+        fn proactive_renewal_rotated(&self, home: &Path, blob: &str) -> Result<()> {
+            let Some(refresh) = extract_refresh_token(blob) else {
+                return Ok(());
+            };
+            let mut fingerprints = load_fake_dead_refresh(home);
+            if fingerprints.remove(&refresh) {
+                persist_fake_dead_refresh(home, &fingerprints)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn fake_dead_refresh_path(home: &Path) -> PathBuf {
+        home.join("fake-dead-refresh")
+    }
+
+    fn load_fake_dead_refresh(home: &Path) -> HashSet<String> {
+        match fs::read_to_string(fake_dead_refresh_path(home)) {
+            Ok(recorded) => recorded
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    fn persist_fake_dead_refresh(home: &Path, fingerprints: &HashSet<String>) -> Result<()> {
+        let path = fake_dead_refresh_path(home);
+        if fingerprints.is_empty() {
+            match fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.into()),
             }
+        } else {
+            let mut lines: Vec<&str> = fingerprints.iter().map(String::as_str).collect();
+            lines.sort_unstable();
+            fs::write(&path, lines.join("\n"))?;
+            Ok(())
         }
     }
 
@@ -1490,6 +1548,139 @@ mod tests {
         );
     }
 
+    /// 停泊 DeadToken（issue #80）：被拒后记录指纹并停止重试，但本次及后续查询仍用旧 access token
+    /// （与当前账号主动续期「查询按凭证过期呈现」不同）。
+    #[tokio::test]
+    async fn query_quota_parked_dead_token_records_fingerprint_and_stops_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Dead);
+        let p = provider_with(tmp.path(), runtime);
+        let old = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let account = p.import_raw(old.into(), None, Some(false)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_to_string(p.test_home().join("fake-dead-refresh")).unwrap(),
+            "R1",
+            "被拒 refresh token 的指纹必须记录在案"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("OLD"),
+            "DeadToken 后仍用旧 access token 查询"
+        );
+        assert_eq!(p.test_store_get("u1").unwrap(), old, "账号库凭证保持不动");
+
+        // 停止重试：再次查询不再发起 refresh，仍用旧 token 查询。
+        p.query_quota(&account.id).await.unwrap();
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            1,
+            "指纹在案必须停止重试"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("OLD"),
+            "停试后查询仍须发生且仍用旧 access token"
+        );
+    }
+
+    /// 两停泊号先后 DeadToken：两者都停试；后写不得覆盖前一个指纹。
+    #[tokio::test]
+    async fn query_quota_two_parked_dead_tokens_both_stop_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Dead);
+        let p = provider_with(tmp.path(), runtime);
+        let blob1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD1"}"#;
+        let blob2 = r#"{"uid":"u2","refresh_token":"R2","access_token":"OLD2"}"#;
+        let a1 = p.import_raw(blob1.into(), None, Some(false)).unwrap();
+        let a2 = p.import_raw(blob2.into(), None, Some(false)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        p.query_quota(&a1.id).await.unwrap();
+        p.query_quota(&a2.id).await.unwrap();
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 2);
+
+        let recorded = fs::read_to_string(p.test_home().join("fake-dead-refresh")).unwrap();
+        let members: HashSet<&str> = recorded
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert!(
+            members.contains("R1") && members.contains("R2"),
+            "后写不得覆盖前一个指纹，两停泊号都应在案：{recorded}"
+        );
+
+        p.query_quota(&a1.id).await.unwrap();
+        p.query_quota(&a2.id).await.unwrap();
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            2,
+            "两停泊死号都必须停试，不得因后写覆盖而再次 refresh"
+        );
+        assert_eq!(p.test_store_get("u1").unwrap(), blob1);
+        assert_eq!(p.test_store_get("u2").unwrap(), blob2);
+    }
+
+    /// 当前账号轮换成功后，另一停泊死号不得再 refresh（不得 unlink 整份指纹文件）。
+    #[tokio::test]
+    async fn proactive_renewal_success_does_not_retry_other_parked_dead_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
+        runtime.dead_uids.insert("u2".into());
+        let p = provider_with(tmp.path(), runtime);
+        let active_blob = r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD"}"#;
+        let parked_blob = r#"{"uid":"u2","refresh_token":"R2","access_token":"PARKED"}"#;
+        let active = p.import_raw(active_blob.into(), None, Some(true)).unwrap();
+        let parked = p.import_raw(parked_blob.into(), None, Some(false)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), active_blob).unwrap();
+
+        p.query_quota(&parked.id).await.unwrap();
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 1);
+        let recorded = fs::read_to_string(p.test_home().join("fake-dead-refresh")).unwrap();
+        assert!(
+            recorded.lines().any(|line| line.trim() == "R2"),
+            "停泊死号指纹必须在案：{recorded}"
+        );
+
+        p.query_quota(&active.id).await.unwrap();
+        let recorded = fs::read_to_string(p.test_home().join("fake-dead-refresh")).unwrap();
+        assert!(
+            recorded.lines().any(|line| line.trim() == "R2"),
+            "当前账号轮换成功不得清掉其他停泊死号指纹：{recorded}"
+        );
+
+        p.query_quota(&parked.id).await.unwrap();
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            2,
+            "当前账号轮换成功后，已死停泊号不得再 refresh（一次停泊 DeadToken + 一次当前号轮换）"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("PARKED"),
+            "停泊死号后续查询仍用旧 access token"
+        );
+    }
+
     // --- query_quota：当前账号主动续期（issue #44，ADR-0003 第 2 条）---
 
     /// 三分支之「轮换成功」：runtime 判定临期 → 查询前先轮换，新 blob 先落库再写回
@@ -1517,7 +1708,11 @@ mod tests {
             "查询必须使用轮换后的 access token"
         );
         let rotated = r#"{"uid":"u1","access_token":"ROTATED"}"#;
-        assert_eq!(p.test_store_get("u1").unwrap(), rotated, "新凭证必须落账号库");
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            rotated,
+            "新凭证必须落账号库"
+        );
         assert_eq!(
             fs::read_to_string(p.test_live_path()).unwrap(),
             rotated,
@@ -1669,7 +1864,11 @@ mod tests {
             Some("OFFICIAL"),
             "查询改用官方刚轮换的最新凭证"
         );
-        assert_eq!(p.test_store_get("u1").unwrap(), official, "采纳后回灌账号库");
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            official,
+            "采纳后回灌账号库"
+        );
         assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), official);
     }
 
@@ -1707,9 +1906,9 @@ mod tests {
         assert_eq!(p.test_store_get("u1").unwrap(), old, "账号库保持不动");
     }
 
-    /// 轮换成功收尾：旧拒止指纹（对应更早前被拒、已作废的 refresh）随之清除。
+    /// 轮换成功收尾：只清掉这次轮换前 blob 的指纹；其它账号的拒止指纹保留。
     #[tokio::test]
-    async fn proactive_renewal_success_clears_stale_dead_fingerprint() {
+    async fn proactive_renewal_success_clears_only_rotated_blob_fingerprint() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime = FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
         let p = provider_with(tmp.path(), runtime);
@@ -1717,14 +1916,19 @@ mod tests {
         let account = p.import_raw(old.into(), None, Some(true)).unwrap();
         fs::create_dir_all(p.test_home()).unwrap();
         fs::write(p.test_live_path(), old).unwrap();
-        // 旧指纹对应已作废的 R0，不命中当前 R1，不阻塞本次轮换。
+        // 另一停泊死号的指纹；不命中当前 R1，不阻塞本次轮换。
         fs::write(p.test_home().join("fake-dead-refresh"), "R0").unwrap();
 
         p.query_quota(&account.id).await.unwrap();
 
+        let recorded = fs::read_to_string(p.test_home().join("fake-dead-refresh")).unwrap();
         assert!(
-            !p.test_home().join("fake-dead-refresh").exists(),
-            "成功轮换后旧指纹作废清除"
+            recorded.lines().any(|line| line.trim() == "R0"),
+            "当前账号轮换成功不得清掉其他拒止指纹：{recorded}"
+        );
+        assert!(
+            !recorded.lines().any(|line| line.trim() == "R1"),
+            "不得把当前号指纹误写入：{recorded}"
         );
     }
 
@@ -1755,7 +1959,12 @@ mod tests {
             account.extra = expected_extra.clone();
             p.test_registry_upsert(account).unwrap();
             store
-                .set("fake", uid, "blob", &format!(r#"{{"uid":"{uid}","access_token":"A1"}}"#))
+                .set(
+                    "fake",
+                    uid,
+                    "blob",
+                    &format!(r#"{{"uid":"{uid}","access_token":"A1"}}"#),
+                )
                 .unwrap();
             store
                 .set("fake", uid, "web", &format!("web-token-{uid}"))

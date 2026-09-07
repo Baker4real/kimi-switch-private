@@ -25,6 +25,9 @@ describe("webBindCopy", () => {
     expect(copy).toContain("工作机");
     expect(copy).toContain("access_token");
     expect(copy).toContain("www.kimi.com");
-    expect(copy).toContain("会员有效期");
+    expect(copy).toContain("会员到期");
+    expect(copy).toContain("这张卡可显示会员到期");
+    expect(copy).not.toContain("会员有效期");
+    expect(copy).not.toContain("有效期");
   });
 });

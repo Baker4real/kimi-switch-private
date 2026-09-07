@@ -28,13 +28,13 @@ describe("membershipRefreshToast", () => {
 
   it("单卡用显示名拼一条普通文案", () => {
     expect(membershipRefreshToast([row({ display_name: "Forever" })])).toBe(
-      "会员有效期未更新：Forever 网页登录已失效，可重新绑定",
+      "会员到期未更新：Forever 网页登录已失效，可重新绑定",
     );
   });
 
   it("别名兜底的显示名同样直接使用", () => {
     expect(membershipRefreshToast([row({ display_name: "工作机" })])).toBe(
-      "会员有效期未更新：工作机 网页登录已失效，可重新绑定",
+      "会员到期未更新：工作机 网页登录已失效，可重新绑定",
     );
   });
 
@@ -44,7 +44,7 @@ describe("membershipRefreshToast", () => {
         row({ display_name: "Forever" }),
         row({ display_name: "工作机" }),
       ]),
-    ).toBe("会员有效期未更新：Forever、工作机 网页登录已失效，可重新绑定");
+    ).toBe("会员到期未更新：Forever、工作机 网页登录已失效，可重新绑定");
   });
 
   it("从未绑定（hint 亮但无到期日）不纳入", () => {
@@ -58,7 +58,7 @@ describe("membershipRefreshToast", () => {
         row({ display_name: "Forever" }),
         row({ membership_expiry: null, membership_expiry_hint: true, display_name: "新卡" }),
       ]),
-    ).toBe("会员有效期未更新：Forever 网页登录已失效，可重新绑定");
+    ).toBe("会员到期未更新：Forever 网页登录已失效，可重新绑定");
   });
 });
 
@@ -71,7 +71,7 @@ describe("afterUserQuotaRefreshSuccess", () => {
     expect(toast).toHaveBeenCalledTimes(2);
     expect(toast).toHaveBeenNthCalledWith(
       1,
-      "会员有效期未更新：Forever 网页登录已失效，可重新绑定",
+      "会员到期未更新：Forever 网页登录已失效，可重新绑定",
     );
     expect(toast.mock.calls[0]).toHaveLength(1);
   });
@@ -88,7 +88,7 @@ describe("runUserQuotaRefresh", () => {
     const order: string[] = [];
     const snapshot = {
       accounts: [row({ display_name: "Forever" })],
-      message: { text: "刚刚更新过", tone: "info" as const },
+      message: { text: "刚刚更新过", tone: "info" as const, kind: "generic" as const },
     };
     await runUserQuotaRefresh({
       list: async () => snapshot,
@@ -105,7 +105,7 @@ describe("runUserQuotaRefresh", () => {
     expect(order).toEqual([
       "apply",
       "msg:刚刚更新过",
-      "toast:会员有效期未更新：Forever 网页登录已失效，可重新绑定",
+      "toast:会员到期未更新：Forever 网页登录已失效，可重新绑定",
     ]);
   });
 

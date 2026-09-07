@@ -7,7 +7,7 @@ intent: Install and use the Kimi Code account switcher GUI and CLI.
 # kimi-switch · Kimi 换号器
 
 [Kimi Code](https://www.kimi.com/) 多账号管理工具：浏览器授权添加账号、一键切换、额度一目了然。
-提供 Windows 图形界面和命令行两个版本，单文件 exe、无运行时依赖。
+以 Windows 为主：图形界面和命令行两个版本，单文件 exe、无运行时依赖。
 
 ![深色主题](docs/screenshot-dark.png)
 
@@ -39,7 +39,7 @@ intent: Install and use the Kimi Code account switcher GUI and CLI.
 需要 Rust 1.80+ 和 Node.js（图形界面）：
 
 ```bash
-git clone https://github.com/Baker4real/kimi-switch-private.git
+git clone https://github.com/yuan2627/kimi-switch.git
 cd kimi-switch
 cargo build --release -p kimi-switch-cli
 npm install
@@ -78,7 +78,17 @@ kimi-switch-cli bind-web <编号或id>  # 从 stdin 读网页 token，绑定后�
 kimi-switch-cli config           # 打印生效设置（只读，与 GUI 设置页同源）
 ```
 
-GUI 与 CLI 共用同一份账号库和设置（`%APPDATA%\kimi-switch\`），可以混用。
+GUI 与 CLI 共用同一份账号库和设置，可以混用。
+
+### 数据目录
+
+本工具以 Windows 为主。默认目录：
+
+- 配置（账号库 `registry.toml`、设置 `config.toml`）：`%APPDATA%\kimi-switch\kimi-switch\config`
+- 数据（凭证 `credentials.json`、审计日志）：`%APPDATA%\kimi-switch\kimi-switch\data`
+- 缓存（额度查询缓存）：`%LOCALAPPDATA%\kimi-switch\kimi-switch\cache`
+
+也可设置绝对路径环境变量 `KIMI_SWITCH_HOME`，把配置、数据、状态与缓存全部收口到该目录下的 `config` / `data` / `cache`。
 
 ## 常见问题
 
@@ -86,7 +96,7 @@ GUI 与 CLI 共用同一份账号库和设置（`%APPDATA%\kimi-switch\`），�
 不需要。凭证是每次请求时读取的，切换即时生效。
 
 **账号库的凭证安全吗？**
-所有 token 只存在你自己的电脑上（`%APPDATA%\kimi-switch\` 下的私有文件），不会上传到任何第三方服务器。源码中唯一的网络请求发往 Kimi 官方域名：授权、额度与官方昵称走 `auth.kimi.com` / `api.kimi.com`，绑定网页登录读取会员到期才访问 `www.kimi.com`。
+所有 token 只存在你自己的电脑上（`%APPDATA%\kimi-switch\kimi-switch\data` 下的私有文件），不会上传到任何第三方服务器。源码中唯一的网络请求发往 Kimi 官方域名：授权、额度与官方昵称走 `auth.kimi.com` / `api.kimi.com`，绑定网页登录读取会员到期才访问 `www.kimi.com`。
 
 **账号放久了切换过去提示 401？**
 refresh token 有有效期，长期未使用的账号凭证会过期。在账号库对那张卡点「授权」重走一次浏览器登录即可救活，无需删除重加。

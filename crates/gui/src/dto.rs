@@ -7,6 +7,7 @@ pub const URGENT_USED_RATIO: f32 = 0.8;
 
 const UI_STYLES: &str = include_str!("../../../src-ui/styles.css");
 const UI_QUOTA_TS: &str = include_str!("../../../src-ui/quota.ts");
+const UI_API_TS: &str = include_str!("../../../src-ui/api.ts");
 
 /// 额度条压力色；serde 为 `ok` / `warn` / `high` / `full`，对应 CSS `.quota-fill--*`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -63,6 +64,31 @@ const fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+const fn all_needles_present(haystack: &[u8], needles: &[&[u8]]) -> bool {
+    let mut i = 0;
+    while i < needles.len() {
+        if !slice_contains(haystack, needles[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// 钉住前端字段声明 `  name:`，后端删改字段名时须同步改此列表，编译或 JSON 键测试变红。
+macro_rules! pin_dto_fields {
+    ($keys:ident, $src:expr, $($field:literal),+ $(,)?) => {
+        #[cfg(test)]
+        pub(crate) const $keys: &'static [&'static str] = &[$($field),+];
+        $(
+            const _: () = assert!(
+                slice_contains($src.as_bytes(), concat!("  ", $field, ":").as_bytes()),
+                concat!("frontend DTO missing field ", $field)
+            );
+        )+
+    };
+}
+
 const fn quota_tones_match_css() -> bool {
     let mut i = 0;
     while i < QuotaTone::ALL.len() {
@@ -88,6 +114,80 @@ const _: () = assert!(
     ),
     "src-ui/quota.ts Tone union must match QuotaTone"
 );
+const _: () = assert!(
+    slice_contains(
+        UI_API_TS.as_bytes(),
+        br#"export type MessageTone = "ok" | "err" | "info";"#,
+    ),
+    "src-ui/api.ts MessageTone union must match MessageTone"
+);
+const _: () = assert!(
+    slice_contains(
+        UI_API_TS.as_bytes(),
+        br#""generic" | "auto_swap_success" | "auto_swap_no_candidate" | "auto_swap_failed";"#,
+    ),
+    "src-ui/api.ts UiMessageKind union must match UiMessageKind"
+);
+const _: () = assert!(
+    slice_contains(UI_API_TS.as_bytes(), b"  kind: UiMessageKind;"),
+    "src-ui/api.ts UiMessage.kind must be UiMessageKind"
+);
+const _: () = assert!(
+    slice_contains(UI_API_TS.as_bytes(), b"  tone: MessageTone;"),
+    "src-ui/api.ts UiMessage.tone must be MessageTone"
+);
+const _: () = assert!(
+    all_needles_present(
+        UI_API_TS.as_bytes(),
+        &[
+            br#"import type { QuotaView } from "./quota";"#,
+            b"quotas: QuotaView[]",
+        ],
+    ),
+    "src-ui/api.ts must import QuotaView and use it on AccountRow"
+);
+
+pin_dto_fields!(
+    QUOTA_VIEW_JSON_KEYS,
+    UI_QUOTA_TS,
+    "window",
+    "ratio",
+    "text",
+    "reset",
+    "tone",
+);
+pin_dto_fields!(
+    ACCOUNT_ROW_JSON_KEYS,
+    UI_API_TS,
+    "id",
+    "label",
+    "active",
+    "membership",
+    "membership_expiry",
+    "membership_remaining_days",
+    "membership_period_days",
+    "membership_expiry_hint",
+    "quotas",
+    "error",
+    "credential_expired",
+    "cached_at",
+    "display_name",
+    "official_nickname_known",
+);
+pin_dto_fields!(
+    SNAPSHOT_JSON_KEYS,
+    UI_API_TS,
+    "accounts",
+    "current_label",
+    "account_count",
+    "urgent_count",
+    "theme",
+    "proactive_renewal",
+    "auto_swap",
+    "auto_swap_prefer_lower_tier",
+    "message",
+);
+pin_dto_fields!(UI_MESSAGE_JSON_KEYS, UI_API_TS, "text", "tone", "kind",);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -179,11 +279,111 @@ impl AccountRow {
     }
 }
 
+/// 快照 toast 严重度；serde 为 `ok` / `err` / `info`。未知值前端不得当完成吞掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageTone {
+    Ok,
+    Err,
+    Info,
+}
+
+impl MessageTone {
+    pub const ALL: [Self; 3] = [Self::Ok, Self::Err, Self::Info];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Err => "err",
+            Self::Info => "info",
+        }
+    }
+}
+
+/// 快照 toast 语义；serde 为 snake_case。自动切换通知靠 kind 过滤，不靠中文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiMessageKind {
+    /// 导入、切换、绑定、节流提示等普通 toast。
+    Generic,
+    AutoSwapSuccess,
+    AutoSwapNoCandidate,
+    AutoSwapFailed,
+}
+
+impl UiMessageKind {
+    pub const ALL: [Self; 4] = [
+        Self::Generic,
+        Self::AutoSwapSuccess,
+        Self::AutoSwapNoCandidate,
+        Self::AutoSwapFailed,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::AutoSwapSuccess => "auto_swap_success",
+            Self::AutoSwapNoCandidate => "auto_swap_no_candidate",
+            Self::AutoSwapFailed => "auto_swap_failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UiMessage {
     pub text: String,
-    /// `ok` / `err` / `info`
-    pub tone: String,
+    pub tone: MessageTone,
+    pub kind: UiMessageKind,
+}
+
+impl UiMessage {
+    pub fn ok(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: MessageTone::Ok,
+            kind: UiMessageKind::Generic,
+        }
+    }
+
+    pub fn err(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: MessageTone::Err,
+            kind: UiMessageKind::Generic,
+        }
+    }
+
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: MessageTone::Info,
+            kind: UiMessageKind::Generic,
+        }
+    }
+
+    pub fn auto_swap_success(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: MessageTone::Ok,
+            kind: UiMessageKind::AutoSwapSuccess,
+        }
+    }
+
+    pub fn auto_swap_no_candidate() -> Self {
+        Self {
+            text: "没有可自动切换的账号".into(),
+            tone: MessageTone::Err,
+            kind: UiMessageKind::AutoSwapNoCandidate,
+        }
+    }
+
+    pub fn auto_swap_failed() -> Self {
+        Self {
+            text: "自动切换失败".into(),
+            tone: MessageTone::Err,
+            kind: UiMessageKind::AutoSwapFailed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

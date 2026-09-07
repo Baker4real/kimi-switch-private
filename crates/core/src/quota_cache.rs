@@ -8,7 +8,9 @@
 //! 缓存是可丢弃数据，读写失败静默忽略。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -84,10 +86,10 @@ impl QuotaCache {
             .unwrap_or_default()
     }
 
-    /// 将缓存写入文件；失败静默忽略（缓存是可丢弃数据）。
+    /// 将缓存写入文件。同目录 tmp+rename，避免并发写撕裂；失败静默忽略（缓存是可丢弃数据）。
     pub fn save(&self, path: &Path) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+            let _ = save_atomically(path, json.as_bytes());
         }
     }
 
@@ -222,6 +224,41 @@ fn failure_backoff(
 ) -> std::time::Duration {
     let shift = consecutive.saturating_sub(1).min(16);
     base.saturating_mul(1_u32 << shift).min(cap.max(base))
+}
+
+/// 同目录唯一临时文件 + rename。Unix 创建即 0600。
+fn save_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = unique_tmp_path(path);
+    let result = (|| {
+        write_private(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp.{}.{}", std::process::id(), seq));
+    PathBuf::from(name)
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 fn cache_key(provider: &str, account_id: &str) -> String {
@@ -438,5 +475,128 @@ mod tests {
         assert!(cache
             .fresh("alpha", "a@x.com", std::time::Duration::from_secs(90))
             .is_none());
+    }
+
+    fn fat_quotas(n: usize) -> Vec<Quota> {
+        (0..n).map(|_| sample_quota()).collect()
+    }
+
+    /// GUI/CLI 会并发 `save`；直接 `fs::write` 会把文件撕成半截 JSON。
+    /// 半截文件被 `load` 当成空缓存，失败退避表消失，调用方会立刻重新打网。
+    #[test]
+    fn concurrent_saves_keep_valid_json_and_backoff_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota_cache.json");
+
+        let mut writer_a = QuotaCache::default();
+        writer_a.record_failure(
+            "alpha",
+            "writer-a",
+            &Error::quota_http(429, "429 rate limited"),
+        );
+        writer_a.set("alpha", "acct-a", fat_quotas(24));
+        writer_a.save(&path);
+
+        let mut writer_b = QuotaCache::default();
+        writer_b.record_failure(
+            "alpha",
+            "writer-b",
+            &Error::quota_http(429, "429 rate limited"),
+        );
+        writer_b.set("alpha", "acct-b", fat_quotas(48));
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let torn = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let watch_path = path.clone();
+        let watch_stop = stop.clone();
+        let watch_torn = torn.clone();
+        let watcher = std::thread::spawn(move || {
+            while !watch_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match std::fs::read_to_string(&watch_path) {
+                    Ok(raw) => {
+                        if raw.is_empty()
+                            || serde_json::from_str::<serde_json::Value>(&raw).is_err()
+                        {
+                            *watch_torn.lock().unwrap() = Some(raw);
+                            break;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let handle_a = std::thread::spawn(move || {
+            for _ in 0..300 {
+                writer_a.save(&path_a);
+            }
+        });
+        let handle_b = std::thread::spawn(move || {
+            for _ in 0..300 {
+                writer_b.save(&path_b);
+            }
+        });
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        watcher.join().unwrap();
+
+        if let Some(snippet) = torn.lock().unwrap().as_ref() {
+            panic!("concurrent saves tore cache into invalid JSON; snippet={snippet:?}");
+        }
+
+        let raw =
+            std::fs::read_to_string(&path).expect("cache file should exist after concurrent saves");
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|e| {
+            panic!("concurrent saves tore cache into invalid JSON: {e}; snippet={raw:?}");
+        });
+
+        let loaded = QuotaCache::load(&path);
+        let base = std::time::Duration::from_secs(90);
+        let cap = std::time::Duration::from_secs(900);
+        let backoff_a = loaded
+            .in_failure_backoff("alpha", "writer-a", base, cap)
+            .is_some();
+        let backoff_b = loaded
+            .in_failure_backoff("alpha", "writer-b", base, cap)
+            .is_some();
+        assert!(
+            backoff_a || backoff_b,
+            "torn cache loads as empty and skips failure backoff, which would immediately re-query"
+        );
+    }
+
+    /// 损坏文件必须自愈为空缓存，不能让调用方当成「有退避」或 panic。
+    #[test]
+    fn load_heals_corrupt_file_as_empty_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota_cache.json");
+        std::fs::write(&path, "{\"entries\":").unwrap();
+        let loaded = QuotaCache::load(&path);
+        assert!(loaded.get("alpha", "a@x.com").is_none());
+        assert!(loaded
+            .in_failure_backoff(
+                "alpha",
+                "a@x.com",
+                std::time::Duration::from_secs(90),
+                std::time::Duration::from_secs(900)
+            )
+            .is_none());
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_cache_file_with_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota_cache.json");
+        let mut cache = QuotaCache::default();
+        cache.set("alpha", "a@x.com", vec![sample_quota()]);
+        cache.save(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "quota cache file must be 0600");
     }
 }

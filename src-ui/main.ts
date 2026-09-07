@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import "./styles.css";
 import { api, commandError, type Snapshot } from "./api";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
@@ -5,9 +6,21 @@ import { escapeHtml } from "./escape";
 import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
-import { autoSwapPreferLowerTierSwitchView, autoSwapSwitchView, silentQuotaMessage } from "./auto-swap";
+import { autoSwapPreferLowerTierSwitchView, autoSwapSwitchView } from "./auto-swap";
+import { createSilentQuotaScheduler } from "./silent-quota";
 import { renewalSwitchView } from "./renewal";
-import { createAppStore } from "./store";
+import {
+  accountFocusAttr,
+  createAppStore,
+  listedActionSelector,
+  listFocusKey,
+  pickRestoredFocus,
+  setListedActionsBusy,
+  snapshotAnnouncement,
+  toastDismissMs,
+  type ListFocusKey,
+  type SnapshotAnnounceSource,
+} from "./store";
 import {
   parseMirroredTheme,
   persistThemeMirror,
@@ -27,25 +40,53 @@ const BUSY_BUTTON_IDS = [
   "import-button",
   "refresh-button",
   "overview-retry-button",
+  "library-retry-button",
+  "rename-retry-button",
+  "bind-retry-button",
+  "delete-retry-button",
+  "auth-retry-button",
 ] as const;
 
 const routes: Route[] = ["overview", "library", "settings"];
 const store = createAppStore();
 let renameId = "";
 let deleteId = "";
+/** 忙碌禁用可能把焦点打到 body；重建后按此 data-* 身份恢复。 */
+let pendingListFocus: ListFocusKey | null = null;
 // 绑定网页登录（issue #51）的目标账号 id：仅对话框打开期间持有，token 不落这里。
 let bindId = "";
 // 最近一次打开授权对话框的流程类型：仅用于取消时的 toast 文案区分
 let authIsReauth = false;
+/** 最近一次操作失败的中文原因，供就近重试面板复用。 */
+let lastActionError = "";
+/** 账号库切换失败后的就近重试；点按钮即复用刚才那次切换。 */
+let libraryRetry: (() => void) | null = null;
+/** 授权失败后复用同一目标，避免回列表再找。 */
+let lastAuth: { target: string | null; displayName: string } | null = null;
+/** deviceAuth 失败也会调 close；为 true 时拦住，让对话框留着就近重试。 */
+let authHoldOpen = false;
 let toastTimer = 0;
-// 与 core `QUOTA_MIN_REFRESH_INTERVAL_MS` 默认一致；前端拿不到运行时配置，不另做产品开关。
-const SILENT_QUOTA_INTERVAL_MS = 90_000;
-let snapshotGeneration = 0;
-let appliedGeneration = 0;
-let lastSnapshotAt = 0;
-let silentTimer = 0;
-let silentInFlight = false;
-let silentStopped = false;
+
+const silentQuota = createSilentQuotaScheduler({
+  clock: {
+    now: () => Date.now(),
+    setTimeout: (handler, delayMs) => window.setTimeout(handler, delayMs),
+    clearTimeout: (id) => {
+      window.clearTimeout(id);
+    },
+  },
+  host: {
+    isHidden: () => document.hidden,
+    isBusy: () => store.get().busy,
+    accountCount: () => {
+      const snapshot = store.get().snapshot;
+      return snapshot ? snapshot.accounts.length : null;
+    },
+    listAccounts: () => api.listAccounts(),
+    applySnapshot: (snapshot, generation) => applySnapshot(snapshot, generation),
+    toast: (text, isError) => showToast(text, isError),
+  },
+});
 
 function required<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -53,6 +94,198 @@ function required<T extends HTMLElement>(id: string): T {
     throw new Error(`缺少元素: ${id}`);
   }
   return el as T;
+}
+
+/** 字段控件：测试用假对象与真实 input/textarea 共用。 */
+export type FieldErrorInput = {
+  setAttribute(name: string, value: string): void;
+  removeAttribute(name: string): void;
+};
+
+/** 字段旁错误节点：显示文案并被 aria-describedby 指向。 */
+export type FieldErrorOutput = {
+  id: string;
+  textContent: string | null;
+  classList: { add(token: string): void; remove(token: string): void };
+};
+
+/** 把校验错误画在字段旁，并用 aria-describedby / aria-invalid 关联。 */
+export function paintFieldError(
+  input: FieldErrorInput,
+  errorEl: FieldErrorOutput,
+  message: string | null,
+): void {
+  if (message === null) {
+    errorEl.textContent = "";
+    errorEl.classList.add("hidden");
+    input.removeAttribute("aria-invalid");
+    return;
+  }
+  errorEl.textContent = message;
+  errorEl.classList.remove("hidden");
+  input.setAttribute("aria-invalid", "true");
+  input.setAttribute("aria-describedby", errorEl.id);
+}
+
+/** 别名校验：失败返回 null，调用方不得关对话框。 */
+export function evaluateRenameSubmit(
+  raw: string,
+  input: FieldErrorInput,
+  errorEl: FieldErrorOutput,
+): string | null {
+  const label = parseAliasInput(raw);
+  paintFieldError(input, errorEl, label === null ? "别名不能为空" : null);
+  return label;
+}
+
+/** 网页 token 校验：失败返回 null，调用方不得关对话框。 */
+export function evaluateBindSubmit(
+  raw: string,
+  input: FieldErrorInput,
+  errorEl: FieldErrorOutput,
+): string | null {
+  const token = parseWebToken(raw);
+  paintFieldError(input, errorEl, token === null ? "请先粘贴网页 token" : null);
+  return token;
+}
+
+/** 操作失败就近重试面板：与总览首载失败同一套「文案 + 重试」。 */
+export function paintActionRetry(
+  panel: { classList: { add(token: string): void; remove(token: string): void } },
+  textEl: { textContent: string | null },
+  message: string | null,
+): void {
+  if (message === null) {
+    textEl.textContent = "";
+    panel.classList.add("hidden");
+    return;
+  }
+  textEl.textContent = message;
+  panel.classList.remove("hidden");
+}
+
+function hideActionRetry(panelId: string, textId: string): void {
+  paintActionRetry(required(panelId), required(textId), null);
+}
+
+function showActionRetry(panelId: string, textId: string, message: string): void {
+  paintActionRetry(required(panelId), required(textId), message);
+}
+
+function hideLibraryRetry(): void {
+  libraryRetry = null;
+  hideActionRetry("library-action-error", "library-action-error-text");
+}
+
+function showLibraryRetry(message: string, retry: () => void): void {
+  libraryRetry = retry;
+  showActionRetry("library-action-error", "library-action-error-text", message);
+}
+
+/** 对话框内的绑定/重命名/删除：失败留在对话框里就近重试，成功才关。 */
+async function runDialogSnapshotAction(opts: {
+  label: string;
+  action: () => Promise<Snapshot>;
+  dialogId: string;
+  retryPanelId: string;
+  retryTextId: string;
+}): Promise<void> {
+  hideActionRetry(opts.retryPanelId, opts.retryTextId);
+  const ok = await runAction(opts.label, opts.action);
+  const dialog = required<HTMLDialogElement>(opts.dialogId);
+  if (ok) {
+    if (dialog.open) {
+      dialog.close();
+    }
+    return;
+  }
+  if (lastActionError === "" || !dialog.open) {
+    return;
+  }
+  showActionRetry(opts.retryPanelId, opts.retryTextId, lastActionError);
+}
+
+function submitRename(): void {
+  if (store.get().busy) {
+    return;
+  }
+  const input = required<HTMLInputElement>("rename-input");
+  const errorEl = required<HTMLElement>("rename-error");
+  const label = evaluateRenameSubmit(input.value, input, errorEl);
+  if (label === null) {
+    return;
+  }
+  const id = renameId;
+  void runDialogSnapshotAction({
+    label: "正在重命名…",
+    action: () => api.renameAccount(id, label),
+    dialogId: "rename-dialog",
+    retryPanelId: "rename-action-error",
+    retryTextId: "rename-action-error-text",
+  });
+}
+
+function submitBind(): void {
+  if (store.get().busy) {
+    return;
+  }
+  const input = required<HTMLTextAreaElement>("bind-token");
+  const errorEl = required<HTMLElement>("bind-token-error");
+  const token = evaluateBindSubmit(input.value, input, errorEl);
+  if (token === null) {
+    return;
+  }
+  const id = bindId;
+  void runDialogSnapshotAction({
+    label: "正在绑定…",
+    action: () => api.bindWebAccount(id, token),
+    dialogId: "bind-dialog",
+    retryPanelId: "bind-action-error",
+    retryTextId: "bind-action-error-text",
+  });
+}
+
+function submitDelete(): void {
+  if (store.get().busy) {
+    return;
+  }
+  void runDialogSnapshotAction({
+    label: "正在删除…",
+    action: () => api.removeAccount(deleteId),
+    dialogId: "delete-dialog",
+    retryPanelId: "delete-action-error",
+    retryTextId: "delete-action-error-text",
+  });
+}
+
+function listedActionButtons(): NodeListOf<HTMLButtonElement> {
+  return document.querySelectorAll<HTMLButtonElement>(
+    listedActionSelector(["#accounts-list", "#current-plan"]),
+  );
+}
+
+function captureListFocus(): ListFocusKey | null {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) {
+    return null;
+  }
+  const account = active.closest<HTMLElement>("[data-account]");
+  return listFocusKey(active.dataset, account?.dataset.account);
+}
+
+function rememberListFocus(): void {
+  pendingListFocus = captureListFocus() ?? pendingListFocus;
+}
+
+function restoreListFocus(key: ListFocusKey | null): void {
+  if (!key) {
+    return;
+  }
+  pickRestoredFocus(key, (selector) => document.querySelector<HTMLElement>(selector))?.focus();
+}
+
+function syncListedActionsBusy(): void {
+  setListedActionsBusy(listedActionButtons(), store.get().busy);
 }
 
 function applyTheme(theme: ThemeId): void {
@@ -102,12 +335,29 @@ function paintAutoSwapPreferLowerTier(autoSwapEnabled: boolean, preferLowerTier:
 }
 
 function showToast(text: string, isError = false): void {
-  const toast = required<HTMLDivElement>("toast");
-  toast.textContent = text;
-  toast.classList.toggle("is-error", isError);
-  toast.classList.remove("hidden");
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => toast.classList.add("hidden"), 3200);
+  const status = required<HTMLDivElement>("toast-status");
+  const alert = required<HTMLDivElement>("toast-alert");
+  if (isError) {
+    status.classList.add("hidden");
+    required<HTMLElement>("toast-alert-text").textContent = text;
+    alert.classList.remove("hidden");
+    toastTimer = window.setTimeout(() => {
+      alert.classList.add("hidden");
+    }, toastDismissMs(text, true));
+    return;
+  }
+  alert.classList.add("hidden");
+  status.textContent = text;
+  status.classList.remove("hidden");
+  toastTimer = window.setTimeout(() => {
+    status.classList.add("hidden");
+  }, toastDismissMs(text, false));
+}
+
+function dismissAlertToast(): void {
+  window.clearTimeout(toastTimer);
+  required<HTMLDivElement>("toast-alert").classList.add("hidden");
 }
 
 function setOverviewLoadError(visible: boolean): void {
@@ -117,7 +367,7 @@ function setOverviewLoadError(visible: boolean): void {
 
 function cardActionButtons(row: Snapshot["accounts"][number], busy: boolean): string {
   const disabled = busy ? " disabled" : "";
-  const reauth = `<button class="profile-pill" data-reauth="${escapeHtml(row.id)}" type="button" title="给这张卡重新走浏览器授权"${disabled}>授权</button>`;
+  const reauth = `<button class="profile-pill" data-reauth="${escapeHtml(row.id)}" type="button" title="给这张卡重新走浏览器授权"${disabled}>重新授权</button>`;
   const rename = renameButtonHtml(row, busy);
   const remove = `<button class="profile-pill profile-pill--danger" data-delete="${escapeHtml(row.id)}" type="button"${disabled}>删除</button>`;
   const renameGap = rename ? `\n           ${rename}` : "";
@@ -131,19 +381,18 @@ function cardActionButtons(row: Snapshot["accounts"][number], busy: boolean): st
 }
 
 function paintAccountCards(next: Snapshot): void {
-  const busy = store.get().busy;
   const list = required<HTMLDivElement>("accounts-list");
   const empty = required<HTMLDivElement>("accounts-empty");
   empty.classList.toggle("hidden", next.accounts.length > 0);
   list.innerHTML = next.accounts
     .map((row) => {
-      return `<article class="profile-card${row.active ? " is-current" : ""}">
+      return `<article class="profile-card${row.active ? " is-current" : ""}" ${accountFocusAttr(row.id)}>
         <div class="profile-title-wrap">
           <span class="profile-title">${escapeHtml(accountCardTitle(row))}</span>
-          <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, busy)}</span>
+          <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, false)}</span>
         </div>
         <div class="profile-quota-stack">${quotaStackHtml(row)}</div>
-        <div class="profile-card-actions">${cardActionButtons(row, busy)}</div>
+        <div class="profile-card-actions">${cardActionButtons(row, false)}</div>
       </article>`;
     })
     .join("");
@@ -160,12 +409,11 @@ function currentPlanHtml(
   return plan === null && bind === "" ? "--" : `${plan ?? ""}${bind}`;
 }
 
-/** 重画总览档位行；busy 翻转时与账号卡一同重画（syncBusyChrome），绑定按钮
- * 不残留上一次操作期间的禁用态。 */
+/** 重画总览档位行。忙碌禁用由 syncListedActionsBusy 就地切换，避免拆掉焦点。 */
 function paintCurrentPlan(snapshot: Snapshot): void {
   const current = snapshot.accounts.find((row) => row.active);
   required<HTMLParagraphElement>("current-plan").innerHTML = current
-    ? currentPlanHtml(current, store.get().busy)
+    ? currentPlanHtml(current, false)
     : "--";
 }
 
@@ -178,6 +426,8 @@ function paintSnapshot(next: Snapshot): void {
   paintAutoSwapPreferLowerTier(next.auto_swap, next.auto_swap_prefer_lower_tier);
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
+  rememberListFocus();
+  const key = captureListFocus() ?? pendingListFocus;
   paintCurrentPlan(next);
   required<HTMLDivElement>("current-quota-panel").innerHTML = current
     ? quotaStackHtml(current)
@@ -186,27 +436,35 @@ function paintSnapshot(next: Snapshot): void {
   required<HTMLElement>("metric-total").textContent = String(next.account_count);
   required<HTMLElement>("metric-urgent").textContent = String(next.urgent_count);
   paintAccountCards(next);
+  restoreListFocus(key);
+  syncListedActionsBusy();
+  if (!store.get().busy) {
+    pendingListFocus = null;
+  }
 }
 
 function syncBusyChrome(): void {
-  const { busy, busyLabel, snapshot } = store.get();
-  const pill = required<HTMLDivElement>("quota-monitor-label").parentElement;
-  pill?.classList.toggle("is-busy", busy);
-  required<HTMLSpanElement>("quota-monitor-label").textContent = busyLabel;
+  const { busy, busyLabel } = store.get();
+  required<HTMLElement>("app-shell").setAttribute("aria-busy", String(busy));
+  const pill = required<HTMLElement>("app-busy");
+  pill.classList.toggle("is-busy", busy);
+  required<HTMLSpanElement>("app-busy-label").textContent = busyLabel;
   for (const id of BUSY_BUTTON_IDS) {
     required<HTMLButtonElement>(id).disabled = busy;
   }
-  if (snapshot) {
-    paintAccountCards(snapshot);
-    paintCurrentPlan(snapshot);
-  }
+  syncListedActionsBusy();
 }
 
 function setBusy(next: boolean, label?: string): void {
+  if (next) {
+    rememberListFocus();
+  }
   store.setBusy(next, label);
   syncBusyChrome();
   if (!next) {
-    armSilentQuota();
+    restoreListFocus(pendingListFocus);
+    pendingListFocus = null;
+    silentQuota.arm();
   }
 }
 
@@ -230,42 +488,30 @@ function applyRoute(route: Route): void {
   required<HTMLElement>("page-settings").classList.toggle("active", route === "settings");
 }
 
-function nextSnapshotGeneration(): number {
-  snapshotGeneration += 1;
-  return snapshotGeneration;
-}
-
 // 用户操作一开始就占住世代，已在飞的静默结果会被当成落后快照丢掉。
 function reserveUserSnapshotGeneration(): number {
-  const generation = nextSnapshotGeneration();
-  appliedGeneration = generation;
-  return generation;
+  return silentQuota.generation.reserveUser();
 }
 
-function applySnapshot(next: Snapshot, generation: number): void {
-  if (generation < appliedGeneration) {
+function applySnapshot(
+  next: Snapshot,
+  generation: number,
+  source: SnapshotAnnounceSource = "other",
+): void {
+  if (!silentQuota.generation.applyIfCurrent(generation)) {
     return;
   }
-  appliedGeneration = generation;
-  lastSnapshotAt = Date.now();
+  silentQuota.noteApplied();
   paintSnapshot(next);
-  if (next.message) {
-    showToast(next.message.text, next.message.tone === "err");
+  const announcement = snapshotAnnouncement(next.message, source);
+  if (announcement) {
+    showToast(announcement.text, announcement.isError);
   }
-  armSilentQuota();
-}
-
-function stopSilentQuotaTimer(): void {
-  window.clearTimeout(silentTimer);
-  silentTimer = 0;
+  silentQuota.arm();
 }
 
 function stopSilentQuotaQueries(): void {
-  if (silentStopped) {
-    return;
-  }
-  silentStopped = true;
-  stopSilentQuotaTimer();
+  silentQuota.stop();
   document.removeEventListener("visibilitychange", onVisibilityChange);
   window.removeEventListener("pagehide", stopSilentQuotaQueries);
   window.removeEventListener("beforeunload", stopSilentQuotaQueries);
@@ -273,50 +519,10 @@ function stopSilentQuotaQueries(): void {
 
 function onVisibilityChange(): void {
   if (document.hidden) {
-    stopSilentQuotaTimer();
+    silentQuota.pause();
     return;
   }
-  armSilentQuota();
-}
-
-function armSilentQuota(): void {
-  stopSilentQuotaTimer();
-  if (silentStopped || document.hidden) {
-    return;
-  }
-  const snapshot = store.get().snapshot;
-  if (snapshot && snapshot.accounts.length === 0) {
-    return;
-  }
-  const delay = Math.max(0, SILENT_QUOTA_INTERVAL_MS - (Date.now() - lastSnapshotAt));
-  silentTimer = window.setTimeout(() => {
-    void runSilentQuotaQuery();
-  }, delay);
-}
-
-async function runSilentQuotaQuery(): Promise<void> {
-  if (silentStopped || document.hidden || store.get().busy || silentInFlight) {
-    return;
-  }
-  const snapshot = store.get().snapshot;
-  if (snapshot && snapshot.accounts.length === 0) {
-    return;
-  }
-  silentInFlight = true;
-  const generation = nextSnapshotGeneration();
-  try {
-    const next = await api.listAccounts();
-    if (silentStopped || store.get().busy) {
-      return;
-    }
-    applySnapshot({ ...next, message: silentQuotaMessage(next.message) }, generation);
-  } catch {
-    // 静默失败不 toast；有上次成功快照则条留在当前界面。静默列出不弹会员 toast。
-  } finally {
-    silentInFlight = false;
-    lastSnapshotAt = Date.now();
-    armSilentQuota();
-  }
+  silentQuota.arm();
 }
 
 function wireSilentQuota(): void {
@@ -325,14 +531,34 @@ function wireSilentQuota(): void {
   window.addEventListener("beforeunload", stopSilentQuotaQueries);
 }
 
-async function runAction(label: string, action: () => Promise<Snapshot>): Promise<void> {
+async function runAction(label: string, action: () => Promise<Snapshot>): Promise<boolean> {
   if (store.get().busy) {
-    return;
+    return false;
   }
+  lastActionError = "";
   setBusy(true, label);
   const generation = reserveUserSnapshotGeneration();
   try {
     applySnapshot(await action(), generation);
+    hideLibraryRetry();
+    return true;
+  } catch (error) {
+    lastActionError = commandError(error).message;
+    showToast(lastActionError, true);
+    return false;
+  } finally {
+    setBusy(false);
+  }
+}
+
+/** 设置页异步操作：走同一套全局忙碌指示，失败进错误 toast。 */
+async function runSettingsAction(label: string, action: () => Promise<void>): Promise<void> {
+  if (store.get().busy) {
+    return;
+  }
+  setBusy(true, label);
+  try {
+    await action();
   } catch (error) {
     showToast(commandError(error).message, true);
   } finally {
@@ -345,12 +571,12 @@ async function refreshQuotas(): Promise<void> {
   if (store.get().busy) {
     return;
   }
-  setBusy(true, "正在刷新额度…");
+  setBusy(true, "正在查询额度…");
   const generation = reserveUserSnapshotGeneration();
   try {
     await runUserQuotaRefresh({
       list: () => api.listAccounts(true),
-      applySnapshot: (snapshot) => applySnapshot(snapshot, generation),
+      applySnapshot: (snapshot) => applySnapshot(snapshot, generation, "refresh"),
       toast: (text, isError = false) => showToast(text, isError),
     });
   } finally {
@@ -366,11 +592,12 @@ async function loadInitialSnapshot(): Promise<void> {
   const generation = reserveUserSnapshotGeneration();
   try {
     const initial = await api.listAccounts();
-    // 启动加载不是用户点「刷新」，不弹会员有效期 toast。
+    // 启动加载不是用户点「刷新」，不弹会员到期 toast。
     applySnapshot(initial, generation);
   } catch (error) {
     showToast(commandError(error).message, true);
     setOverviewLoadError(true);
+    // 首载失败不自动静默重试；成功快照后才按 90s 节奏。
   } finally {
     setBusy(false);
   }
@@ -413,13 +640,21 @@ function authDialogAdapter(): DeviceAuthDialog {
   return {
     isOpen: () => dialog.open,
     show(input) {
+      authHoldOpen = false;
+      hideActionRetry("auth-action-error", "auth-action-error-text");
       title.textContent = input.title;
       copy.textContent = input.copy;
       urlInput.value = "";
       code.textContent = "----";
-      dialog.showModal();
+      if (!dialog.open) {
+        dialog.showModal();
+      }
     },
     close: () => {
+      if (authHoldOpen) {
+        authHoldOpen = false;
+        return;
+      }
       dialog.close();
     },
     setLink(url, userCode) {
@@ -437,6 +672,7 @@ function startDeviceAuth(target: string | null, displayName: string): Promise<vo
     return Promise.resolve();
   }
   authIsReauth = target !== null;
+  lastAuth = { target, displayName };
   return runDeviceAuth(target, displayName, {
     dialog: authDialogAdapter(),
     host: {
@@ -444,7 +680,12 @@ function startDeviceAuth(target: string | null, displayName: string): Promise<vo
       setBusy,
       reserveGeneration: reserveUserSnapshotGeneration,
       applySnapshot,
-      showError: (message) => showToast(message, true),
+      showError: (message) => {
+        lastActionError = message;
+        authHoldOpen = true;
+        showActionRetry("auth-action-error", "auth-action-error-text", message);
+        showToast(message, true);
+      },
     },
     commands: {
       startDeviceAuth: (id) => api.startDeviceAuth(id),
@@ -467,6 +708,8 @@ function openBindDialog(id: string): void {
   );
   const tokenInput = required<HTMLTextAreaElement>("bind-token");
   tokenInput.value = "";
+  paintFieldError(tokenInput, required("bind-token-error"), null);
+  hideActionRetry("bind-action-error", "bind-action-error-text");
   required<HTMLDialogElement>("bind-dialog").showModal();
   tokenInput.focus();
 }
@@ -496,9 +739,15 @@ function wireDialogs(): void {
     }
   });
   required<HTMLButtonElement>("auth-cancel").addEventListener("click", async () => {
+    authHoldOpen = false;
     await api.cancelDeviceAuth();
     required<HTMLDialogElement>("auth-dialog").close();
     showToast(authIsReauth ? "已取消重新授权" : "已取消添加账号");
+  });
+  required<HTMLButtonElement>("auth-retry-button").addEventListener("click", () => {
+    if (lastAuth) {
+      void startDeviceAuth(lastAuth.target, lastAuth.displayName);
+    }
   });
   required<HTMLDialogElement>("auth-dialog").addEventListener("cancel", () => {
     void api.cancelDeviceAuth();
@@ -516,20 +765,22 @@ function wireDialogs(): void {
     required<HTMLDialogElement>("bind-dialog").close();
   });
   required<HTMLButtonElement>("bind-submit").addEventListener("click", () => {
-    const token = parseWebToken(required<HTMLTextAreaElement>("bind-token").value);
-    if (token === null) {
-      showToast("请先粘贴网页 token", true);
-      return;
-    }
-    const id = bindId;
-    // 关闭即清空输入（下方 close 事件）；token 只活在本次闭包里，随命令交给后端。
-    required<HTMLDialogElement>("bind-dialog").close();
-    void runAction("正在绑定…", () => api.bindWebAccount(id, token));
+    submitBind();
   });
-  // 对话框任何关闭路径（取消按钮 / Esc / 提交后的 close()）都清空 token 输入，
+  required<HTMLButtonElement>("bind-retry-button").addEventListener("click", () => {
+    submitBind();
+  });
+  required<HTMLTextAreaElement>("bind-token").addEventListener("input", () => {
+    const input = required<HTMLTextAreaElement>("bind-token");
+    paintFieldError(input, required("bind-token-error"), null);
+  });
+  // 对话框任何关闭路径（取消按钮 / Esc / 提交成功后的 close()）都清空 token 输入，
   // token 不留在 DOM。
   required<HTMLDialogElement>("bind-dialog").addEventListener("close", () => {
-    required<HTMLTextAreaElement>("bind-token").value = "";
+    const input = required<HTMLTextAreaElement>("bind-token");
+    input.value = "";
+    paintFieldError(input, required("bind-token-error"), null);
+    hideActionRetry("bind-action-error", "bind-action-error-text");
   });
 
   required<HTMLButtonElement>("rename-cancel").addEventListener("click", () => {
@@ -537,21 +788,24 @@ function wireDialogs(): void {
   });
   required<HTMLFormElement>("rename-form").addEventListener("submit", (event) => {
     event.preventDefault();
-    const label = parseAliasInput(required<HTMLInputElement>("rename-input").value);
-    if (label === null) {
-      showToast("别名不能为空", true);
-      return;
-    }
-    required<HTMLDialogElement>("rename-dialog").close();
-    void runAction("正在重命名…", () => api.renameAccount(renameId, label));
+    submitRename();
+  });
+  required<HTMLButtonElement>("rename-retry-button").addEventListener("click", () => {
+    submitRename();
+  });
+  required<HTMLInputElement>("rename-input").addEventListener("input", () => {
+    const input = required<HTMLInputElement>("rename-input");
+    paintFieldError(input, required("rename-error"), null);
   });
 
   required<HTMLButtonElement>("delete-cancel").addEventListener("click", () => {
     required<HTMLDialogElement>("delete-dialog").close();
   });
-  required<HTMLButtonElement>("delete-confirm").addEventListener("click", async () => {
-    required<HTMLDialogElement>("delete-dialog").close();
-    await runAction("正在删除…", () => api.removeAccount(deleteId));
+  required<HTMLButtonElement>("delete-confirm").addEventListener("click", () => {
+    submitDelete();
+  });
+  required<HTMLButtonElement>("delete-retry-button").addEventListener("click", () => {
+    submitDelete();
   });
 }
 
@@ -567,7 +821,17 @@ function wireList(): void {
     const remove = target.closest<HTMLElement>("[data-delete]");
     const bind = target.closest<HTMLElement>("[data-bind]");
     if (swap?.dataset.swap) {
-      void runAction("正在切换…", () => api.swapAccount(swap.dataset.swap ?? ""));
+      const id = swap.dataset.swap;
+      const retrySwap = (): void => {
+        hideLibraryRetry();
+        void (async () => {
+          const ok = await runAction("正在切换…", () => api.swapAccount(id));
+          if (!ok && lastActionError !== "") {
+            showLibraryRetry(lastActionError, retrySwap);
+          }
+        })();
+      };
+      retrySwap();
       return;
     }
     if (bind?.dataset.bind) {
@@ -586,9 +850,12 @@ function wireList(): void {
       const display = accountDisplayName(row, renameId);
       required<HTMLParagraphElement>("rename-copy").textContent =
         `给 ${display} 起个别名（只影响本软件里的显示）：`;
-      required<HTMLInputElement>("rename-input").value = row?.label ?? "";
+      const input = required<HTMLInputElement>("rename-input");
+      input.value = row?.label ?? "";
+      paintFieldError(input, required("rename-error"), null);
+      hideActionRetry("rename-action-error", "rename-action-error-text");
       required<HTMLDialogElement>("rename-dialog").showModal();
-      required<HTMLInputElement>("rename-input").focus();
+      input.focus();
       return;
     }
     if (remove?.dataset.delete) {
@@ -596,6 +863,7 @@ function wireList(): void {
       const row = store.get().snapshot?.accounts.find((item) => item.id === deleteId);
       required<HTMLParagraphElement>("delete-copy").textContent =
         `确定要从账号库删除 ${accountDisplayName(row, deleteId)} 吗？`;
+      hideActionRetry("delete-action-error", "delete-action-error-text");
       required<HTMLDialogElement>("delete-dialog").showModal();
     }
   });
@@ -626,29 +894,35 @@ async function init(): Promise<void> {
   required<HTMLButtonElement>("overview-retry-button").addEventListener("click", () => {
     void loadInitialSnapshot();
   });
-  required<HTMLButtonElement>("theme-classic").addEventListener("click", async () => {
-    const theme = await api.setTheme("classic");
-    applyTheme(theme);
+  required<HTMLButtonElement>("library-retry-button").addEventListener("click", () => {
+    libraryRetry?.();
   });
-  required<HTMLButtonElement>("theme-jade-night").addEventListener("click", async () => {
-    const theme = await api.setTheme("jade-night");
-    applyTheme(theme);
+  required<HTMLButtonElement>("toast-alert-dismiss").addEventListener("click", () => {
+    dismissAlertToast();
   });
-  required<HTMLButtonElement>("renewal-toggle").addEventListener("click", async () => {
+  required<HTMLButtonElement>("theme-classic").addEventListener("click", () => {
+    void runSettingsAction("正在切换主题…", async () => {
+      applyTheme(await api.setTheme("classic"));
+    });
+  });
+  required<HTMLButtonElement>("theme-jade-night").addEventListener("click", () => {
+    void runSettingsAction("正在切换主题…", async () => {
+      applyTheme(await api.setTheme("jade-night"));
+    });
+  });
+  required<HTMLButtonElement>("renewal-toggle").addEventListener("click", () => {
     const toggle = required<HTMLButtonElement>("renewal-toggle");
     const next = toggle.getAttribute("aria-checked") !== "true";
-    try {
+    void runSettingsAction("正在保存设置…", async () => {
       const saved = await api.setProactiveRenewal(next);
       paintProactiveRenewal(saved);
       showToast(renewalSwitchView(saved).toast);
-    } catch (error) {
-      showToast(commandError(error).message, true);
-    }
+    });
   });
-  required<HTMLButtonElement>("auto-swap-toggle").addEventListener("click", async () => {
+  required<HTMLButtonElement>("auto-swap-toggle").addEventListener("click", () => {
     const toggle = required<HTMLButtonElement>("auto-swap-toggle");
     const next = toggle.getAttribute("aria-checked") !== "true";
-    try {
+    void runSettingsAction("正在保存设置…", async () => {
       const saved = await api.setAutoSwap(next);
       paintAutoSwap(saved);
       const prefer =
@@ -657,28 +931,24 @@ async function init(): Promise<void> {
         ) === "true";
       paintAutoSwapPreferLowerTier(saved, prefer);
       showToast(autoSwapSwitchView(saved).toast);
-    } catch (error) {
-      showToast(commandError(error).message, true);
-    }
+    });
   });
   required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").addEventListener(
     "click",
-    async () => {
+    () => {
       const toggle = required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle");
       if (toggle.disabled) {
         return;
       }
       const next = toggle.getAttribute("aria-checked") !== "true";
-      try {
+      void runSettingsAction("正在保存设置…", async () => {
         const saved = await api.setAutoSwapPreferLowerTier(next);
         const masterOn =
           required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
           "true";
         paintAutoSwapPreferLowerTier(masterOn, saved);
         showToast(autoSwapPreferLowerTierSwitchView(masterOn, saved).toast);
-      } catch (error) {
-        showToast(commandError(error).message, true);
-      }
+      });
     },
   );
 
@@ -699,4 +969,6 @@ async function init(): Promise<void> {
   await loadInitialSnapshot();
 }
 
-void init();
+if (!import.meta.env.VITEST) {
+  void init();
+}

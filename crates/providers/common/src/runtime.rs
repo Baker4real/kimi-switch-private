@@ -98,9 +98,10 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
         ))
     }
 
-    /// 轮换成功收尾：refresh token 已轮换，清掉旧的拒止指纹。默认 no-op。
-    fn proactive_renewal_rotated(&self, home: &Path) -> Result<()> {
-        let _ = home;
+    /// 轮换成功收尾：只清掉这次轮换前 blob 对应的拒止指纹，其它账号的指纹保留。
+    /// 默认 no-op。
+    fn proactive_renewal_rotated(&self, home: &Path, blob: &str) -> Result<()> {
+        let _ = (home, blob);
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-//! 删除账号：注册表 → 墓碑 → 凭证（Code blob + 网页会员 field）→ 额度缓存 → 审计。
+//! 删除账号：墓碑 → 账号库删除 → 凭证（Code blob + 网页会员 field）→ 额度缓存 → 审计。
 //!
 //! CLI 与 GUI 只调用本操作，不再各自编排。`store_field` 由 provider 自报；
 //! 网页会员凭证按 core schema 常量 [`crate::membership_expiry::WEB_STORE_FIELD`]
@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::account_registry::AccountRegistry;
 use crate::audit::{AuditEvent, AuditLog};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::membership_expiry::WEB_STORE_FIELD;
 use crate::model::AccountId;
 use crate::quota_cache::QuotaCache;
@@ -30,10 +30,19 @@ pub fn remove_account(
     provider_id: &str,
     account_id: &AccountId,
 ) -> Result<()> {
-    registry.remove(provider_id, account_id)?;
+    // 先确认在库里，避免给幽灵账号写墓碑；写序仍是墓碑先于账号库删除。
+    if registry.find(provider_id, account_id)?.is_none() {
+        return Err(Error::AccountNotFound {
+            provider: provider_id.into(),
+            id: account_id.to_string(),
+        });
+    }
 
     let mut removed = RemovedAccounts::load(removed_path);
-    removed.add(provider_id, account_id.0.as_str())?;
+    removed
+        .add(provider_id, account_id.0.as_str())
+        .map_err(|e| anyhow::anyhow!("写入墓碑失败，账号未删除: {e}"))?;
+    registry.remove(provider_id, account_id)?;
 
     if let Err(e) = store.delete(provider_id, account_id.0.as_str(), store_field) {
         tracing::warn!(err=%e, "credential store delete failed (continuing)");
@@ -255,5 +264,55 @@ mod tests {
             .get("kimi", "ghost")
             .is_some());
         assert!(!h.audit.path().exists());
+    }
+
+    /// issue #76：墓碑必须先于账号库删除落盘。墓碑写失败时账号仍在库里，并给出明确报错。
+    #[test]
+    fn remove_account_keeps_registry_when_tombstone_write_fails() {
+        let h = Harness::new();
+        h.registry.upsert(account("alice")).unwrap();
+
+        // 把墓碑路径做成目录，写入必然失败。
+        std::fs::create_dir_all(&h.removed_path).unwrap();
+
+        let err = h.remove("alice", "auth_json").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("写入墓碑失败") && msg.contains("账号未删除"),
+            "墓碑写失败必须有明确报错，got {msg:?}"
+        );
+
+        assert!(
+            h.registry
+                .find("kimi", &AccountId("alice".into()))
+                .unwrap()
+                .is_some(),
+            "墓碑写失败时账号库必须保持不变"
+        );
+        assert!(!RemovedAccounts::load(&h.removed_path).contains("kimi", "alice"));
+        assert!(!h.audit.path().exists());
+    }
+
+    /// issue #76：删掉的当前账号有墓碑，默认入口不得再自动导入。
+    #[test]
+    fn remove_account_prevents_reimport_of_deleted_live_account() {
+        let h = Harness::new();
+        h.registry.upsert(account("alice")).unwrap();
+        h.remove("alice", "auth_json").unwrap();
+
+        crate::sync_active::sync_local_active(
+            "kimi",
+            &h.removed_path,
+            &h.registry,
+            || Ok(AccountId("alice".into())),
+            || panic!("墓碑命中时不得把已删的当前账号再导入"),
+        );
+
+        assert!(h
+            .registry
+            .find("kimi", &AccountId("alice".into()))
+            .unwrap()
+            .is_none());
+        assert!(RemovedAccounts::load(&h.removed_path).contains("kimi", "alice"));
     }
 }

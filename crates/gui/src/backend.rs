@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -29,8 +30,50 @@ pub struct Backend {
     audit: AuditLog,
     /// 会员到期「仅刷新」的生产替身（issue #52）：只在 UserInitiated 行列组装时被调用。
     web_membership: Arc<LiveWebMembershipRefresh>,
-    /// 进行中的设备码授权；第三项是「按卡授权」的目标账号 id（None = 添加新账号）。
-    pending_auth: Mutex<Option<(DeviceAuthorization, Arc<AtomicBool>, Option<AccountId>)>>,
+    /// 进行中的设备码授权（含世代号与设备码有效期）。
+    pending_auth: Mutex<Option<PendingAuth>>,
+}
+
+/// 进行中的设备码授权。完成阶段只清匹配的世代，避免跨世代误清。
+#[derive(Clone)]
+struct PendingAuth {
+    generation: u64,
+    auth: DeviceAuthorization,
+    cancel: Arc<AtomicBool>,
+    /// 「按卡授权」的目标账号 id；`None` = 添加新账号。
+    target: Option<AccountId>,
+    issued_at: Instant,
+}
+
+impl PendingAuth {
+    /// 超过设备码自身 `expires_in` 即视为不存在。
+    fn is_live(&self, now: Instant) -> bool {
+        match now.checked_duration_since(self.issued_at) {
+            Some(elapsed) => elapsed < std::time::Duration::from_secs(self.auth.expires_in),
+            None => true,
+        }
+    }
+}
+
+/// 过期或空槽都视为没有进行中的授权（自动切换可恢复）。
+fn has_live_pending(pending: Option<&PendingAuth>, now: Instant) -> bool {
+    pending.is_some_and(|pending| pending.is_live(now))
+}
+
+fn snapshot_live_pending(slot: &Option<PendingAuth>, now: Instant) -> Option<PendingAuth> {
+    slot.as_ref()
+        .filter(|pending| pending.is_live(now))
+        .cloned()
+}
+
+/// 只清自己那一代；当前已是更新一代则原样保留。
+fn clear_own_generation(slot: &mut Option<PendingAuth>, generation: u64) {
+    if slot
+        .as_ref()
+        .is_some_and(|pending| pending.generation == generation)
+    {
+        *slot = None;
+    }
 }
 
 impl Backend {
@@ -127,10 +170,13 @@ impl Backend {
     }
 
     fn has_pending_auth(&self) -> bool {
-        self.pending_auth
-            .lock()
-            .expect("pending_auth lock")
-            .is_some()
+        has_live_pending(
+            self.pending_auth
+                .lock()
+                .expect("pending_auth lock")
+                .as_ref(),
+            Instant::now(),
+        )
     }
 
     fn load_auto_swap_settings() -> kimi_switch_core::settings::AutoSwap {
@@ -265,9 +311,8 @@ impl Backend {
     ) {
         let mut accounts = self.registry.list_by_provider("kimi").unwrap_or_default();
         accounts.sort_by_key(|a| !a.active);
-        let cache_path = AppPaths::resolve()
-            .map(|p| p.quota_cache_file())
-            .unwrap_or_else(|_| std::path::PathBuf::from("quota-cache-missing.json"));
+        let cache_path =
+            quota_cache_path(AppPaths::resolve()).unwrap_or_else(skipped_quota_cache_path);
         let (rows, stats, snapshots) = collect_account_rows(
             self.kimi.clone(),
             Some(self.web_membership.clone()),
@@ -297,10 +342,7 @@ impl Backend {
             .append(AuditEvent::ok("login", "kimi", Some(account.id.0.as_str())));
         Ok(self
             .snapshot(
-                Some(UiMessage {
-                    text: import_success_message(&account),
-                    tone: "ok".into(),
-                }),
+                Some(UiMessage::ok(import_success_message(&account))),
                 QuotaCollectReason::Scheduled,
             )
             .await)
@@ -325,10 +367,10 @@ impl Backend {
         });
         Ok(self
             .snapshot(
-                Some(UiMessage {
-                    text: swap_success_message(&account, plan.as_deref()),
-                    tone: "ok".into(),
-                }),
+                Some(UiMessage::ok(swap_success_message(
+                    &account,
+                    plan.as_deref(),
+                ))),
                 QuotaCollectReason::Scheduled,
             )
             .await)
@@ -353,10 +395,7 @@ impl Backend {
         )?;
         Ok(self
             .snapshot(
-                Some(UiMessage {
-                    text: delete_success_message(&account),
-                    tone: "ok".into(),
-                }),
+                Some(UiMessage::ok(delete_success_message(&account))),
                 QuotaCollectReason::Scheduled,
             )
             .await)
@@ -372,10 +411,7 @@ impl Backend {
         if label.is_empty() || label == account.label {
             return Ok(self
                 .snapshot(
-                    Some(UiMessage {
-                        text: "别名未变化".into(),
-                        tone: "info".into(),
-                    }),
+                    Some(UiMessage::info("别名未变化")),
                     QuotaCollectReason::Scheduled,
                 )
                 .await);
@@ -384,13 +420,7 @@ impl Backend {
         account.label = label.to_string();
         self.registry.upsert(account)?;
         Ok(self
-            .snapshot(
-                Some(UiMessage {
-                    text,
-                    tone: "ok".into(),
-                }),
-                QuotaCollectReason::Scheduled,
-            )
+            .snapshot(Some(UiMessage::ok(text)), QuotaCollectReason::Scheduled)
             .await)
     }
 
@@ -421,32 +451,52 @@ impl Backend {
             .unwrap_or_else(|| auth.verification_uri.clone());
         let user_code = auth.user_code.clone();
         let cancel = Arc::new(AtomicBool::new(false));
-        *self.pending_auth.lock().expect("pending_auth lock") = Some((auth, cancel, target));
+        let mut slot = self.pending_auth.lock().expect("pending_auth lock");
+        if let Some(old) = slot.as_ref() {
+            old.cancel.store(true, Ordering::SeqCst);
+        }
+        let generation = slot
+            .as_ref()
+            .map(|pending| pending.generation.wrapping_add(1))
+            .unwrap_or(1);
+        *slot = Some(PendingAuth {
+            generation,
+            auth,
+            cancel,
+            target,
+            issued_at: Instant::now(),
+        });
         Ok(AuthLink { url, user_code })
     }
 
     pub fn cancel_device_auth(&self) {
-        if let Some((_, cancel, _)) = self
+        if let Some(pending) = self
             .pending_auth
             .lock()
             .expect("pending_auth lock")
             .as_ref()
         {
-            cancel.store(true, Ordering::SeqCst);
+            pending.cancel.store(true, Ordering::SeqCst);
         }
     }
 
     pub async fn complete_device_auth(&self) -> Result<Snapshot> {
-        let pending = self.pending_auth.lock().expect("pending_auth lock").clone();
-        let Some((auth, cancel, target)) = pending else {
+        let pending = snapshot_live_pending(
+            &self.pending_auth.lock().expect("pending_auth lock"),
+            Instant::now(),
+        );
+        let Some(pending) = pending else {
             return Err(kimi_switch_core::Error::no_pending_auth().into());
         };
-        let result = device_flow::poll_for_token(&auth, cancel)
+        let result = device_flow::poll_for_token(&pending.auth, pending.cancel)
             .await
             .map_err(anyhow::Error::from);
-        *self.pending_auth.lock().expect("pending_auth lock") = None;
+        {
+            let mut slot = self.pending_auth.lock().expect("pending_auth lock");
+            clear_own_generation(&mut slot, pending.generation);
+        }
         let blob = result.context("授权未完成")?;
-        let Some(target) = target else {
+        let Some(target) = pending.target else {
             // 现行添加新账号路径，行为保持不变。
             let account = self
                 .kimi
@@ -459,10 +509,7 @@ impl Backend {
                 .append(AuditEvent::ok("login", "kimi", Some(account.id.0.as_str())));
             return Ok(self
                 .snapshot(
-                    Some(UiMessage {
-                        text: auth_success_message(&account),
-                        tone: "ok".into(),
-                    }),
+                    Some(UiMessage::ok(auth_success_message(&account))),
                     QuotaCollectReason::Scheduled,
                 )
                 .await);
@@ -480,10 +527,7 @@ impl Backend {
                 ));
                 Ok(self
                     .snapshot(
-                        Some(UiMessage {
-                            text: reauth_success_message(&account),
-                            tone: "ok".into(),
-                        }),
+                        Some(UiMessage::ok(reauth_success_message(&account))),
                         QuotaCollectReason::Scheduled,
                     )
                     .await)
@@ -537,18 +581,74 @@ impl Backend {
         }
     }
 
-    pub fn open_url(url: &str) -> Result<()> {
+    pub async fn open_url(url: &str) -> Result<()> {
+        assert_allowed_open_url(url)?;
         // explorer.exe 会把 URL 参数误判成文件夹路径，弹出文件资源管理器而不是浏览器；
         // rundll32 url.dll,FileProtocolHandler 走系统默认浏览器关联，行为可靠。
-        // 用 status() 等退出码而不是 spawn() 立刻返回，失败才能真正报到前端。
-        let status = std::process::Command::new("rundll32")
-            .arg("url.dll,FileProtocolHandler")
-            .arg(url)
-            .status()
-            .context("无法打开浏览器")?;
-        anyhow::ensure!(status.success(), "无法打开浏览器");
+        // spawn_blocking 把 status() 移出异步运行时，避免卡住 UI；仍用退出码报到前端。
+        let url = url.to_string();
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("rundll32")
+                .arg("url.dll,FileProtocolHandler")
+                .arg(url)
+                .status()
+        })
+        .await
+        .context("无法打开浏览器")?
+        .context("无法打开浏览器")?;
+        if !status.success() {
+            match status.code() {
+                Some(code) => anyhow::bail!("无法打开浏览器（退出码 {code}）"),
+                None => anyhow::bail!("无法打开浏览器"),
+            }
+        }
         Ok(())
     }
+}
+
+/// 允许用系统浏览器打开的官方主机（仅 https）。
+const ALLOWED_OPEN_URL_HOSTS: &[&str] = &["auth.kimi.com", "api.kimi.com", "www.kimi.com"];
+
+/// 拒绝非官方 URL，避免 rundll32 打开任意协议或主机。
+fn assert_allowed_open_url(url: &str) -> Result<()> {
+    anyhow::ensure!(is_allowed_open_url(url), "不允许打开该链接");
+    Ok(())
+}
+
+fn is_allowed_open_url(url: &str) -> bool {
+    official_https_open_url_host(url).is_some_and(|host| {
+        ALLOWED_OPEN_URL_HOSTS
+            .iter()
+            .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    })
+}
+
+/// 只接受无 userinfo、无端口的 https 主机；其它协议或变形一律拒绝。
+fn official_https_open_url_host(url: &str) -> Option<&str> {
+    if url.is_empty() || url.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'\\') {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    if rest.contains('@') {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return None;
+    }
+    Some(host)
 }
 
 /// 会员到期「仅刷新」的替身面（issue #52）：行列组装在用户发起刷新
@@ -598,6 +698,29 @@ impl WebMembershipRefresh for LiveWebMembershipRefresh {
 /// 会让一次刷新等满 15s，前端 busy 闸门把切换在内全部操作锁死。2s 足够覆盖
 /// 正常的亚秒级会员请求，超出即视为当次不可达。
 const MEMBERSHIP_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 解析额度缓存落盘路径。失败返回 `None`，调用方跳过缓存写入，不回退相对路径。
+pub(crate) fn quota_cache_path(
+    paths: kimi_switch_core::Result<AppPaths>,
+) -> Option<std::path::PathBuf> {
+    match paths {
+        Ok(paths) => Some(paths.quota_cache_file()),
+        Err(err) => {
+            tracing::warn!(err = %err, "额度缓存路径解析失败，本轮跳过缓存写入");
+            None
+        }
+    }
+}
+
+/// 路径不可用时给额度收集的占位路径：绝对路径且父目录不预先创建，写入失败被忽略，不落 cwd。
+fn skipped_quota_cache_path() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!(
+            "kimi-switch-quota-cache-unresolved-{}",
+            std::process::id()
+        ))
+        .join("quota_cache.json")
+}
 
 /// 列出与刷新共用：走 core 额度快照（节流 / 退避 / 并发），GUI 只做展示映射。
 ///
@@ -759,14 +882,8 @@ pub(crate) fn attach_skip_message(
         stats.skipped_rate_limit,
         stats.skipped_auth,
     ) {
-        (n, 0, 0) if n > 0 => Some(UiMessage {
-            text: "刚刚更新过".into(),
-            tone: "info".into(),
-        }),
-        (0, n, 0) if n > 0 => Some(UiMessage {
-            text: "请求过于频繁，请稍后再试".into(),
-            tone: "info".into(),
-        }),
+        (n, 0, 0) if n > 0 => Some(UiMessage::info("刚刚更新过")),
+        (0, n, 0) if n > 0 => Some(UiMessage::info("请求过于频繁，请稍后再试")),
         _ => None,
     }
 }
@@ -834,10 +951,7 @@ where
                 "no eligible candidate",
             ));
             AutoSwapSnapshotEffect {
-                message: Some(UiMessage {
-                    text: "没有可自动切换的账号".into(),
-                    tone: "err".into(),
-                }),
+                message: Some(UiMessage::auto_swap_no_candidate()),
                 swapped: false,
             }
         }
@@ -859,10 +973,7 @@ where
                         .map(auto_swap_success_message)
                         .unwrap_or_else(|| format!("已自动切换到 {}", target.to));
                     AutoSwapSnapshotEffect {
-                        message: Some(UiMessage {
-                            text,
-                            tone: "ok".into(),
-                        }),
+                        message: Some(UiMessage::auto_swap_success(text)),
                         swapped: true,
                     }
                 }
@@ -874,10 +985,7 @@ where
                         &err.to_string(),
                     ));
                     AutoSwapSnapshotEffect {
-                        message: Some(UiMessage {
-                            text: "自动切换失败".into(),
-                            tone: "err".into(),
-                        }),
+                        message: Some(UiMessage::auto_swap_failed()),
                         swapped: false,
                     }
                 }
@@ -915,10 +1023,7 @@ pub(crate) fn bind_web_success_message(binding: &WebBinding) -> UiMessage {
         Some(expiry) => format!("绑定成功，有效期至 {expiry}"),
         None => "绑定成功，暂无会员到期信息".into(),
     };
-    UiMessage {
-        text,
-        tone: "ok".into(),
-    }
+    UiMessage::ok(text)
 }
 
 /// 绑定失败的 GUI 用户文案（issue #51）：简洁中文，按结构化载荷映射。
@@ -1079,5 +1184,302 @@ fn compact_error(error: &str) -> String {
         s
     } else {
         one_line
+    }
+}
+
+#[cfg(test)]
+mod pending_lifecycle_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use kimi_switch_core::{Quota, QuotaState, QuotaStatus, QuotaWindow};
+
+    fn pending_at(generation: u64, expires_in: u64, issued_at: Instant) -> PendingAuth {
+        PendingAuth {
+            generation,
+            auth: DeviceAuthorization {
+                device_code: "dc-test".into(),
+                user_code: "ABCD-EFGH".into(),
+                verification_uri: "https://auth.kimi.com/device".into(),
+                verification_uri_complete: None,
+                expires_in,
+                interval: 5,
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            target: None,
+            issued_at,
+        }
+    }
+
+    /// issue #90：超过设备码自身有效期即视为不存在。
+    #[test]
+    fn pending_device_auth_past_expires_in_is_absent() {
+        let issued_at = Instant::now();
+        let pending = pending_at(1, 5, issued_at);
+        let expired_at = issued_at + Duration::from_secs(5);
+        assert!(
+            !has_live_pending(Some(&pending), expired_at),
+            "到达 expires_in 应视为没有进行中的授权"
+        );
+        assert!(
+            snapshot_live_pending(&Some(pending.clone()), expired_at).is_none(),
+            "过期 pending 对完成授权视为不存在"
+        );
+        assert!(has_live_pending(
+            Some(&pending),
+            issued_at + Duration::from_secs(4)
+        ));
+    }
+
+    /// issue #90：有效期内仍挡住自动切换；过期后判定恢复。
+    #[tokio::test]
+    async fn snapshot_auto_swap_recovers_after_pending_device_auth_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let issued_at = Instant::now();
+        let pending = pending_at(1, 5, issued_at);
+        let expired_at = issued_at + Duration::from_secs(5);
+        let activated = Arc::new(AtomicUsize::new(0));
+        let activated_cb = activated.clone();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 9, 3, 12, 0, 0).unwrap();
+        let settings = kimi_switch_core::settings::AutoSwap {
+            enabled: true,
+            threshold: 0.99,
+            cooldown_ms: 5 * 60 * 1000,
+            settle_grace_ms: 60 * 1000,
+            prefer_lower_tier: false,
+        };
+
+        let live_effect = apply_snapshot_auto_swap(
+            &settings,
+            || has_live_pending(Some(&pending), issued_at),
+            || Some(AccountId("alice".into())),
+            &[
+                auto_swap_acc("alice", true, now),
+                auto_swap_acc("bob", false, now),
+            ],
+            &[
+                auto_swap_ready("alice", 99, 100, now),
+                auto_swap_ready("bob", 10, 100, now),
+            ],
+            now,
+            None,
+            |_id| async { panic!("有效期内不得自动切换") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(!live_effect.swapped);
+        assert!(live_effect.message.is_none());
+
+        let expired_effect = apply_snapshot_auto_swap(
+            &settings,
+            || has_live_pending(Some(&pending), expired_at),
+            || Some(AccountId("alice".into())),
+            &[
+                auto_swap_acc("alice", true, now),
+                auto_swap_acc("bob", false, now),
+            ],
+            &[
+                auto_swap_ready("alice", 99, 100, now),
+                auto_swap_ready("bob", 10, 100, now),
+            ],
+            now,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    activated.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(id.0, "bob");
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(expired_effect.swapped, "过期后应恢复自动切换");
+        assert_eq!(activated.load(Ordering::SeqCst), 1);
+    }
+
+    /// issue #90：完成授权只清自己那一代，不得误清更新一代。
+    #[test]
+    fn complete_device_auth_only_clears_matching_pending_generation() {
+        let now = Instant::now();
+        let mut slot = Some(pending_at(2, 900, now));
+        clear_own_generation(&mut slot, 1);
+        assert!(
+            has_live_pending(slot.as_ref(), now),
+            "旧世代完成不得清掉新 pending"
+        );
+        clear_own_generation(&mut slot, 2);
+        assert!(!has_live_pending(slot.as_ref(), now), "匹配世代应当被清掉");
+    }
+
+    fn auto_swap_acc(id: &str, active: bool, now: DateTime<Utc>) -> Account {
+        Account {
+            provider: "kimi".into(),
+            id: AccountId(id.into()),
+            label: id.into(),
+            active,
+            created_at: now,
+            last_used_at: Some(now - chrono::Duration::seconds(120)),
+            extra: Default::default(),
+        }
+    }
+
+    fn auto_swap_ready(id: &str, used: u64, limit: u64, now: DateTime<Utc>) -> QuotaSnapshot {
+        QuotaSnapshot {
+            account_id: AccountId(id.into()),
+            fetched_at: now,
+            stale: false,
+            membership: None,
+            state: QuotaState::Ready(vec![Quota {
+                provider: "kimi".into(),
+                account_id: AccountId(id.into()),
+                window: QuotaWindow::FiveHour,
+                used,
+                limit,
+                reset_at: None,
+                status: QuotaStatus::Ok,
+                note: None,
+                membership: None,
+            }]),
+        }
+    }
+}
+
+/// issue #91：系统浏览器只允许打开 Kimi 官方 https 链接。
+#[cfg(test)]
+mod open_url_tests {
+    use super::*;
+
+    #[test]
+    fn open_url_allows_official_https_hosts() {
+        for url in [
+            "https://auth.kimi.com/device",
+            "https://www.kimi.com/code/console",
+            "https://api.kimi.com/coding/v1/me",
+        ] {
+            assert_allowed_open_url(url).unwrap_or_else(|err| panic!("{url}: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn open_url_rejects_javascript_scheme() {
+        let err = Backend::open_url("javascript:alert(1)").await.unwrap_err();
+        assert!(err.to_string().contains("不允许打开该链接"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn open_url_rejects_file_scheme() {
+        let err = Backend::open_url("file:///C:/Windows/win.ini")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("不允许打开该链接"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn open_url_rejects_http_scheme() {
+        let err = Backend::open_url("http://www.kimi.com/").await.unwrap_err();
+        assert!(err.to_string().contains("不允许打开该链接"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn open_url_rejects_non_official_host() {
+        for url in [
+            "https://evil.example/phish",
+            "https://auth.kimi.com.evil.com/",
+        ] {
+            let err = Backend::open_url(url).await.unwrap_err();
+            assert!(err.to_string().contains("不允许打开该链接"), "{url}: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod quota_cache_path_tests {
+    use super::*;
+
+    use kimi_switch_core::{Error, Quota};
+
+    #[test]
+    fn quota_cache_path_uses_resolved_cache_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let paths = AppPaths {
+            config_dir: tmp.path().join("config"),
+            data_dir: tmp.path().join("data"),
+            state_dir: tmp.path().join("state"),
+            cache_dir: cache_dir.clone(),
+        };
+        let path = quota_cache_path(Ok(paths)).expect("路径解析成功应得到缓存文件");
+        assert_eq!(path, cache_dir.join("quota_cache.json"));
+        assert!(
+            path.is_absolute(),
+            "缓存路径必须是绝对路径，避免落到工作目录: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn quota_cache_path_skips_on_resolve_failure_instead_of_cwd_fallback() {
+        let path = quota_cache_path(Err(Error::Config("cannot resolve user directories".into())));
+        assert!(
+            path.is_none(),
+            "路径失败必须跳过缓存写入，不得回退相对文件 quota-cache-missing.json，实际={path:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_quota_cache_does_not_write_cwd_fallback_or_sentinel_file() {
+        let cwd_fallback = std::env::current_dir()
+            .expect("cwd")
+            .join("quota-cache-missing.json");
+        let existed_before = cwd_fallback.exists();
+        let skip = skipped_quota_cache_path();
+        assert!(
+            skip.is_absolute(),
+            "跳过路径必须是绝对路径: {}",
+            skip.display()
+        );
+        assert_ne!(
+            skip.file_name().and_then(|name| name.to_str()),
+            Some("quota-cache-missing.json")
+        );
+
+        struct SilentProvider;
+        #[async_trait::async_trait]
+        impl Provider for SilentProvider {
+            async fn activate(&self, _: &AccountId) -> kimi_switch_core::Result<()> {
+                panic!("无账号时不应切换");
+            }
+            async fn query_quota(&self, _: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
+                panic!("无账号时不应查额度");
+            }
+        }
+
+        let _ = collect_account_rows(
+            Arc::new(SilentProvider),
+            None,
+            &[],
+            &skip,
+            QuotaCollectReason::Scheduled,
+        )
+        .await;
+
+        assert!(
+            !skip.exists(),
+            "跳过路径的父目录不存在时不得创建缓存文件: {}",
+            skip.display()
+        );
+        if !existed_before {
+            assert!(
+                !cwd_fallback.exists(),
+                "不得在工作目录写下 quota-cache-missing.json"
+            );
+        }
     }
 }

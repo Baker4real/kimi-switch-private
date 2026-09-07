@@ -38,6 +38,12 @@ describe("设置页「当前账号主动续期」开关（issue #42）", () => {
 
   it("开关旁带 ADR 0003 要求的风险说明", () => {
     expect(settingsPage).toContain("当前账号主动续期");
-    expect(settingsPage).toContain("极端情况下官方会话可能要求重新登录");
+    const note = settingsPage.match(
+      /id="renewal-toggle-note"[^>]*>([^<]*)</,
+    )?.[1];
+    expect(note).toContain("仅在 Windows 生效");
+    expect(note).toContain("允许本工具为当前账号主动续期登录凭证");
+    expect(note).toContain("极端情况下官方会话可能要求重新登录");
+    expect(note).toContain("本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」");
   });
 });

@@ -92,8 +92,8 @@ async fn bind_web_account(
 }
 
 #[tauri::command]
-fn open_url(url: String) -> Result<(), CommandError> {
-    Backend::open_url(&url).map_err(map_err)
+async fn open_url(url: String) -> Result<(), CommandError> {
+    Backend::open_url(&url).await.map_err(map_err)
 }
 
 #[tauri::command]
@@ -133,7 +133,7 @@ fn set_auto_swap_prefer_lower_tier(enabled: bool) -> Result<bool, CommandError> 
 fn fix_taskbar_icon(window: &tauri::WebviewWindow) {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SendMessageW, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
+        LoadImageW, SendMessageW, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR,
         WM_SETICON,
     };
 
@@ -167,11 +167,62 @@ fn fix_taskbar_icon(window: &tauri::WebviewWindow) {
             }
             let hwnd = hwnd as *mut _;
             SendMessageW(hwnd, WM_SETICON as u32, ICON_BIG as usize, h_big as isize);
-            SendMessageW(hwnd, WM_SETICON as u32, ICON_SMALL as usize, h_small as isize);
+            SendMessageW(
+                hwnd,
+                WM_SETICON as u32,
+                ICON_SMALL as usize,
+                h_small as isize,
+            );
             // HICON 不转移所有权给窗口，须存活到进程结束；GUI 生命周期内有意不释放。
             let _ = (h_big, h_small);
         }
     });
+}
+
+/// 初始化失败时要弹给用户的文案与进程退出码（无控制台子系统下不能只 panic）。
+struct InitFailureNotice {
+    title: String,
+    message: String,
+    exit_code: i32,
+}
+
+fn init_failure_notice(err: &impl std::fmt::Display) -> InitFailureNotice {
+    InitFailureNotice {
+        title: "kimi-switch".into(),
+        message: format!("初始化失败：{err}"),
+        exit_code: 1,
+    }
+}
+
+fn show_native_error_dialog(title: &str, message: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+        let title = wide(title);
+        let message = wide(message);
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{title}: {message}");
+    }
+}
+
+fn abort_on_init_failure(err: &anyhow::Error) -> ! {
+    let notice = init_failure_notice(err);
+    eprintln!("kimi-switch: {}", notice.message);
+    show_native_error_dialog(&notice.title, &notice.message);
+    std::process::exit(notice.exit_code);
 }
 
 pub fn run() {
@@ -180,10 +231,7 @@ pub fn run() {
             backend.sync_local_active();
             Arc::new(backend)
         }
-        Err(err) => {
-            eprintln!("kimi-switch: 初始化失败: {err:#}");
-            panic!("kimi-switch 初始化失败: {err:#}");
-        }
+        Err(err) => abort_on_init_failure(&err),
     };
 
     tauri::Builder::default()
@@ -222,4 +270,17 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running kimi-switch");
+}
+
+#[cfg(test)]
+mod init_failure_tests {
+    use super::init_failure_notice;
+
+    #[test]
+    fn init_failure_notice_uses_chinese_message_and_nonzero_exit() {
+        let notice = init_failure_notice(&"凭证文件损坏");
+        assert_eq!(notice.title, "kimi-switch");
+        assert_eq!(notice.message, "初始化失败：凭证文件损坏");
+        assert_eq!(notice.exit_code, 1);
+    }
 }

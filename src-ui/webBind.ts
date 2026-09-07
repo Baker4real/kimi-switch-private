@@ -16,5 +16,5 @@ export function parseWebToken(raw: string): string | null {
 /** 绑定对话框的说明文案：账号显示名帮用户核对绑的是哪张卡，
  * 粘贴来源（控制台 localStorage 的 access_token）写清楚。 */
 export function webBindCopy(displayName: string): string {
-  return `绑定「${displayName}」后这张卡可显示会员有效期。打开 kimi.com 控制台并登录同一账号，在浏览器开发者工具（F12）→ Application → Local Storage → www.kimi.com 中复制 access_token 的值，粘贴到下面。`;
+  return `绑定「${displayName}」后这张卡可显示会员到期。打开 kimi.com 控制台并登录同一账号，在浏览器开发者工具（F12）→ Application → Local Storage → www.kimi.com 中复制 access_token 的值，粘贴到下面。`;
 }

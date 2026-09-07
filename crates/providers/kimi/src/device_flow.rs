@@ -70,9 +70,11 @@ async fn request_device_code_at(oauth_base: &str) -> Result<DeviceAuthorization>
         oauth_base.trim_end_matches('/')
     );
     let form = [("client_id", CLIENT_ID)];
-    let resp = crate::net::send(Some(HTTP_TIMEOUT), crate::net::ProxyFallback::Always, |client| {
-        with_common_headers(client.post(&url)).form(&form)
-    })
+    let resp = crate::net::send(
+        Some(HTTP_TIMEOUT),
+        crate::net::ProxyFallback::Always,
+        |client| with_common_headers(client.post(&url)).form(&form),
+    )
     .await
     .map_err(|e| Error::provider(format!("kimi device code request failed: {e}")))?;
     let status = resp.status();
@@ -80,7 +82,7 @@ async fn request_device_code_at(oauth_base: &str) -> Result<DeviceAuthorization>
     if !status.is_success() {
         return Err(Error::provider_http(
             status.as_u16(),
-            format!("kimi device code HTTP {status}: {body}"),
+            format!("kimi device code HTTP {status}"),
         ));
     }
     let v: serde_json::Value = serde_json::from_str(&body)
@@ -102,10 +104,7 @@ async fn request_device_code_at(oauth_base: &str) -> Result<DeviceAuthorization>
 
 /// 轮询等待用户授权，成功返回可入库的凭证 blob（kimi-code.json 同构 JSON）。
 /// `cancel` 置 true 时尽快中止。
-pub async fn poll_for_token(
-    auth: &DeviceAuthorization,
-    cancel: Arc<AtomicBool>,
-) -> Result<String> {
+pub async fn poll_for_token(auth: &DeviceAuthorization, cancel: Arc<AtomicBool>) -> Result<String> {
     poll_for_token_at(auth, &crate::oauth::oauth_host(), cancel).await
 }
 
@@ -116,8 +115,8 @@ async fn poll_for_token_at(
 ) -> Result<String> {
     let url = format!("{}/api/oauth/token", oauth_base.trim_end_matches('/'));
     let mut interval = MIN_POLL_INTERVAL.max(Duration::from_secs(auth.interval));
-    let deadline = Instant::now()
-        + MAX_POLL_DURATION.min(Duration::from_secs(auth.expires_in.max(1)));
+    let deadline =
+        Instant::now() + MAX_POLL_DURATION.min(Duration::from_secs(auth.expires_in.max(1)));
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -131,16 +130,16 @@ async fn poll_for_token_at(
         let form = [
             ("client_id", CLIENT_ID),
             ("device_code", auth.device_code.as_str()),
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:device_code",
-            ),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ];
-        let resp = crate::net::send(Some(HTTP_TIMEOUT), crate::net::ProxyFallback::Always, |client| {
-            with_common_headers(client.post(&url)).form(&form)
-        })
+        let resp = crate::net::send(
+            Some(HTTP_TIMEOUT),
+            crate::net::ProxyFallback::Always,
+            |client| with_common_headers(client.post(&url)).form(&form),
+        )
         .await
         .map_err(|e| Error::provider(format!("kimi token poll failed: {e}")))?;
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 
@@ -156,21 +155,24 @@ async fn poll_for_token_at(
             Some("access_denied") => {
                 return Err(Error::provider("授权被拒绝"));
             }
-            Some(other) => {
-                let desc = v
-                    .get("error_description")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                return Err(Error::provider(format!("kimi OAuth error: {other} {desc}")));
+            Some(_) => {
+                return Err(Error::provider_http(
+                    status.as_u16(),
+                    format!("kimi token poll HTTP {status}"),
+                ));
+            }
+            None if !status.is_success() => {
+                return Err(Error::provider_http(
+                    status.as_u16(),
+                    format!("kimi token poll HTTP {status}"),
+                ));
             }
             None => {}
         }
 
         let access = v.get("access_token").and_then(|x| x.as_str());
         let Some(access) = access else {
-            return Err(Error::provider(
-                "kimi token response missing access_token",
-            ));
+            return Err(Error::provider("kimi token response missing access_token"));
         };
         let expires_in = v.get("expires_in").and_then(|x| x.as_i64()).unwrap_or(900);
         let now = chrono::Utc::now().timestamp();
@@ -227,19 +229,74 @@ mod tests {
     #[tokio::test]
     async fn cancel_stops_polling() {
         let server = MockServer::start(vec![]);
-        let blob = poll_for_token_at(&auth(), server.base_url(), Arc::new(AtomicBool::new(true)))
-            .await;
+        let blob =
+            poll_for_token_at(&auth(), server.base_url(), Arc::new(AtomicBool::new(true))).await;
         let err = blob.unwrap_err();
-        assert_eq!(err.provider_kind(), Some(kimi_switch_core::ProviderKind::Cancelled));
+        assert_eq!(
+            err.provider_kind(),
+            Some(kimi_switch_core::ProviderKind::Cancelled)
+        );
         assert!(err.to_string().contains("取消"));
     }
 
     #[tokio::test]
     async fn access_denied_is_error() {
         let server = MockServer::start(vec![("200 OK", r#"{"error":"access_denied"}"#)]);
-        let blob = poll_for_token_at(&auth(), server.base_url(), Arc::new(AtomicBool::new(false)))
-            .await;
+        let blob =
+            poll_for_token_at(&auth(), server.base_url(), Arc::new(AtomicBool::new(false))).await;
         assert!(blob.unwrap_err().to_string().contains("拒绝"));
+    }
+
+    /// issue #81：设备码 OAuth HTTP 错误只带状态码，不得回显响应 body。
+    #[tokio::test]
+    async fn device_code_http_error_omits_response_body() {
+        let leak = "should-not-leak-device-code-body";
+        let server = MockServer::start(vec![(
+            "500 Internal Server Error",
+            r#"{"error":"server_exploded","secret":"should-not-leak-device-code-body"}"#,
+        )]);
+        let err = match request_device_code_at(server.base_url()).await {
+            Ok(_) => panic!("非 2xx 设备码申请应失败"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert_eq!(err.http_status(), Some(500), "{msg}");
+        assert!(msg.contains("500"), "错误文案须含状态码：{msg}");
+        assert!(!msg.contains(leak), "错误文案不得含响应 body：{msg}");
+        assert!(
+            !msg.contains("server_exploded"),
+            "错误文案不得含响应 body：{msg}"
+        );
+        assert_eq!(
+            server.finish(),
+            vec!["POST /api/oauth/device_authorization HTTP/1.1"]
+        );
+    }
+
+    /// issue #81：token poll 的 HTTP / 未知 OAuth 错误不得把 body 拼进用户可见文案。
+    #[tokio::test]
+    async fn token_poll_http_error_omits_response_body() {
+        let leak = "should-not-leak-poll-body";
+        let server = MockServer::start(vec![(
+            "400 Bad Request",
+            r#"{"error":"invalid_request","error_description":"should-not-leak-poll-body"}"#,
+        )]);
+        let err =
+            match poll_for_token_at(&auth(), server.base_url(), Arc::new(AtomicBool::new(false)))
+                .await
+            {
+                Ok(_) => panic!("带泄漏 body 的 poll 失败应走错误路径"),
+                Err(err) => err,
+            };
+        let msg = err.to_string();
+        assert_eq!(err.http_status(), Some(400), "{msg}");
+        assert!(msg.contains("400"), "错误文案须含状态码：{msg}");
+        assert!(!msg.contains(leak), "错误文案不得含响应 body：{msg}");
+        assert!(
+            !msg.contains("invalid_request"),
+            "错误文案不得含响应 body：{msg}"
+        );
+        assert_eq!(server.finish(), vec!["POST /api/oauth/token HTTP/1.1"]);
     }
 
     #[tokio::test]

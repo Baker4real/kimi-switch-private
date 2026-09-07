@@ -128,9 +128,18 @@ mod tests {
         let pick = |name: &'static str, value: &'static str| {
             move |n: &str| (n == name).then(|| value.to_string())
         };
-        assert!(env_proxy_present_in(pick("HTTPS_PROXY", "http://127.0.0.1:7897")));
-        assert!(env_proxy_present_in(pick("https_proxy", "http://127.0.0.1:7897")));
-        assert!(env_proxy_present_in(pick("ALL_PROXY", "socks5://127.0.0.1:1080")));
+        assert!(env_proxy_present_in(pick(
+            "HTTPS_PROXY",
+            "http://127.0.0.1:7897"
+        )));
+        assert!(env_proxy_present_in(pick(
+            "https_proxy",
+            "http://127.0.0.1:7897"
+        )));
+        assert!(env_proxy_present_in(pick(
+            "ALL_PROXY",
+            "socks5://127.0.0.1:1080"
+        )));
         assert!(env_proxy_present_in(pick("all_proxy", "http://p")));
         assert!(env_proxy_present_in(pick("HTTP_PROXY", "http://p")));
         assert!(env_proxy_present_in(pick("http_proxy", "http://p")));

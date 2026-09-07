@@ -4,7 +4,7 @@
 //! - `kimi-switch`              — 默认入口：同步本地激活账号，列出 Kimi 账号 + 5h/7d 额度。
 //!   `[auto_swap] enabled = true` 时，额度收集完成后若达阈值则自动切换并追加一行英文结果。
 //! - `kimi-switch login kimi`   — 导入当前本机 Kimi Code 已登录账号
-//!   （`~/.kimi-code/credentials/kimi-code.json`）。
+//!   （`~/.kimi-code/credentials/kimi-code.json`）。`moonshot` 为 kimi 的公司名兼容别名。
 //! - `kimi-switch swap <id|N>`  — 切换激活账号。原子写 + 快照回滚，不依赖网络/quota。
 //!   无参数时只打印编号列表，不做切换。
 //! - `kimi-switch rm <id|N>`    — 删除账号（registry + 凭证仓库 + 墓碑；网页会员
@@ -54,7 +54,7 @@ struct Cli {
 enum Cmd {
     /// Import the currently signed-in Kimi Code account.
     Login {
-        /// Provider to log in: only `kimi` is supported.
+        /// Provider to log in: `kimi` is supported; `moonshot` is an alias.
         provider: String,
     },
 
@@ -116,8 +116,12 @@ impl AppContext {
     }
 }
 
-/// 把用户传入的引用解析到具体账号：纯数字 N 取显示顺序第 N 个；
-/// 否则按 id / label / `kimi/<id>` 走 `find_unique`。
+/// 把用户传入的引用解析到具体账号。
+///
+/// 歧义定义：trim 后若能 `parse::<usize>()`，**一律按 1 起编号**，即使该数字
+/// 字符串同时也是某个账号的 id / label。`0` 非法；越界报错、不回退别名。
+/// 编号命中后不走 `find_unique`。仅当输入不是纯数字时才按 id / label /
+/// `kimi/<id>` 解析。
 fn resolve_account(ctx: &AppContext, input: &str) -> Result<Account> {
     let trimmed = input.trim();
     if let Ok(n) = trimmed.parse::<usize>() {
@@ -433,7 +437,7 @@ fn format_quotas(quotas: &[Quota]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// login kimi
+// login kimi（`moonshot` 为公司名兼容别名，不是第二套 provider）
 // ---------------------------------------------------------------------------
 
 async fn login(ctx: &AppContext, provider: &str) -> Result<()> {
@@ -468,7 +472,9 @@ async fn login(ctx: &AppContext, provider: &str) -> Result<()> {
             println!("login → kimi/{}", account.id);
             Ok(())
         }
-        other => anyhow::bail!("unknown provider: {other} (only `kimi` is supported)"),
+        other => {
+            anyhow::bail!("unknown provider: {other} (`kimi` is supported; `moonshot` is an alias)")
+        }
     }
 }
 
@@ -694,6 +700,100 @@ mod tests {
         assert!(
             Cli::try_parse_from(["kimi-switch", "bind-web", "1", "--token=x"]).is_err(),
             "--token=... 形式同样不得存在"
+        );
+    }
+
+    /// issue #92：`login` 的 clap 帮助须同时写清 `kimi` 与公司名别名 `moonshot`。
+    #[test]
+    fn login_help_documents_kimi_and_moonshot_alias() {
+        use clap::CommandFactory as _;
+
+        let help = super::Cli::command()
+            .find_subcommand("login")
+            .expect("login")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("`kimi` is supported; `moonshot` is an alias"),
+            "{help}"
+        );
+        assert!(
+            !help.contains("only `kimi`"),
+            "不得再写成只支持 kimi：{help}"
+        );
+    }
+
+    /// issue #92：未知 provider 错误与 clap 帮助同一套说法。
+    #[tokio::test]
+    async fn login_unknown_provider_mentions_kimi_and_moonshot_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = cli_ctx(&tmp);
+        let err = super::login(&ctx, "openai").await.unwrap_err().to_string();
+        assert!(
+            err.contains("`kimi` is supported; `moonshot` is an alias"),
+            "{err}"
+        );
+        assert!(!err.contains("only `kimi`"), "不得再写成只支持 kimi：{err}");
+    }
+
+    fn cli_ctx(tmp: &tempfile::TempDir) -> super::AppContext {
+        use kimi_switch_core::{AccountRegistry, CredentialStore, FileStore};
+        use std::sync::Arc;
+
+        let store: Arc<dyn CredentialStore> =
+            Arc::new(FileStore::new(tmp.path().join("creds.json")));
+        let registry = Arc::new(AccountRegistry::new(tmp.path().join("registry.toml")));
+        let kimi = Arc::new(kimi_switch_kimi::new(store.clone(), registry.clone()));
+        let audit = super::AuditLog::new(tmp.path().join("audit.log"));
+        super::AppContext {
+            store,
+            registry,
+            kimi,
+            audit,
+        }
+    }
+
+    /// issue #92：`0` 非法（编号从 1 起），即使存在 label/id 为 `"0"` 的账号也不走别名。
+    #[test]
+    fn resolve_account_rejects_index_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = cli_ctx(&tmp);
+        let mut labeled_zero = acc("alice", true);
+        labeled_zero.label = "0".into();
+        ctx.registry.upsert(labeled_zero).unwrap();
+
+        let err = super::resolve_account(&ctx, "0").unwrap_err().to_string();
+        assert!(err.contains("index 0"), "{err}");
+        assert!(err.contains("starts at 1"), "{err}");
+    }
+
+    /// issue #92：越界编号报错，不回退到 id/label。
+    #[test]
+    fn resolve_account_rejects_out_of_range_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = cli_ctx(&tmp);
+        ctx.registry.upsert(acc("alice", true)).unwrap();
+        ctx.registry.upsert(acc("bob", false)).unwrap();
+
+        let err = super::resolve_account(&ctx, "3").unwrap_err().to_string();
+        assert!(err.contains("index 3"), "{err}");
+    }
+
+    /// issue #92：纯数字优先按 1 起编号；与别名冲突时编号命中则不走别名。
+    #[test]
+    fn resolve_account_numeric_alias_still_uses_1_based_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = cli_ctx(&tmp);
+        let mut first = acc("alice", true);
+        first.label = "2".into();
+        ctx.registry.upsert(first).unwrap();
+        ctx.registry.upsert(acc("bob", false)).unwrap();
+
+        let got = super::resolve_account(&ctx, "2").unwrap();
+        assert_eq!(
+            got.id.0, "bob",
+            "输入 2 必须命中编号第 2 个，而不是 label 为 2 的第 1 个"
         );
     }
 

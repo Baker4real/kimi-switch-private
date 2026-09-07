@@ -4,7 +4,10 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "styles.css"), "utf8");
+const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "styles.css"), "utf8").replace(
+  /\r\n/g,
+  "\n",
+);
 
 function ruleBody(selector: string): string {
   const idx = css.indexOf(`${selector} {`);
@@ -55,6 +58,29 @@ describe("额度条字号与样式收尾", () => {
       ".window-control-button.is-maximized .window-control-icon--maximize::after",
     );
     expect(css).not.toMatch(/--radius-shell:/);
+  });
+});
+
+describe("全局忙碌指示布局", () => {
+  it("工具条三列：导航居中、忙碌指示靠右，各页都能看见", () => {
+    const toolbar = ruleBody(".app-toolbar");
+    expect(toolbar).toMatch(/display:\s*grid\s*;/);
+    expect(toolbar).toMatch(/grid-template-columns:\s*1fr\s+auto\s+1fr\s*;/);
+    const pill = ruleBody(".app-toolbar .quota-monitor-pill");
+    expect(pill).toMatch(/grid-column:\s*3\s*;/);
+    expect(pill).toMatch(/justify-self:\s*end\s*;/);
+  });
+});
+
+describe("主题化焦点环", () => {
+  it("textarea 与 button/input 共用同一 :focus-visible 规则", () => {
+    expect(css).toMatch(
+      /button:focus-visible,\s*input:focus-visible,\s*textarea:focus-visible,\s*a:focus-visible \{/
+    );
+    const start = css.indexOf("button:focus-visible");
+    const body = css.slice(start, start + 220);
+    expect(body).toContain("outline: 2px solid var(--focus-ring)");
+    expect(body).toContain("outline-offset: 2px");
   });
 });
 

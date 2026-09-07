@@ -33,12 +33,13 @@ describe("membershipPlanHtml", () => {
     expect(html).not.toContain("2027-08-27");
   });
 
-  it("档位在但无到期日时显示绑定弱提示（#49 票面原文），不出现「有效期至」", () => {
+  it("档位在但无到期日时显示绑定弱提示（概念名「会员到期」），不出现「有效期至」", () => {
     const html = membershipPlanHtml(fields({ membership_expiry_hint: true }));
     expect(html).toBe(
-      `Allegretto <span class="plan-expiry">绑定后可显示有效期</span>`,
+      `Allegretto <span class="plan-expiry">绑定后可显示会员到期</span>`,
     );
     expect(html).not.toContain("有效期至");
+    expect(html).not.toContain("绑定后可显示有效期");
   });
 
   it("刷新失败缓存降级：档位行无日期、无常驻重新绑定提示句", () => {
@@ -49,6 +50,7 @@ describe("membershipPlanHtml", () => {
     expect(html).not.toContain("有效期至");
     expect(html).not.toContain("重新绑定后可刷新有效期");
     expect(html).not.toContain("绑定后可显示有效期");
+    expect(html).not.toContain("绑定后可显示会员到期");
   });
 
   it("hint 关闭且无到期日时只显示档位", () => {
@@ -71,7 +73,9 @@ describe("bindWebButtonHtml（issue #51 绑定入口，#63 两态）", () => {
     expect(html).toContain("plan-bind");
     expect(html).toContain(">绑定</button>");
     expect(html).not.toContain("重新绑定");
-    expect(html).toContain(`title="绑定网页登录，刷新会员有效期"`);
+    expect(html).toContain(`title="绑定网页登录，更新会员到期"`);
+    expect(html).not.toContain("刷新会员有效期");
+    expect(html).not.toContain("有效期");
     expect(html).not.toContain("danger");
     expect(html).not.toContain("error");
   });

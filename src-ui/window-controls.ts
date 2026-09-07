@@ -9,6 +9,23 @@ function requiredButton(id: string): HTMLButtonElement {
   return element;
 }
 
+/** 最大化按钮读屏名称：普通态「最大化」，已最大化「还原」。 */
+export function maximizeButtonLabel(maximized: boolean): string {
+  return maximized ? "还原" : "最大化";
+}
+
+/** 同步最大化按钮的视觉 class 与 aria-label。 */
+export function applyMaximizePresentation(
+  button: {
+    classList: { toggle(token: string, force?: boolean): void; remove(token: string): void };
+    setAttribute(name: string, value: string): void;
+  },
+  maximized: boolean,
+): void {
+  button.classList.toggle("is-maximized", maximized);
+  button.setAttribute("aria-label", maximizeButtonLabel(maximized));
+}
+
 export async function setupWindowControls(): Promise<void> {
   const minimizeButton = requiredButton("window-minimize-button");
   const maximizeButton = requiredButton("window-maximize-button");
@@ -27,9 +44,9 @@ export async function setupWindowControls(): Promise<void> {
   const syncMaximizeState = async (): Promise<void> => {
     try {
       const maximized = await appWindow.isMaximized();
-      maximizeButton.classList.toggle("is-maximized", maximized);
+      applyMaximizePresentation(maximizeButton, maximized);
     } catch {
-      maximizeButton.classList.remove("is-maximized");
+      applyMaximizePresentation(maximizeButton, false);
     }
   };
 

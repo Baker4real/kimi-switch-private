@@ -437,7 +437,9 @@ mod tests {
 
     #[test]
     fn credential_expired_401_keeps_401_semantics() {
-        let err = Error::quota_credential_expired("凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权");
+        let err = Error::quota_credential_expired(
+            "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+        );
         assert_eq!(err.http_status(), Some(401));
         assert!(err.is_authentication_failure());
         assert!(!err.is_retryable());

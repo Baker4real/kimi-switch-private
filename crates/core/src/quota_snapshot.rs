@@ -161,7 +161,9 @@ where
                 }
                 let failed_at = failure.failed_at;
                 out[idx] = Some(match cache.get(provider_id, &id.0) {
-                    Some(entry) if !error.is_authentication_failure() => from_cache(id, entry, true),
+                    Some(entry) if !error.is_authentication_failure() => {
+                        from_cache(id, entry, true)
+                    }
                     _ => failed(id, error, failed_at),
                 });
                 continue;
@@ -455,9 +457,14 @@ mod tests {
         assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
 
         let written = QuotaCache::load(&path);
-        let entry = written.get("kimi", "alice").expect("success cache rewritten");
+        let entry = written
+            .get("kimi", "alice")
+            .expect("success cache rewritten");
         assert!(Utc::now() - entry.cached_at < ChronoDuration::seconds(2));
-        assert_eq!(entry.quotas[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
+        assert_eq!(
+            entry.quotas[0].membership.as_deref(),
+            Some("LEVEL_ADVANCED")
+        );
     }
 
     #[tokio::test]
@@ -679,7 +686,9 @@ mod tests {
         cache.record_failure(
             "kimi",
             "alice",
-            &Error::quota_credential_expired("凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权"),
+            &Error::quota_credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            ),
         );
         cache.save(&path);
 

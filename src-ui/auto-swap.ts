@@ -46,13 +46,12 @@ export function silentQuotaMessage(message: UiMessage | null): UiMessage | null 
   if (!message) {
     return null;
   }
-  const { text } = message;
-  if (
-    text.startsWith("已自动切换到") ||
-    text === "没有可自动切换的账号" ||
-    text === "自动切换失败"
-  ) {
-    return message;
+  switch (message.kind) {
+    case "auto_swap_success":
+    case "auto_swap_no_candidate":
+    case "auto_swap_failed":
+      return message;
+    default:
+      return null;
   }
-  return null;
 }

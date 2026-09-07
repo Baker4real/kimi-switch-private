@@ -19,7 +19,7 @@ function sampleSnapshot(): Snapshot {
     proactive_renewal: false,
     auto_swap: false,
     auto_swap_prefer_lower_tier: false,
-    message: { text: "授权成功，已添加账号 u1", tone: "ok" },
+    message: { text: "授权成功，已添加账号 u1", tone: "ok", kind: "generic" },
   };
 }
 

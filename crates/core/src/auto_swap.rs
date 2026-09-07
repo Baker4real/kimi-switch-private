@@ -836,18 +836,14 @@ mod tests {
                 name: "prefer on：会员到期日不参与排序",
                 settings: prefer_lower(),
                 last_auto_swap_at: None,
-                accounts: vec![
-                    settled("alice", true),
-                    acc("bob", false, None),
-                    {
-                        let mut carol = acc("carol", false, None);
-                        carol.extra.insert(
-                            crate::membership_expiry::EXTRA_NEXT_BILLING_TIME.into(),
-                            serde_json::Value::String("2026-01-01".into()),
-                        );
-                        carol
-                    },
-                ],
+                accounts: vec![settled("alice", true), acc("bob", false, None), {
+                    let mut carol = acc("carol", false, None);
+                    carol.extra.insert(
+                        crate::membership_expiry::EXTRA_NEXT_BILLING_TIME.into(),
+                        serde_json::Value::String("2026-01-01".into()),
+                    );
+                    carol
+                }],
                 snapshots: vec![
                     ready("alice", w99),
                     membered("bob", w10, "LEVEL_INTERMEDIATE"),

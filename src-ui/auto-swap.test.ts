@@ -33,21 +33,41 @@ describe("autoSwapSwitchView", () => {
 });
 
 describe("silentQuotaMessage", () => {
-  it("保留自动切换成功 / 无候选 / 失败", () => {
-    expect(
-      silentQuotaMessage({ text: "已自动切换到 工作机", tone: "ok" }),
-    ).toEqual({ text: "已自动切换到 工作机", tone: "ok" });
-    expect(
-      silentQuotaMessage({ text: "没有可自动切换的账号", tone: "err" }),
-    ).toEqual({ text: "没有可自动切换的账号", tone: "err" });
-    expect(silentQuotaMessage({ text: "自动切换失败", tone: "err" })).toEqual({
+  it("按 kind 保留自动切换成功 / 无候选 / 失败，文案只作钉版", () => {
+    const success = {
+      text: "已自动切换到 工作机",
+      tone: "ok" as const,
+      kind: "auto_swap_success" as const,
+    };
+    const empty = {
+      text: "没有可自动切换的账号",
+      tone: "err" as const,
+      kind: "auto_swap_no_candidate" as const,
+    };
+    const failed = {
       text: "自动切换失败",
-      tone: "err",
-    });
+      tone: "err" as const,
+      kind: "auto_swap_failed" as const,
+    };
+    expect(silentQuotaMessage(success)).toEqual(success);
+    expect(silentQuotaMessage(empty)).toEqual(empty);
+    expect(silentQuotaMessage(failed)).toEqual(failed);
+  });
+
+  it("普通 toast 即使文案像自动切换也丢掉", () => {
+    expect(
+      silentQuotaMessage({
+        text: "已自动切换到 工作机",
+        tone: "ok",
+        kind: "generic",
+      }),
+    ).toBeNull();
   });
 
   it("丢掉刚刚更新过和 null", () => {
-    expect(silentQuotaMessage({ text: "刚刚更新过", tone: "info" })).toBeNull();
+    expect(
+      silentQuotaMessage({ text: "刚刚更新过", tone: "info", kind: "generic" }),
+    ).toBeNull();
     expect(silentQuotaMessage(null)).toBeNull();
   });
 });
