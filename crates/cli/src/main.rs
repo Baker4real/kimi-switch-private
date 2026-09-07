@@ -2,7 +2,8 @@
 //!
 //! 命令面（刻意保持最小）：
 //! - `kimi-switch`              — 默认入口：同步本地激活账号，列出 Kimi 账号 + 5h/7d 额度。
-//!   `[auto_swap] enabled = true` 时，额度收集完成后若达阈值则自动切换并追加一行英文结果。
+//!   `[auto_swap] enabled = true` 时，额度收集完成后若达阈值则自动切换并追加一行英文结果；
+//!   `resident_lower_tier` 子开关开启时，未达阈值也可能因档位更低而回驻（ADR-0008）。
 //! - `kimi-switch login kimi`   — 导入当前本机 Kimi Code 已登录账号
 //!   （`~/.kimi-code/credentials/kimi-code.json`）。`moonshot` 为 kimi 的公司名兼容别名。
 //! - `kimi-switch swap <id|N>`  — 切换激活账号。原子写 + 快照回滚，不依赖网络/quota。
@@ -26,10 +27,12 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    decide_auto_swap, membership_expiry_from_extra, prettify_membership, read_last_auto_swap_at,
-    settings, write_last_auto_swap_at, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
-    AutoSwapDecision, AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore,
-    Provider, Quota, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
+    decide_auto_swap, decide_resident_return, membership_expiry_from_extra, prettify_membership,
+    read_last_auto_swap_at, read_manual_hold_until, set_manual_hold_until, settings,
+    write_last_auto_swap_at, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
+    AutoSwapDecision, AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget, CredentialStore,
+    FileStore, KeyringStore, Provider, Quota, QuotaSnapshot, QuotaState, QuotaWindow,
+    RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 
@@ -259,6 +262,8 @@ async fn maybe_run_status_auto_swap(
     };
     let state_path = paths.auto_swap_state_file();
     let last = read_last_auto_swap_at(&state_path);
+    // 手动保持期与冷却同住一个状态文件（ADR-0008 第 4/5 条）。
+    let manual_hold_until = read_manual_hold_until(&state_path);
     let kimi = ctx.kimi.clone();
     apply_status_auto_swap(
         &settings.auto_swap,
@@ -266,6 +271,7 @@ async fn maybe_run_status_auto_swap(
         snapshots,
         Utc::now(),
         last,
+        manual_hold_until,
         move |id| async move { kimi.activate(&id).await },
         &ctx.audit,
         &state_path,
@@ -274,12 +280,15 @@ async fn maybe_run_status_auto_swap(
 }
 
 /// collect 完成后的自动切换编排。开关关闭立即返回；activate 失败不写冷却。
+/// 耗尽判定 Stay 时再评估回驻（issue #97 / ADR-0008）：无合格目标完全静默，
+/// 不套用「没有可切换的账号」提示；回驻 activate 失败同样不写冷却。
 async fn apply_status_auto_swap<F, Fut>(
     auto_swap: &kimi_switch_core::settings::AutoSwap,
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
+    manual_hold_until: Option<DateTime<Utc>>,
     activate: F,
     audit: &AuditLog,
     state_path: &Path,
@@ -307,7 +316,44 @@ where
                 swapped: false,
             }
         }
-        AutoSwapDecision::Stay { .. } => AutoSwapStatusEffect::none(),
+        // 未达耗尽阈值 / 冷却 / 宽限期等 Stay：耗尽路径不动作，转交回驻判定。
+        AutoSwapDecision::Stay { .. } => {
+            match decide_resident_return(
+                accounts,
+                snapshots,
+                auto_swap,
+                now,
+                last_auto_swap_at,
+                manual_hold_until,
+            ) {
+                None => AutoSwapStatusEffect::none(),
+                Some(target) => match activate(target.to.clone()).await {
+                    Ok(()) => {
+                        write_last_auto_swap_at(state_path, Utc::now());
+                        audit.append(
+                            AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
+                                .with_detail(resident_return_audit_detail(&target)),
+                        );
+                        AutoSwapStatusEffect {
+                            line: Some(resident_return_line(&target)),
+                            swapped: true,
+                        }
+                    }
+                    Err(err) => {
+                        audit.append(AuditEvent::err(
+                            "auto_swap",
+                            "kimi",
+                            Some(target.to.0.as_str()),
+                            &err.to_string(),
+                        ));
+                        AutoSwapStatusEffect {
+                            line: Some(auto_swap_failed_line(&target.to, &err)),
+                            swapped: false,
+                        }
+                    }
+                },
+            }
+        }
         AutoSwapDecision::Swap(target) => match activate(target.to.clone()).await {
             Ok(()) => {
                 write_last_auto_swap_at(state_path, Utc::now());
@@ -365,6 +411,19 @@ fn auto_swap_no_candidate_line() -> &'static str {
 
 fn auto_swap_failed_line(to: &AccountId, err: impl std::fmt::Display) -> String {
     format!("auto_swap kimi/{to} failed: {err}")
+}
+
+/// 回驻成功行：与耗尽成功行同风格，括号内标注 resident return（ADR-0008）。
+fn resident_return_line(target: &AutoSwapReturn) -> String {
+    format!(
+        "auto_swap kimi/{} → kimi/{} (resident return)",
+        target.from, target.to
+    )
+}
+
+/// 回驻审计细节：kind=return 标识非耗尽触发；目标账号在事件的 account 字段里。
+fn resident_return_audit_detail(target: &AutoSwapReturn) -> String {
+    format!("kind=return from={}", target.from)
 }
 
 fn auto_swap_audit_detail(target: &AutoSwapTarget) -> String {
@@ -494,6 +553,18 @@ async fn swap(ctx: &AppContext, id_input: Option<&str>) -> Result<()> {
         Ok(()) => {
             ctx.audit
                 .append(AuditEvent::ok("activate", "kimi", Some(acc.id.0.as_str())));
+            // 手动切换写回驻保持期（issue #97 / ADR-0008）：期间回驻不触发，
+            // 耗尽被迫切换不受影响。只写本机状态文件，不引入网络依赖；
+            // 写失败在 core 内只 warn，不影响 swap 成功结果。
+            if let Ok(paths) = AppPaths::resolve() {
+                set_manual_hold_until(
+                    &paths.auto_swap_state_file(),
+                    Utc::now()
+                        + chrono::Duration::milliseconds(
+                            settings::current().auto_swap.manual_hold_ms,
+                        ),
+                );
+            }
             println!("swap → kimi/{}", acc.id);
             Ok(())
         }
@@ -856,6 +927,8 @@ mod tests {
             cooldown_ms: 5 * 60 * 1000,
             settle_grace_ms: 60 * 1000,
             prefer_lower_tier: false,
+            resident_lower_tier: false,
+            manual_hold_ms: 8 * 60 * 60 * 1000,
         }
     }
 
@@ -910,6 +983,7 @@ mod tests {
             &[ready("alice", 100, 100), ready("bob", 10, 100)],
             now(),
             None,
+            None,
             |_id| async { panic!("disabled 不得 activate") },
             &audit,
             &state,
@@ -936,6 +1010,7 @@ mod tests {
             &[acc("alice", true), acc("bob", false)],
             &[ready("alice", 99, 100), ready("bob", 10, 100)],
             now(),
+            None,
             None,
             move |id| {
                 let activated = activated_cb.clone();
@@ -991,6 +1066,7 @@ mod tests {
             &[ready("alice", 99, 100), bob, carol],
             now(),
             None,
+            None,
             move |id| {
                 let activated = activated_cb.clone();
                 async move {
@@ -1020,6 +1096,121 @@ mod tests {
         assert!(detail.contains("used=99%"), "{detail}");
     }
 
+    /// issue #97 回驻（ADR-0008）：当前账号未耗尽但档位更高，存在档位严格更低的
+    /// 合格停泊账号 → 自动切回低档：activate 低档账号、写冷却、审计 detail 带
+    /// kind=return、输出成功行。
+    #[tokio::test]
+    async fn status_auto_swap_resident_return_swaps_to_lower_tier() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.resident_lower_tier = true;
+        let mut alice = ready("alice", 10, 100);
+        alice.membership = Some("LEVEL_ADVANCED".into());
+        let mut bob = ready("bob", 20, 100);
+        bob.membership = Some("LEVEL_INTERMEDIATE".into());
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = super::apply_status_auto_swap(
+            &settings,
+            &[acc("alice", true), acc("bob", false)],
+            &[alice, bob],
+            now(),
+            None,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.swapped);
+        assert!(
+            effect.line.as_deref().is_some_and(|line| !line.is_empty()),
+            "回驻成功必须输出结果行"
+        );
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob"),
+            "必须切回档位更低的 bob"
+        );
+        assert!(kimi_switch_core::read_last_auto_swap_at(&state).is_some());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        let detail = event.detail.expect("success audit has detail");
+        assert!(detail.contains("kind=return"), "{detail}");
+        assert!(detail.contains("from=alice"), "{detail}");
+    }
+
+    /// 手动保持期内（manual_hold_until = now + 1h）不回驻：不 activate、
+    /// 无输出行、不落冷却、无审计。
+    #[tokio::test]
+    async fn status_auto_swap_resident_return_held_within_manual_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.resident_lower_tier = true;
+        let mut alice = ready("alice", 10, 100);
+        alice.membership = Some("LEVEL_ADVANCED".into());
+        let mut bob = ready("bob", 20, 100);
+        bob.membership = Some("LEVEL_INTERMEDIATE".into());
+        let effect = super::apply_status_auto_swap(
+            &settings,
+            &[acc("alice", true), acc("bob", false)],
+            &[alice, bob],
+            now(),
+            None,
+            Some(now() + chrono::Duration::hours(1)),
+            |_id| async { panic!("保持期内不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.line.is_none());
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        assert!(!audit.path().exists());
+    }
+
+    /// 回驻子开关默认关：同样的档位差完全无副作用（静默语义，无提示行）。
+    #[tokio::test]
+    async fn status_auto_swap_resident_return_off_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut alice = ready("alice", 10, 100);
+        alice.membership = Some("LEVEL_ADVANCED".into());
+        let mut bob = ready("bob", 20, 100);
+        bob.membership = Some("LEVEL_INTERMEDIATE".into());
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", true), acc("bob", false)],
+            &[alice, bob],
+            now(),
+            None,
+            None,
+            |_id| async { panic!("回驻关闭不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.line.is_none());
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        assert!(!audit.path().exists());
+    }
+
     /// activate 失败：输出失败行、不写冷却、当前账号路径不视为已切换。
     #[tokio::test]
     async fn status_auto_swap_activate_failure_outputs_line_without_persist() {
@@ -1031,6 +1222,7 @@ mod tests {
             &[acc("alice", true), acc("bob", false)],
             &[ready("alice", 99, 100), ready("bob", 10, 100)],
             now(),
+            None,
             None,
             |_id| async { Err(kimi_switch_core::Error::provider("disk full")) },
             &audit,
@@ -1065,6 +1257,7 @@ mod tests {
             &[acc("alice", true), acc("bob", false)],
             &[ready("alice", 99, 100), ready("bob", 99, 100)],
             now(),
+            None,
             None,
             |_id| async { panic!("无候选不得 activate") },
             &audit,

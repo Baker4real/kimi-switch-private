@@ -25,7 +25,8 @@ pub mod time;
 pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
 pub use auto_swap::{
-    decide_auto_swap, read_last_auto_swap_at, write_last_auto_swap_at, AutoSwapDecision,
+    decide_auto_swap, decide_resident_return, read_last_auto_swap_at, read_manual_hold_until,
+    set_manual_hold_until, write_last_auto_swap_at, AutoSwapDecision, AutoSwapReturn,
     AutoSwapSkipReason, AutoSwapTarget,
 };
 pub use display_name::{

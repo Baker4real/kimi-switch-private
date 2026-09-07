@@ -185,6 +185,7 @@ pin_dto_fields!(
     "proactive_renewal",
     "auto_swap",
     "auto_swap_prefer_lower_tier",
+    "auto_swap_resident_lower_tier",
     "message",
 );
 pin_dto_fields!(UI_MESSAGE_JSON_KEYS, UI_API_TS, "text", "tone", "kind",);
@@ -399,6 +400,8 @@ pub struct Snapshot {
     pub auto_swap: bool,
     /// 「自动切换时优先低档位账号」子开关（issue #71）：直读 config.toml，默认关。
     pub auto_swap_prefer_lower_tier: bool,
+    /// 「额度恢复后回驻低档账号」子开关（issue #95）：直读 config.toml，默认关。
+    pub auto_swap_resident_lower_tier: bool,
     pub message: Option<UiMessage>,
 }
 

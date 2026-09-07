@@ -121,6 +121,12 @@ fn set_auto_swap_prefer_lower_tier(enabled: bool) -> Result<bool, CommandError> 
     Backend::save_auto_swap_prefer_lower_tier(enabled).map_err(map_err)
 }
 
+/// 「额度恢复后回驻低档账号」子开关（issue #95）：写 config.toml，返回落盘后的生效值。
+#[tauri::command]
+fn set_auto_swap_resident_lower_tier(enabled: bool) -> Result<bool, CommandError> {
+    Backend::save_auto_swap_resident_lower_tier(enabled).map_err(map_err)
+}
+
 /// 任务栏图标修正（Windows）：tao 只给窗口设 16px 的 ICON_SMALL，从不设 ICON_BIG；
 /// Win11 任务栏按钮在 >100% 缩放下读 ICON_BIG 槽位，为空时渲染白色占位图、
 /// 不会回退到 SMALL，表现为「任务栏图标空白」。
@@ -267,6 +273,7 @@ pub fn run() {
             set_proactive_renewal,
             set_auto_swap,
             set_auto_swap_prefer_lower_tier,
+            set_auto_swap_resident_lower_tier,
         ])
         .run(tauri::generate_context!())
         .expect("error while running kimi-switch");

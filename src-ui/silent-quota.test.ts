@@ -38,6 +38,7 @@ function sampleSnapshot(message: UiMessage | null = null): Snapshot {
     proactive_renewal: false,
     auto_swap: false,
     auto_swap_prefer_lower_tier: false,
+    auto_swap_resident_lower_tier: false,
     message,
   };
 }

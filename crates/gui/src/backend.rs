@@ -9,10 +9,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    decide_auto_swap, display_name, membership_expiry_from_extra, membership_period_days,
-    membership_remaining_days, membership_start_from_extra, official_nickname_known,
-    prettify_membership, read_last_auto_swap_at, write_last_auto_swap_at, Account, AccountId,
-    AccountRegistry, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapSkipReason, AutoSwapTarget,
+    decide_auto_swap, decide_resident_return, display_name, membership_expiry_from_extra,
+    membership_period_days, membership_remaining_days, membership_start_from_extra,
+    official_nickname_known, prettify_membership, read_last_auto_swap_at, read_manual_hold_until,
+    set_manual_hold_until, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
+    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget,
     CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
     QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
     WEB_STORE_FIELD,
@@ -169,6 +170,24 @@ impl Backend {
         Ok(settings.auto_swap.prefer_lower_tier)
     }
 
+    /// 直读 config.toml 里的「额度恢复后回驻低档账号」子开关；文件缺失/损坏都回落默认关。
+    pub fn load_auto_swap_resident_lower_tier() -> bool {
+        AppPaths::resolve()
+            .and_then(|p| {
+                Ok(kimi_switch_core::settings::load_from(&p.config_file())?
+                    .auto_swap
+                    .resident_lower_tier)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 持久化子开关到 config.toml（保注释原子写），返回落盘后的生效值。
+    pub fn save_auto_swap_resident_lower_tier(enabled: bool) -> Result<bool> {
+        let settings = kimi_switch_core::settings::set_auto_swap_resident_lower_tier(enabled)
+            .context("写入设置失败")?;
+        Ok(settings.auto_swap.resident_lower_tier)
+    }
+
     fn has_pending_auth(&self) -> bool {
         has_live_pending(
             self.pending_auth
@@ -207,6 +226,7 @@ impl Backend {
         };
         let state_path = paths.auto_swap_state_file();
         let last = read_last_auto_swap_at(&state_path);
+        let hold = read_manual_hold_until(&state_path);
         let kimi = self.kimi.clone();
         apply_snapshot_auto_swap(
             &settings,
@@ -226,6 +246,7 @@ impl Backend {
             snapshots,
             Utc::now(),
             last,
+            hold,
             move |id| async move { kimi.activate(&id).await },
             &self.audit,
             &state_path,
@@ -296,6 +317,7 @@ impl Backend {
             proactive_renewal: Self::load_proactive_renewal(),
             auto_swap: Self::load_auto_swap(),
             auto_swap_prefer_lower_tier: Self::load_auto_swap_prefer_lower_tier(),
+            auto_swap_resident_lower_tier: Self::load_auto_swap_resident_lower_tier(),
             message: attach_auto_swap_message(message, reason, &stats, effect.message),
         }
     }
@@ -361,6 +383,15 @@ impl Backend {
             .with_context(|| swap_failure_message(&account))?;
         self.audit
             .append(AuditEvent::ok("activate", "kimi", Some(id.0.as_str())));
+        // 手动切换写回驻保持期（issue #95 / ADR-0008）：紧跟其后的快照判定不会把
+        // 用户刚选的账号又被回驻改掉；耗尽被迫切换不受保持期影响。
+        if let Ok(paths) = AppPaths::resolve() {
+            let hold_ms = Self::load_auto_swap_settings().manual_hold_ms;
+            set_manual_hold_until(
+                &paths.auto_swap_state_file(),
+                Utc::now() + chrono::Duration::milliseconds(hold_ms),
+            );
+        }
         let plan = AppPaths::resolve().ok().and_then(|paths| {
             let cache = kimi_switch_core::QuotaCache::load(&paths.quota_cache_file());
             cached_membership_plan(&cache, &id.0)
@@ -918,6 +949,7 @@ impl AutoSwapSnapshotEffect {
 
 /// collect 完成后的自动切换编排。`pending_auth` 或开关关闭立即返回；activate 失败不写冷却。
 /// 决定之后、真正 activate 之前再读 pending 与当前账号：已变则放弃（不 toast、不审计、不写冷却）。
+/// 耗尽判定 Stay 时再评估回驻（issue #95 / ADR-0008）；回驻无目标静默，activate 失败同样不写冷却。
 pub(crate) async fn apply_snapshot_auto_swap<F, Fut, P, C>(
     auto_swap: &kimi_switch_core::settings::AutoSwap,
     pending_auth: P,
@@ -926,6 +958,7 @@ pub(crate) async fn apply_snapshot_auto_swap<F, Fut, P, C>(
     snapshots: &[QuotaSnapshot],
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
+    manual_hold_until: Option<DateTime<Utc>>,
     activate: F,
     audit: &AuditLog,
     state_path: &Path,
@@ -955,7 +988,53 @@ where
                 swapped: false,
             }
         }
-        AutoSwapDecision::Stay { .. } => AutoSwapSnapshotEffect::none(),
+        AutoSwapDecision::Stay { .. } => {
+            match decide_resident_return(
+                accounts,
+                snapshots,
+                auto_swap,
+                now,
+                last_auto_swap_at,
+                manual_hold_until,
+            ) {
+                None => AutoSwapSnapshotEffect::none(),
+                Some(target) => {
+                    if pending_auth() || current_active().as_ref() != Some(&target.from) {
+                        return AutoSwapSnapshotEffect::none();
+                    }
+                    match activate(target.to.clone()).await {
+                        Ok(()) => {
+                            write_last_auto_swap_at(state_path, Utc::now());
+                            audit.append(
+                                AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
+                                    .with_detail(resident_return_audit_detail(&target)),
+                            );
+                            let text = accounts
+                                .iter()
+                                .find(|account| account.id == target.to)
+                                .map(resident_return_message)
+                                .unwrap_or_else(|| format!("已回驻 {}", target.to));
+                            AutoSwapSnapshotEffect {
+                                message: Some(UiMessage::auto_swap_success(text)),
+                                swapped: true,
+                            }
+                        }
+                        Err(err) => {
+                            audit.append(AuditEvent::err(
+                                "auto_swap",
+                                "kimi",
+                                Some(target.to.0.as_str()),
+                                &err.to_string(),
+                            ));
+                            AutoSwapSnapshotEffect {
+                                message: Some(UiMessage::auto_swap_failed()),
+                                swapped: false,
+                            }
+                        }
+                    }
+                }
+            }
+        }
         AutoSwapDecision::Swap(target) => {
             if pending_auth() || current_active().as_ref() != Some(&target.from) {
                 return AutoSwapSnapshotEffect::none();
@@ -1014,6 +1093,16 @@ fn auto_swap_audit_detail(target: &AutoSwapTarget) -> String {
         quota_window_short(target.trigger_window),
         auto_swap_pct(target.usage_ratio)
     )
+}
+
+/// 回驻审计细节：kind=return 标识非耗尽触发；目标账号在事件的 account 字段里。
+fn resident_return_audit_detail(target: &AutoSwapReturn) -> String {
+    format!("kind=return from={}", target.from)
+}
+
+/// 回驻成功 toast 文案，与自动切换成功共用同一消息通道（静默周期白名单沿用）。
+pub(crate) fn resident_return_message(account: &Account) -> String {
+    format!("已回驻 {}", display_name(account))
 }
 
 /// 绑定成功的 toast 文案（issue #51）。订阅无到期瞬间时到期展示回退弱提示，
@@ -1250,6 +1339,8 @@ mod pending_lifecycle_tests {
             cooldown_ms: 5 * 60 * 1000,
             settle_grace_ms: 60 * 1000,
             prefer_lower_tier: false,
+            resident_lower_tier: false,
+            manual_hold_ms: 8 * 60 * 60 * 1000,
         };
 
         let live_effect = apply_snapshot_auto_swap(
@@ -1265,6 +1356,7 @@ mod pending_lifecycle_tests {
                 auto_swap_ready("bob", 10, 100, now),
             ],
             now,
+            None,
             None,
             |_id| async { panic!("有效期内不得自动切换") },
             &audit,
@@ -1287,6 +1379,7 @@ mod pending_lifecycle_tests {
                 auto_swap_ready("bob", 10, 100, now),
             ],
             now,
+            None,
             None,
             move |id| {
                 let activated = activated_cb.clone();

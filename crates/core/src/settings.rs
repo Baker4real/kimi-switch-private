@@ -63,6 +63,11 @@ pub struct AutoSwap {
     pub settle_grace_ms: i64,
     /// 合格停泊账号中优先选档位更低者。默认关闭，与现状比较链一致。
     pub prefer_lower_tier: bool,
+    /// 回驻子开关（issue #95 / ADR-0008）：当前账号未耗尽、但存在档位严格更低的
+    /// 合格停泊账号时自动切回其中档位最低者。默认关闭；不影响耗尽切换。
+    pub resident_lower_tier: bool,
+    /// 手动切换后的回驻保持期（毫秒）。期间不回驻；耗尽被迫切换不受影响。
+    pub manual_hold_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -134,6 +139,8 @@ impl Default for AutoSwap {
             cooldown_ms: defaults::AUTO_SWAP_COOLDOWN_MS,
             settle_grace_ms: defaults::AUTO_SWAP_SETTLE_GRACE_MS,
             prefer_lower_tier: false,
+            resident_lower_tier: false,
+            manual_hold_ms: defaults::AUTO_SWAP_MANUAL_HOLD_MS,
         }
     }
 }
@@ -343,6 +350,14 @@ pub fn set_auto_swap_prefer_lower_tier(prefer: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_prefer_lower_tier(&path, prefer)
 }
 
+/// 把「额度恢复后回驻低档账号」写入 `<config_dir>/config.toml`，返回新快照。
+///
+/// 只落盘，不改全局当前值；写序与 [`set_auto_swap_enabled`] 相同。
+pub fn set_auto_swap_resident_lower_tier(enabled: bool) -> Result<Arc<Settings>> {
+    let path = AppPaths::resolve()?.config_file();
+    upsert_auto_swap_resident_lower_tier(&path, enabled)
+}
+
 /// 读-改-写指定配置文件里的 `auto_swap.enabled`。
 fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_bool(path, "enabled", enabled)
@@ -351,6 +366,11 @@ fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
 /// 读-改-写指定配置文件里的 `auto_swap.prefer_lower_tier`。
 fn upsert_auto_swap_prefer_lower_tier(path: &Path, prefer: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_bool(path, "prefer_lower_tier", prefer)
+}
+
+/// 读-改-写指定配置文件里的 `auto_swap.resident_lower_tier`。
+fn upsert_auto_swap_resident_lower_tier(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
+    upsert_auto_swap_bool(path, "resident_lower_tier", enabled)
 }
 
 /// 读-改-写指定配置文件里的一个 `auto_swap` 布尔键。

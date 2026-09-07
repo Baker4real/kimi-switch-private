@@ -151,6 +151,7 @@ mod tests {
             proactive_renewal: false,
             auto_swap: false,
             auto_swap_prefer_lower_tier: false,
+            auto_swap_resident_lower_tier: false,
             message: Some(message),
         };
         assert_eq!(
@@ -1021,6 +1022,7 @@ mod tests {
             proactive_renewal: false,
             auto_swap: false,
             auto_swap_prefer_lower_tier: false,
+            auto_swap_resident_lower_tier: false,
             message: attach_skip_message(None, reason, stats),
         }
     }
@@ -1434,6 +1436,8 @@ mod tests {
             cooldown_ms: 5 * 60 * 1000,
             settle_grace_ms: 60 * 1000,
             prefer_lower_tier: false,
+            resident_lower_tier: false,
+            manual_hold_ms: 8 * 60 * 60 * 1000,
         }
     }
 
@@ -1493,6 +1497,7 @@ mod tests {
             ],
             auto_swap_now(),
             None,
+            None,
             |_id| async { panic!("disabled 不得 activate") },
             &audit,
             &state,
@@ -1520,6 +1525,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
+            None,
             None,
             |_id| async { panic!("pending_auth 不得 activate") },
             &audit,
@@ -1555,6 +1561,7 @@ mod tests {
             ],
             auto_swap_now(),
             None,
+            None,
             move |id| {
                 let activated = activated_cb.clone();
                 async move {
@@ -1587,6 +1594,96 @@ mod tests {
         assert!(detail.contains("used=99%"), "{detail}");
     }
 
+    /// 回驻成功（issue #95 / ADR-0008）：当前账号未耗尽、停泊账号档位严格更低时
+    /// 经同一条 activate 路径切回；toast / 审计 kind=return 区分非耗尽触发。
+    #[tokio::test]
+    async fn snapshot_resident_return_activates_audits_and_toasts_display_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.resident_lower_tier = true;
+        let mut bob = auto_swap_acc("bob", false);
+        bob.label = "工作机".into();
+        let mut alice_snap = auto_swap_ready("alice", 10, 100);
+        alice_snap.membership = Some("LEVEL_ADVANCED".into());
+        let mut bob_snap = auto_swap_ready("bob", 20, 100);
+        bob_snap.membership = Some("LEVEL_INTERMEDIATE".into());
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &settings,
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), bob],
+            &[alice_snap, bob_snap],
+            auto_swap_now(),
+            None,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("return toast");
+        assert_eq!(message.text, "已回驻 工作机");
+        assert_eq!(message.tone, MessageTone::Ok);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapSuccess);
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob")
+        );
+        assert!(kimi_switch_core::read_last_auto_swap_at(&state).is_some());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.provider, "kimi");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        let detail = event.detail.expect("return audit has detail");
+        assert!(detail.contains("kind=return"), "{detail}");
+        assert!(detail.contains("from=alice"), "{detail}");
+    }
+
+    /// 回驻保持期（issue #95 / ADR-0008）：手动切换后的 8 小时内不回驻——
+    /// 无 toast、无审计、不碰状态文件（耗尽路径不受影响，另行覆盖）。
+    #[tokio::test]
+    async fn snapshot_resident_return_blocked_by_manual_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.resident_lower_tier = true;
+        let mut alice_snap = auto_swap_ready("alice", 10, 100);
+        alice_snap.membership = Some("LEVEL_ADVANCED".into());
+        let mut bob_snap = auto_swap_ready("bob", 20, 100);
+        bob_snap.membership = Some("LEVEL_INTERMEDIATE".into());
+        let effect = apply_snapshot_auto_swap(
+            &settings,
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[alice_snap, bob_snap],
+            auto_swap_now(),
+            None,
+            Some(auto_swap_now() + chrono::Duration::hours(1)),
+            |_id| async { panic!("保持期内不得回驻") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.message.is_none());
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        assert!(!audit.path().exists());
+    }
+
     /// activate 失败：瞬时失败 toast、不写冷却、当前账号路径不视为已切换。
     #[tokio::test]
     async fn snapshot_auto_swap_activate_failure_toasts_without_persist() {
@@ -1603,6 +1700,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
+            None,
             None,
             |_id| async { Err(kimi_switch_core::Error::provider("disk full")) },
             &audit,
@@ -1643,6 +1741,7 @@ mod tests {
             ],
             auto_swap_now(),
             None,
+            None,
             |_id| async { panic!("无候选不得 activate") },
             &audit,
             &state,
@@ -1681,6 +1780,7 @@ mod tests {
                     auto_swap_ready("bob", 10, 100),
                 ],
                 auto_swap_now(),
+                None,
                 None,
                 |_id| async { panic!("过期决策不得 activate") },
                 &audit,

@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   autoSwapPreferLowerTierSwitchView,
+  autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
   silentQuotaMessage,
 } from "./auto-swap";
@@ -137,6 +138,61 @@ describe("设置页「自动切换时优先低档位账号」子开关（issue #
   it("文案为优先低档位，不写套餐或 plan", () => {
     expect(settingsPage).toContain("自动切换时优先低档位账号");
     const start = settingsPage.indexOf("auto-swap-prefer-lower-tier");
+    const snippet = settingsPage.slice(start, start + 900);
+    expect(snippet).not.toContain("套餐");
+    expect(snippet).not.toMatch(/\bplan\b/i);
+  });
+});
+
+describe("autoSwapResidentLowerTierSwitchView", () => {
+  it("总开关关时子开关置灰，checked 仍反映持久化值", () => {
+    expect(autoSwapResidentLowerTierSwitchView(false, false)).toEqual({
+      checked: false,
+      disabled: true,
+      toast: "已关闭额度恢复后回驻低档账号",
+    });
+    expect(autoSwapResidentLowerTierSwitchView(false, true)).toEqual({
+      checked: true,
+      disabled: true,
+      toast: "已开启额度恢复后回驻低档账号",
+    });
+  });
+
+  it("总开关开时子开关可点，checked 反映持久化值", () => {
+    expect(autoSwapResidentLowerTierSwitchView(true, false)).toEqual({
+      checked: false,
+      disabled: false,
+      toast: "已关闭额度恢复后回驻低档账号",
+    });
+    expect(autoSwapResidentLowerTierSwitchView(true, true)).toEqual({
+      checked: true,
+      disabled: false,
+      toast: "已开启额度恢复后回驻低档账号",
+    });
+  });
+});
+
+describe("设置页「额度恢复后回驻低档账号」子开关（issue #95）", () => {
+  it("位于优先低档位开关之后，role=switch，静态关且 disabled", () => {
+    expect(settingsPage).toContain('id="auto-swap-resident-lower-tier-toggle"');
+    expect(settingsPage).toMatch(
+      /id="auto-swap-resident-lower-tier-toggle"[^>]*role="switch"/,
+    );
+    expect(settingsPage).toMatch(
+      /id="auto-swap-resident-lower-tier-toggle"[^>]*aria-checked="false"/,
+    );
+    expect(settingsPage).toMatch(
+      /id="auto-swap-resident-lower-tier-toggle"[^>]*\sdisabled/,
+    );
+    const prefer = settingsPage.indexOf('id="auto-swap-prefer-lower-tier-toggle"');
+    const resident = settingsPage.indexOf('id="auto-swap-resident-lower-tier-toggle"');
+    expect(resident).toBeGreaterThan(prefer);
+  });
+
+  it("文案为回驻低档账号并说明保持期，不写套餐或 plan", () => {
+    expect(settingsPage).toContain("额度恢复后回驻低档账号");
+    expect(settingsPage).toContain("手动切换后 8 小时内不回驻");
+    const start = settingsPage.indexOf("auto-swap-resident-lower-tier");
     const snippet = settingsPage.slice(start, start + 900);
     expect(snippet).not.toContain("套餐");
     expect(snippet).not.toMatch(/\bplan\b/i);

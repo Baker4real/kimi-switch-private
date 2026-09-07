@@ -60,6 +60,8 @@ export interface Snapshot {
   auto_swap: boolean;
   /** 「自动切换时优先低档位账号」子开关（issue #71）：与 CLI 同源，来自 config.toml。 */
   auto_swap_prefer_lower_tier: boolean;
+  /** 「额度恢复后回驻低档账号」子开关（issue #95）：与 CLI 同源，来自 config.toml。 */
+  auto_swap_resident_lower_tier: boolean;
   message: UiMessage | null;
 }
 
@@ -134,6 +136,8 @@ export function createApi(invokeFn: InvokeFn) {
     setAutoSwap: (enabled: boolean) => call<boolean>("set_auto_swap", { enabled }),
     setAutoSwapPreferLowerTier: (enabled: boolean) =>
       call<boolean>("set_auto_swap_prefer_lower_tier", { enabled }),
+    setAutoSwapResidentLowerTier: (enabled: boolean) =>
+      call<boolean>("set_auto_swap_resident_lower_tier", { enabled }),
   };
 }
 

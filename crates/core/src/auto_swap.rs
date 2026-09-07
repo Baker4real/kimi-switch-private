@@ -1,6 +1,6 @@
-//! 额度耗尽自动切换：纯决策 + 上次切换时刻的可丢弃状态。
+//! 额度耗尽自动切换与回驻：纯决策 + 上次切换时刻 / 手动保持期的可丢弃状态。
 //!
-//! 决策函数无 IO、无网络；冷却时刻读写失败静默忽略。
+//! 决策函数无 IO、无网络；状态文件读写失败静默忽略。
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -118,6 +118,98 @@ pub fn decide_auto_swap(
     })
 }
 
+/// 回驻目标（issue #95 / ADR-0008）：从哪个账号切回哪个账号。
+///
+/// 与 [`AutoSwapTarget`] 不同，没有触发窗口——回驻不因耗尽而起。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoSwapReturn {
+    pub from: AccountId,
+    pub to: AccountId,
+}
+
+/// 回驻判定：当前账号未达耗尽阈值、但存在档位严格更低的合格停泊账号时，切回其中
+/// 档位最低者。纯函数，不碰盘、不联网。
+///
+/// 闸门与 [`decide_auto_swap`] 共用语义：总开关或回驻子开关关、无当前账号、冷却期
+/// （与耗尽切换共享一把锁）、安顿宽限、手动保持期都不回驻。当前账号快照不可用、
+/// 额度未知、任一窗口已达阈值（那是耗尽路径的事）或档位未知时不回驻；候选须快照
+/// 可用、所有窗口低于阈值、档位已知且严格低于当前档。无档位（`None` / 未识别）
+/// 不参与比较：既不当目标，也不让无档位的当前账号被切走（ADR-0008 第 3 条）。
+/// 无目标返回 `None`，调用方静默，不产生「没有可切换的账号」类提示。
+pub fn decide_resident_return(
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+    last_auto_swap_at: Option<DateTime<Utc>>,
+    manual_hold_until: Option<DateTime<Utc>>,
+) -> Option<AutoSwapReturn> {
+    if !settings.enabled || !settings.resident_lower_tier {
+        return None;
+    }
+    let Some(current) = accounts.iter().find(|account| account.active) else {
+        return None;
+    };
+    if in_cooldown(now, last_auto_swap_at, settings.cooldown_ms) {
+        return None;
+    }
+    if in_settle_grace(now, current.last_used_at, settings.settle_grace_ms) {
+        return None;
+    }
+    if manual_hold_until.is_some_and(|until| now < until) {
+        return None;
+    }
+    let Some(current_snap) = snapshot_of(snapshots, &current.id) else {
+        return None;
+    };
+    let Some(current_quotas) = usable_quotas(current_snap) else {
+        return None;
+    };
+    let current_rank = membership_tier_rank(current_snap.membership.as_deref());
+    if current_rank >= UNKNOWN_TIER_RANK {
+        return None;
+    }
+    let current_ratios = known_ratios(current_quotas);
+    if current_ratios.is_empty()
+        || current_ratios
+            .iter()
+            .any(|(_, ratio)| *ratio >= settings.threshold)
+    {
+        return None;
+    }
+
+    let mut eligible: Vec<(&Account, &[Quota], &str)> = accounts
+        .iter()
+        .filter(|account| account.id != current.id)
+        .filter_map(|account| {
+            let snap = snapshot_of(snapshots, &account.id)?;
+            let quotas = usable_quotas(snap)?;
+            if !is_eligible_candidate(quotas, settings.threshold) {
+                return None;
+            }
+            let membership = snap.membership.as_deref()?;
+            let rank = membership_tier_rank(Some(membership));
+            if rank >= UNKNOWN_TIER_RANK || rank >= current_rank {
+                return None;
+            }
+            Some((account, quotas, membership))
+        })
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    eligible.sort_by(|(a, aq, am), (b, bq, bm)| {
+        membership_tier_rank(Some(am))
+            .cmp(&membership_tier_rank(Some(bm)))
+            .then_with(|| compare_candidates(a, aq, Some(am), b, bq, Some(bm), false))
+    });
+    let (best, _, _) = eligible[0];
+    Some(AutoSwapReturn {
+        from: current.id.clone(),
+        to: best.id.clone(),
+    })
+}
+
 fn stay(reason: AutoSwapSkipReason) -> AutoSwapDecision {
     AutoSwapDecision::Stay { reason }
 }
@@ -172,6 +264,9 @@ fn candidate_max_ratio(quotas: &[Quota]) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
+/// 未知档位序号：`None` 与未识别枚举。耗尽路径按「排最后」用；回驻干脆不比较（ADR-0008）。
+const UNKNOWN_TIER_RANK: u8 = 5;
+
 /// `/usages` 快照 `membership` 原始字符串的档位优先级。
 /// 序号越小越优先被选中；`None` 与未列出的字符串同为最低优先级（宁晚烧、不错烧高档）。
 ///
@@ -185,7 +280,7 @@ fn membership_tier_rank(membership: Option<&str>) -> u8 {
         Some("LEVEL_INTERMEDIATE") => 2,
         Some("LEVEL_ADVANCED") => 3,
         Some("LEVEL_TEAM") => 4,
-        _ => 5,
+        _ => UNKNOWN_TIER_RANK,
     }
 }
 
@@ -242,20 +337,56 @@ fn in_settle_grace(
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AutoSwapStateFile {
-    last_auto_swap_at: DateTime<Utc>,
+    /// 上次自动切换成功时刻。缺失视为从未自动切换：没有切换史就不伪造任何时刻
+    /// （issue #96），序列化时 None 跳过该字段，读侧 `#[serde(default)]` 同语义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_auto_swap_at: Option<DateTime<Utc>>,
+    /// 手动切换后的回驻保持期截止（issue #95）。缺失视为无保持期，存量文件兼容。
+    #[serde(default)]
+    manual_hold_until: Option<DateTime<Utc>>,
 }
 
-/// 读取上次自动切换成功时刻。文件缺失或损坏视为从未自动切换。
-pub fn read_last_auto_swap_at(path: &Path) -> Option<DateTime<Utc>> {
+/// 整份状态文件；文件缺失或损坏返回 `None`（既有语义：视为从未自动切换）。
+fn read_state(path: &Path) -> Option<AutoSwapStateFile> {
     let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<AutoSwapStateFile>(&raw)
-        .ok()
-        .map(|state| state.last_auto_swap_at)
+    serde_json::from_str::<AutoSwapStateFile>(&raw).ok()
 }
 
-/// 写入上次自动切换成功时刻。失败只 warn，不回传错误。
+/// 读取上次自动切换成功时刻。文件缺失、损坏或无切换史字段视为从未自动切换。
+pub fn read_last_auto_swap_at(path: &Path) -> Option<DateTime<Utc>> {
+    read_state(path).and_then(|state| state.last_auto_swap_at)
+}
+
+/// 读取手动保持期截止。文件缺失、损坏或无该字段视为无保持期。
+pub fn read_manual_hold_until(path: &Path) -> Option<DateTime<Utc>> {
+    read_state(path).and_then(|state| state.manual_hold_until)
+}
+
+/// 写入上次自动切换成功时刻，读改写保留手动保持期。失败只 warn，不回传错误。
 pub fn write_last_auto_swap_at(path: &Path, at: DateTime<Utc>) {
-    if let Err(err) = try_write_last_auto_swap_at(path, at) {
+    let mut state = read_state(path).unwrap_or(AutoSwapStateFile {
+        last_auto_swap_at: None,
+        manual_hold_until: None,
+    });
+    state.last_auto_swap_at = Some(at);
+    write_state_or_warn(path, &state);
+}
+
+/// 写入手动保持期截止，读改写不动上次自动切换时刻（没有切换史保持 None）。
+/// 失败只 warn，不回传错误。
+pub fn set_manual_hold_until(path: &Path, until: DateTime<Utc>) {
+    // 文件缺失或损坏时重建：没有切换史就不伪造任何时刻（issue #96）。保持期
+    // 只约束回驻，不得借 last_auto_swap_at 把耗尽切换也锁进冷却（ADR-0008 第 4 条）。
+    let mut state = read_state(path).unwrap_or(AutoSwapStateFile {
+        last_auto_swap_at: None,
+        manual_hold_until: None,
+    });
+    state.manual_hold_until = Some(until);
+    write_state_or_warn(path, &state);
+}
+
+fn write_state_or_warn(path: &Path, state: &AutoSwapStateFile) {
+    if let Err(err) = try_write_state(path, state) {
         tracing::warn!(
             err = %err,
             path = %path.display(),
@@ -264,14 +395,12 @@ pub fn write_last_auto_swap_at(path: &Path, at: DateTime<Utc>) {
     }
 }
 
-fn try_write_last_auto_swap_at(path: &Path, at: DateTime<Utc>) -> std::io::Result<()> {
+fn try_write_state(path: &Path, state: &AutoSwapStateFile) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_vec(&AutoSwapStateFile {
-        last_auto_swap_at: at,
-    })
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let body = serde_json::to_vec(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)?;
@@ -297,6 +426,8 @@ mod tests {
             cooldown_ms: 5 * 60 * 1000,
             settle_grace_ms: 60 * 1000,
             prefer_lower_tier: false,
+            resident_lower_tier: false,
+            manual_hold_ms: crate::defaults::AUTO_SWAP_MANUAL_HOLD_MS,
         }
     }
 
@@ -310,6 +441,13 @@ mod tests {
     fn prefer_lower() -> AutoSwap {
         AutoSwap {
             prefer_lower_tier: true,
+            ..on()
+        }
+    }
+
+    fn resident() -> AutoSwap {
+        AutoSwap {
+            resident_lower_tier: true,
             ..on()
         }
     }
@@ -865,6 +1003,345 @@ mod tests {
         let at = now();
         write_last_auto_swap_at(&path, at);
         assert_eq!(read_last_auto_swap_at(&path), Some(at));
+    }
+
+    /// issue #95：两个写入点读改写互不覆盖，存量无 hold 字段文件兼容。
+    #[test]
+    fn manual_hold_roundtrip_preserves_last_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let at = now();
+        write_last_auto_swap_at(&path, at);
+        let hold = now() + chrono::Duration::hours(8);
+        set_manual_hold_until(&path, hold);
+        assert_eq!(read_last_auto_swap_at(&path), Some(at));
+        assert_eq!(read_manual_hold_until(&path), Some(hold));
+
+        // 反向：写冷却不丢保持期。
+        let at2 = now() + chrono::Duration::minutes(10);
+        write_last_auto_swap_at(&path, at2);
+        assert_eq!(read_last_auto_swap_at(&path), Some(at2));
+        assert_eq!(read_manual_hold_until(&path), Some(hold));
+    }
+
+    /// issue #95：存量只有 last_auto_swap_at 的文件（升级前格式）仍可读，无保持期。
+    #[test]
+    fn manual_hold_missing_file_or_field_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_manual_hold_until(&dir.path().join("nope.json")), None);
+        let path = dir.path().join("auto_swap.json");
+        std::fs::write(&path, r#"{"last_auto_swap_at":"2026-09-03T12:00:00Z"}"#).unwrap();
+        assert_eq!(read_last_auto_swap_at(&path), Some(now()));
+        assert_eq!(read_manual_hold_until(&path), None);
+    }
+
+    /// issue #96：全新文件（或状态文件被删）上只写保持期，不伪造切换史。
+    #[test]
+    fn manual_hold_on_fresh_file_keeps_last_swap_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let hold = now() + chrono::Duration::hours(8);
+        set_manual_hold_until(&path, hold);
+        assert_eq!(read_last_auto_swap_at(&path), None);
+        assert_eq!(read_manual_hold_until(&path), Some(hold));
+    }
+
+    /// issue #96 / ADR-0008 第 4 条：保持期内耗尽切换不被冷却锁死。
+    /// 按调用方接线模拟：手动切换后状态文件只有保持期，read_last_auto_swap_at
+    /// 读出 None，当前账号 99% 时应 Swap 而非 Stay{Cooldown}。
+    #[test]
+    fn exhaustion_swaps_during_manual_hold_without_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let hold = now() + chrono::Duration::hours(8);
+        set_manual_hold_until(&path, hold);
+        assert_eq!(read_manual_hold_until(&path), Some(hold));
+
+        let five = QuotaWindow::FiveHour;
+        let accounts = vec![settled("alice", true), settled("bob", false)];
+        let snapshots = vec![
+            ready("alice", &[(five, 99, 100)]),
+            ready("bob", &[(five, 10, 100)]),
+        ];
+        let got = decide_auto_swap(
+            &accounts,
+            &snapshots,
+            &on(),
+            now(),
+            read_last_auto_swap_at(&path),
+        );
+        match got {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.from.0, "alice");
+                assert_eq!(target.to.0, "bob");
+            }
+            other => panic!("保持期内耗尽应 Swap，got {other:?}"),
+        }
+    }
+
+    /// issue #95 / ADR-0008：回驻判定全矩阵。默认场景：当前高档未耗尽 + 低档停泊可用。
+    #[test]
+    fn decide_resident_return_table() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let w_low = &[(five, 10, 100), (seven, 20, 100)];
+        let adv = "LEVEL_ADVANCED";
+        let mid = "LEVEL_INTERMEDIATE";
+
+        struct ReturnCase {
+            name: &'static str,
+            settings: AutoSwap,
+            last_auto_swap_at: Option<DateTime<Utc>>,
+            manual_hold_until: Option<DateTime<Utc>>,
+            accounts: Vec<Account>,
+            snapshots: Vec<QuotaSnapshot>,
+            expect_to: Option<&'static str>,
+        }
+
+        let cases = [
+            ReturnCase {
+                name: "高档当前 + 低档停泊可用 → 回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), membered("bob", w_low, mid)],
+                expect_to: Some("bob"),
+            },
+            ReturnCase {
+                name: "总开关关不回驻",
+                settings: AutoSwap {
+                    enabled: false,
+                    ..resident()
+                },
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), membered("bob", w_low, mid)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "回驻子开关关不回驻",
+                settings: on(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), membered("bob", w_low, mid)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "冷却期内不回驻（与耗尽共享）",
+                settings: resident(),
+                last_auto_swap_at: Some(now() - chrono::Duration::minutes(1)),
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), membered("bob", w_low, mid)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "安顿宽限期内不回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![
+                    acc("alice", true, Some(now() - chrono::Duration::seconds(10))),
+                    settled("bob", false),
+                ],
+                snapshots: vec![membered("alice", w_low, adv), membered("bob", w_low, mid)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "手动保持期内不回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: Some(now() + chrono::Duration::hours(1)),
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), membered("bob", w_low, mid)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "保持期刚过即可回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: Some(now() - chrono::Duration::seconds(1)),
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), membered("bob", w_low, mid)],
+                expect_to: Some("bob"),
+            },
+            ReturnCase {
+                name: "当前已达阈值不回驻（耗尽路径接管）",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", &[(five, 99, 100)], adv),
+                    membered("bob", w_low, mid),
+                ],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "当前额度未知（limit=0）不回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", &[(five, 50, 0)], adv),
+                    membered("bob", w_low, mid),
+                ],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "当前快照 Failed 不回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![failed_other("alice"), membered("bob", w_low, mid)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "当前档位未知不回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w_low), membered("bob", w_low, mid)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "低档停泊额度任一窗口达阈值不回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", w_low, adv),
+                    membered("bob", &[(five, 10, 100), (seven, 99, 100)], mid),
+                ],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "同档停泊不回驻（须严格更低）",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", w_low, mid),
+                    membered("bob", &[(five, 0, 100)], mid),
+                ],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "无档位停泊不作为目标",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), ready("bob", w_low)],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "未识别档位停泊不作为目标",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", w_low, adv),
+                    membered("bob", w_low, "LEVEL_FUTURE"),
+                ],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "候选快照 Failed 跳过",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![membered("alice", w_low, adv), failed_other("bob")],
+                expect_to: None,
+            },
+            ReturnCase {
+                name: "多档更低取最低档（Andante 胜 Allegretto）",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    membered("alice", w_low, adv),
+                    membered("bob", w_low, mid),
+                    membered("carol", &[(five, 80, 100)], "LEVEL_ANDANTE"),
+                ],
+                expect_to: Some("carol"),
+            },
+            ReturnCase {
+                name: "同档多候选回落已用比例升序",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    membered("alice", w_low, adv),
+                    membered("bob", &[(five, 50, 100)], mid),
+                    membered("carol", &[(five, 20, 100)], mid),
+                ],
+                expect_to: Some("carol"),
+            },
+            ReturnCase {
+                name: "低档已 90%（未达阈值）仍回驻：资格线沿用合格线",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", w_low, adv),
+                    membered("bob", &[(five, 0, 100), (seven, 90, 100)], mid),
+                ],
+                expect_to: Some("bob"),
+            },
+            ReturnCase {
+                name: "当前已是最低档不回驻",
+                settings: resident(),
+                last_auto_swap_at: None,
+                manual_hold_until: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    membered("alice", w_low, "LEVEL_ANDANTE"),
+                    membered("bob", w_low, mid),
+                ],
+                expect_to: None,
+            },
+        ];
+
+        for case in &cases {
+            let got = decide_resident_return(
+                &case.accounts,
+                &case.snapshots,
+                &case.settings,
+                now(),
+                case.last_auto_swap_at,
+                case.manual_hold_until,
+            );
+            match (got, case.expect_to) {
+                (Some(target), Some(to)) => {
+                    assert_eq!(target.from.0, "alice", "{}", case.name);
+                    assert_eq!(target.to.0, to, "{}", case.name);
+                }
+                (None, None) => {}
+                (got, expected) => panic!("{}: got {got:?}, expect {expected:?}", case.name),
+            }
+        }
     }
 
     #[test]

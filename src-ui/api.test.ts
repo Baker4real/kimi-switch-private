@@ -27,6 +27,7 @@ describe("createApi 动词与命令字符串", () => {
     await api.setProactiveRenewal(true);
     await api.setAutoSwap(true);
     await api.setAutoSwapPreferLowerTier(true);
+    await api.setAutoSwapResidentLowerTier(true);
 
     expect(invoke.mock.calls).toEqual([
       ["list_accounts"],
@@ -45,6 +46,7 @@ describe("createApi 动词与命令字符串", () => {
       ["set_proactive_renewal", { enabled: true }],
       ["set_auto_swap", { enabled: true }],
       ["set_auto_swap_prefer_lower_tier", { enabled: true }],
+      ["set_auto_swap_resident_lower_tier", { enabled: true }],
     ]);
   });
 

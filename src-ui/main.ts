@@ -6,7 +6,11 @@ import { escapeHtml } from "./escape";
 import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
-import { autoSwapPreferLowerTierSwitchView, autoSwapSwitchView } from "./auto-swap";
+import {
+  autoSwapPreferLowerTierSwitchView,
+  autoSwapResidentLowerTierSwitchView,
+  autoSwapSwitchView,
+} from "./auto-swap";
 import { createSilentQuotaScheduler } from "./silent-quota";
 import { renewalSwitchView } from "./renewal";
 import {
@@ -334,6 +338,16 @@ function paintAutoSwapPreferLowerTier(autoSwapEnabled: boolean, preferLowerTier:
   toggle.disabled = view.disabled;
 }
 
+function paintAutoSwapResidentLowerTier(
+  autoSwapEnabled: boolean,
+  residentLowerTier: boolean,
+): void {
+  const view = autoSwapResidentLowerTierSwitchView(autoSwapEnabled, residentLowerTier);
+  const toggle = required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle");
+  toggle.setAttribute("aria-checked", String(view.checked));
+  toggle.disabled = view.disabled;
+}
+
 function showToast(text: string, isError = false): void {
   window.clearTimeout(toastTimer);
   const status = required<HTMLDivElement>("toast-status");
@@ -424,6 +438,7 @@ function paintSnapshot(next: Snapshot): void {
   paintProactiveRenewal(next.proactive_renewal);
   paintAutoSwap(next.auto_swap);
   paintAutoSwapPreferLowerTier(next.auto_swap, next.auto_swap_prefer_lower_tier);
+  paintAutoSwapResidentLowerTier(next.auto_swap, next.auto_swap_resident_lower_tier);
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
   rememberListFocus();
@@ -930,6 +945,11 @@ async function init(): Promise<void> {
           "aria-checked",
         ) === "true";
       paintAutoSwapPreferLowerTier(saved, prefer);
+      const resident =
+        required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").getAttribute(
+          "aria-checked",
+        ) === "true";
+      paintAutoSwapResidentLowerTier(saved, resident);
       showToast(autoSwapSwitchView(saved).toast);
     });
   });
@@ -948,6 +968,24 @@ async function init(): Promise<void> {
           "true";
         paintAutoSwapPreferLowerTier(masterOn, saved);
         showToast(autoSwapPreferLowerTierSwitchView(masterOn, saved).toast);
+      });
+    },
+  );
+  required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").addEventListener(
+    "click",
+    () => {
+      const toggle = required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle");
+      if (toggle.disabled) {
+        return;
+      }
+      const next = toggle.getAttribute("aria-checked") !== "true";
+      void runSettingsAction("正在保存设置…", async () => {
+        const saved = await api.setAutoSwapResidentLowerTier(next);
+        const masterOn =
+          required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
+          "true";
+        paintAutoSwapResidentLowerTier(masterOn, saved);
+        showToast(autoSwapResidentLowerTierSwitchView(masterOn, saved).toast);
       });
     },
   );
