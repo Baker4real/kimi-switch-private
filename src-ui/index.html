@@ -107,6 +107,45 @@
                 </button>
               </div>
             </div>
+            <section class="behavior-panel" aria-labelledby="behavior-panel-title">
+              <h3 class="behavior-panel-title" id="behavior-panel-title">账号行为</h3>
+              <div class="settings-row settings-row--switch">
+                <div class="settings-copy">
+                  <span id="renewal-toggle-label">当前账号主动续期</span>
+                  <p class="settings-note" id="renewal-toggle-note">仅在 Windows 生效。允许本工具为当前账号主动续期登录凭证；极端情况下官方会话可能要求重新登录。本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」。</p>
+                </div>
+                <button id="renewal-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="renewal-toggle-label" aria-describedby="renewal-toggle-note">
+                  <span class="switch-thumb" aria-hidden="true"></span>
+                </button>
+              </div>
+              <div class="settings-row settings-row--switch">
+                <div class="settings-copy">
+                  <span id="auto-swap-toggle-label">额度耗尽自动切换</span>
+                  <p class="settings-note" id="auto-swap-toggle-note">当前账号任一额度窗口达到阈值时，自动切到合格停泊账号（默认按已用比例升序）。默认关闭。</p>
+                </div>
+                <button id="auto-swap-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="auto-swap-toggle-label" aria-describedby="auto-swap-toggle-note">
+                  <span class="switch-thumb" aria-hidden="true"></span>
+                </button>
+              </div>
+              <div class="settings-row settings-row--switch settings-row--nested">
+                <div class="settings-copy">
+                  <span id="auto-swap-prefer-lower-tier-toggle-label">自动切换时优先低档位账号</span>
+                  <p class="settings-note" id="auto-swap-prefer-lower-tier-toggle-note">开启后，额度耗尽自动切换时优先选择更低档位的停泊账号。默认关闭。</p>
+                </div>
+                <button id="auto-swap-prefer-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-prefer-lower-tier-toggle-label" aria-describedby="auto-swap-prefer-lower-tier-toggle-note">
+                  <span class="switch-thumb" aria-hidden="true"></span>
+                </button>
+              </div>
+              <div class="settings-row settings-row--switch settings-row--nested">
+                <div class="settings-copy">
+                  <span id="auto-swap-resident-lower-tier-toggle-label">额度恢复后回驻低档账号</span>
+                  <p class="settings-note" id="auto-swap-resident-lower-tier-toggle-note">开启后，当前账号未耗尽但更低档位停泊账号额度可用时，自动切回其中档位最低者。手动切换后 8 小时内不回驻。默认关闭。</p>
+                </div>
+                <button id="auto-swap-resident-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-resident-lower-tier-toggle-label" aria-describedby="auto-swap-resident-lower-tier-toggle-note">
+                  <span class="switch-thumb" aria-hidden="true"></span>
+                </button>
+              </div>
+            </section>
             <div id="accounts-empty" class="empty-state hidden">暂无账号。用「添加账号」浏览器授权，或先在 Kimi Code 登录后点「导入当前账号」。</div>
             <div id="library-action-error" class="action-retry hidden">
               <p id="library-action-error-text"></p>
@@ -131,42 +170,6 @@
                   深色
                 </button>
               </div>
-            </div>
-            <div class="settings-row settings-row--switch">
-              <div class="settings-copy">
-                <span id="renewal-toggle-label">当前账号主动续期</span>
-                <p class="settings-note" id="renewal-toggle-note">仅在 Windows 生效。允许本工具为当前账号主动续期登录凭证；极端情况下官方会话可能要求重新登录。本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」。</p>
-              </div>
-              <button id="renewal-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="renewal-toggle-label" aria-describedby="renewal-toggle-note">
-                <span class="switch-thumb" aria-hidden="true"></span>
-              </button>
-            </div>
-            <div class="settings-row settings-row--switch">
-              <div class="settings-copy">
-                <span id="auto-swap-toggle-label">额度耗尽自动切换</span>
-                <p class="settings-note" id="auto-swap-toggle-note">当前账号任一额度窗口达到阈值时，自动切到合格停泊账号（默认按已用比例升序）。默认关闭。</p>
-              </div>
-              <button id="auto-swap-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="auto-swap-toggle-label" aria-describedby="auto-swap-toggle-note">
-                <span class="switch-thumb" aria-hidden="true"></span>
-              </button>
-            </div>
-            <div class="settings-row settings-row--switch settings-row--nested">
-              <div class="settings-copy">
-                <span id="auto-swap-prefer-lower-tier-toggle-label">自动切换时优先低档位账号</span>
-                <p class="settings-note" id="auto-swap-prefer-lower-tier-toggle-note">开启后，额度耗尽自动切换时优先选择更低档位的停泊账号。默认关闭。</p>
-              </div>
-              <button id="auto-swap-prefer-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-prefer-lower-tier-toggle-label" aria-describedby="auto-swap-prefer-lower-tier-toggle-note">
-                <span class="switch-thumb" aria-hidden="true"></span>
-              </button>
-            </div>
-            <div class="settings-row settings-row--switch settings-row--nested">
-              <div class="settings-copy">
-                <span id="auto-swap-resident-lower-tier-toggle-label">额度恢复后回驻低档账号</span>
-                <p class="settings-note" id="auto-swap-resident-lower-tier-toggle-note">开启后，当前账号未耗尽但更低档位停泊账号额度可用时，自动切回其中档位最低者。手动切换后 8 小时内不回驻。默认关闭。</p>
-              </div>
-              <button id="auto-swap-resident-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-resident-lower-tier-toggle-label" aria-describedby="auto-swap-resident-lower-tier-toggle-note">
-                <span class="switch-thumb" aria-hidden="true"></span>
-              </button>
             </div>
           </div>
         </section>

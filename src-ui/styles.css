@@ -616,6 +616,24 @@ p {
   gap: 8px;
 }
 
+/* 账号行为面板：与账号卡同级的内嵌分区（细边 + 内高光，不投外阴影，避免卡中卡） */
+.behavior-panel {
+  margin-bottom: 18px;
+  padding: 16px 18px 18px;
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-metric);
+  background: var(--profile-background);
+  box-shadow: var(--highlight-inset);
+}
+
+.behavior-panel-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
 .profiles-grid {
   display: flex;
   flex-direction: column;

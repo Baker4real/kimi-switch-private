@@ -10,7 +10,10 @@ const html = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "index.html"),
   "utf8",
 );
-const settingsPage = html.slice(html.indexOf('id="page-settings"'));
+const libraryPage = html.slice(
+  html.indexOf('id="page-library"'),
+  html.indexOf('id="page-settings"'),
+);
 
 describe("renewalSwitchView", () => {
   it("开态映射 checked 与开启 toast", () => {
@@ -28,17 +31,17 @@ describe("renewalSwitchView", () => {
   });
 });
 
-describe("设置页「当前账号主动续期」开关（issue #42）", () => {
-  it("开关出现在设置页且默认关", () => {
-    expect(settingsPage).toContain('id="renewal-toggle"');
-    expect(settingsPage).toMatch(/role="switch"/);
+describe("账号库页「当前账号主动续期」开关（issue #42）", () => {
+  it("开关出现在账号库页且默认关", () => {
+    expect(libraryPage).toContain('id="renewal-toggle"');
+    expect(libraryPage).toMatch(/role="switch"/);
     // 静态首帧即关态；权威值由快照涂刷覆盖。
-    expect(settingsPage).toMatch(/id="renewal-toggle"[^>]*aria-checked="false"/);
+    expect(libraryPage).toMatch(/id="renewal-toggle"[^>]*aria-checked="false"/);
   });
 
   it("开关旁带 ADR 0003 要求的风险说明", () => {
-    expect(settingsPage).toContain("当前账号主动续期");
-    const note = settingsPage.match(
+    expect(libraryPage).toContain("当前账号主动续期");
+    const note = libraryPage.match(
       /id="renewal-toggle-note"[^>]*>([^<]*)</,
     )?.[1];
     expect(note).toContain("仅在 Windows 生效");
