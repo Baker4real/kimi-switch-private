@@ -19,7 +19,7 @@ crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调�
 
 1. **按改动面验证**：Rust 核心、Provider、凭证或共享契约改动运行 `cargo check --workspace` 及受影响的 `cargo test --workspace`；改了 `src-ui/` 再运行对应的 typecheck、测试和构建。跨层、发布或共享契约变化再扩大到完整组合；通过后按任务需要运行 release build。
 2. **凭证安全是最高优先级**：token 只能写用户本机私有文件；网络请求只允许发往 Kimi 官方域名（`auth.kimi.com` / `api.kimi.com` / `www.kimi.com`）。`www.kimi.com` 仅限「绑定网页登录」的会员到期读取路径（ADR-0004）。官方昵称只允许在既有导入/授权/额度流程上额外 `GET api.kimi.com/coding/v1/me`，禁止 `www.kimi.com/me`；禁止引入遥测。
-3. **手动切换永远可用**：`swap` 不依赖额度查询、`/me` 和网络，原子写入 + 快照回滚的逻辑不得破坏。额度查询成功后不得 await `/me`（后台缓存即可）；`/me` 失败不失败主流程。额度耗尽自动切换默认关闭；子开关 `prefer_lower_tier`（优先低档位）亦默认关，只改自动切换候选排序、不影响手动切换。判定只用已收集的额度快照、不新打网；执行只走既有 `activate`；不引入常驻 daemon。
+3. **手动切换永远可用**：`swap` 不依赖额度查询、`/me` 和网络，原子写入 + 快照回滚的逻辑不得破坏。额度查询成功后不得 await `/me`（后台缓存即可）；`/me` 失败不失败主流程。额度耗尽自动切换默认关闭；子开关 `prefer_lower_tier`（优先低档位）亦默认关，只改自动切换候选排序、不影响手动切换。子开关 `resident_lower_tier`（回驻，ADR-0008）亦默认关，开启后当前账号未耗尽也可能被自动切走；手动切换会写保持期、回驻与耗尽切换共用冷却，细节见 ADR-0008。判定只用已收集的额度快照、不新打网；执行只走既有 `activate`；不引入常驻 daemon。
 4. **token 刷新必须与官方客户端协调**：有官方锁协议的平台只能复用官方锁，不得自创并行刷新机制；仅在无官方锁的平台组合（当前：Windows + TS 客户端），允许经「主动续期」开关（默认关）依赖官方 100ms 重读采纳机制做查询前轮换，前提是原子写回（先账号库后 live，写序见 ADR-0002）。refresh token 是一次性轮换，被拒绝后记录指纹并停止重试。
 5. 代码注释、doc comment 用中文；用户可见输出、错误文本用简洁中文（GUI）/英文（CLI 内部标识）。
 6. 不做 git 提交、推送、打 tag，除非用户明确要求。
@@ -40,13 +40,12 @@ node scripts/generate-icons.mjs        # 重生成 src-tauri/icons（零依赖�
 
 ### Issue tracker
 
-GitHub Issues 写在 `Baker4real/kimi-switch-private`；`gh` 必须带 `-R`，禁止打到公开上游 `yuan2627/kimi-switch`。See `docs/agents/issue-tracker.md`.
+**Issue 操作**（建票/读/评论/标签/关票）前读 `docs/agents/issue-tracker.md`；`gh` 必须带 `-R Baker4real/kimi-switch-private`，禁止打到公开上游 `yuan2627/kimi-switch`。
 
 ### Triage labels
 
-状态五套 + 分类 `bug` / `enhancement`。See `docs/agents/triage-labels.md`.
+**打标签 / triage** 前读 `docs/agents/triage-labels.md`。
 
 ### Domain docs
 
-single-context：根目录 `CONTEXT.md` + `docs/adr/`。See `docs/agents/domain.md`.
-ownership / endpoint / extra 键 / agent 文档查找：仓库 OKF（`.okf-frontmatter.json`，含 `docs/agents/`）。
+**域词与 ADR**：根目录 `CONTEXT.md` + `docs/adr/`（见 `docs/agents/domain.md`）；**ownership / endpoint / extra 键 / agent 文档查找**走仓库 OKF（`.okf-frontmatter.json`，含 `docs/agents/`）。
