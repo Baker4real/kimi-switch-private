@@ -291,3 +291,21 @@ mod init_failure_tests {
         assert_eq!(notice.exit_code, 1);
     }
 }
+
+#[cfg(test)]
+mod csp_tests {
+    /// 额度条与会员轨道用 `style="width:N%"` 画填充（会员=已度过比例，剩余越短越满）。
+    /// 仅 `default-src 'self'` 时 style 属性被禁，块级 `.quota-fill` 拉满轨道。
+    #[test]
+    fn webview_csp_allows_style_attrs_for_bar_width() {
+        let raw = include_str!("../tauri.conf.json");
+        assert!(
+            raw.contains("default-src 'self'"),
+            "脚本与资源仍只允许 self"
+        );
+        assert!(
+            raw.contains("style-src-attr 'unsafe-inline'"),
+            "必须放行 style 属性，否则会员/额度条宽无效、看起来永远满条"
+        );
+    }
+}
