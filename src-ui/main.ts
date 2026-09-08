@@ -8,10 +8,14 @@ import { credentialRecoveredToast } from "./credentialToast";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
 import {
+  autoSwapNestedPanelToggle,
+  autoSwapNestedPanelView,
+  autoSwapNestedStatusText,
   autoSwapOptOutSwitchHtml,
   autoSwapPreferLowerTierSwitchView,
   autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
+  type AutoSwapNestedPanelOverride,
 } from "./auto-swap";
 import { createSilentQuotaScheduler } from "./silent-quota";
 import { renewalSwitchView } from "./renewal";
@@ -72,6 +76,10 @@ let lastAuth: { target: string | null; displayName: string } | null = null;
 /** deviceAuth 失败也会调 close；为 true 时拦住，让对话框留着就近重试。 */
 let authHoldOpen = false;
 let toastTimer = 0;
+/** 「优先低档与回驻」折叠面板的会话记忆（issue #116/#117）；null=尚未点过，静态首帧收起。不落盘。 */
+let autoSwapNestedOverride: AutoSwapNestedPanelOverride = null;
+/** 本会话是否曾展开过（含自动展开）；只置 true，任何路径都不清回 false。不落盘。 */
+let autoSwapNestedOpened = false;
 
 const silentQuota = createSilentQuotaScheduler({
   clock: {
@@ -351,6 +359,46 @@ function paintAutoSwapResidentLowerTier(
   toggle.disabled = view.disabled;
 }
 
+/** 读当前两个子开关的 DOM 状态（paint 层用；开合判定本身仍是纯函数）。 */
+function currentNestedSwitchState(): { prefer: boolean; resident: boolean } {
+  return {
+    prefer:
+      required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").getAttribute(
+        "aria-checked",
+      ) === "true",
+    resident:
+      required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").getAttribute(
+        "aria-checked",
+      ) === "true",
+  };
+}
+
+/**
+ * 折叠面板 paint（issue #116/#117）：同步 aria-expanded、hidden、状态行文案与
+ * aria-describedby；自动路径算出展开时把会话闩 opened 置 true。
+ */
+function paintAutoSwapNestedPanel(preferLowerTier: boolean, residentLowerTier: boolean): void {
+  const view = autoSwapNestedPanelView(
+    autoSwapNestedOverride,
+    autoSwapNestedOpened,
+    preferLowerTier,
+    residentLowerTier,
+  );
+  autoSwapNestedOpened = view.opened;
+  const toggle = required<HTMLButtonElement>("auto-swap-nested-toggle");
+  toggle.setAttribute("aria-expanded", String(view.expanded));
+  required<HTMLElement>("auto-swap-nested-panel").classList.toggle("hidden", !view.expanded);
+  const status = autoSwapNestedStatusText(preferLowerTier, residentLowerTier);
+  const statusEl = required<HTMLParagraphElement>("auto-swap-nested-status");
+  statusEl.textContent = status;
+  statusEl.classList.toggle("hidden", status === "");
+  if (status === "") {
+    toggle.removeAttribute("aria-describedby");
+  } else {
+    toggle.setAttribute("aria-describedby", "auto-swap-nested-status");
+  }
+}
+
 function showToast(text: string, isError = false): void {
   window.clearTimeout(toastTimer);
   const status = required<HTMLDivElement>("toast-status");
@@ -443,6 +491,8 @@ function paintSnapshot(next: Snapshot): void {
   paintAutoSwap(next.auto_swap);
   paintAutoSwapPreferLowerTier(next.auto_swap, next.auto_swap_prefer_lower_tier);
   paintAutoSwapResidentLowerTier(next.auto_swap, next.auto_swap_resident_lower_tier);
+  // 折叠 paint 放在子开关之后：自动展开与状态行都要读刚涂好的子开关真值。
+  paintAutoSwapNestedPanel(next.auto_swap_prefer_lower_tier, next.auto_swap_resident_lower_tier);
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
   rememberListFocus();
@@ -951,6 +1001,18 @@ async function init(): Promise<void> {
       showToast(renewalSwitchView(saved).toast);
     });
   });
+  required<HTMLButtonElement>("auto-swap-nested-toggle").addEventListener("click", () => {
+    const state = currentNestedSwitchState();
+    const view = autoSwapNestedPanelToggle(
+      autoSwapNestedOverride,
+      autoSwapNestedOpened,
+      state.prefer,
+      state.resident,
+    );
+    autoSwapNestedOverride = view.override;
+    autoSwapNestedOpened = view.opened;
+    paintAutoSwapNestedPanel(state.prefer, state.resident);
+  });
   required<HTMLButtonElement>("auto-swap-toggle").addEventListener("click", () => {
     const toggle = required<HTMLButtonElement>("auto-swap-toggle");
     const next = toggle.getAttribute("aria-checked") !== "true";
@@ -984,6 +1046,7 @@ async function init(): Promise<void> {
           required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
           "true";
         paintAutoSwapPreferLowerTier(masterOn, saved);
+        paintAutoSwapNestedPanel(saved, currentNestedSwitchState().resident);
         showToast(autoSwapPreferLowerTierSwitchView(masterOn, saved).toast);
       });
     },
@@ -1002,6 +1065,7 @@ async function init(): Promise<void> {
           required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
           "true";
         paintAutoSwapResidentLowerTier(masterOn, saved);
+        paintAutoSwapNestedPanel(currentNestedSwitchState().prefer, saved);
         showToast(autoSwapResidentLowerTierSwitchView(masterOn, saved).toast);
       });
     },

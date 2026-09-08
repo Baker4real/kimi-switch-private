@@ -880,6 +880,45 @@ p {
   padding-left: 16px;
 }
 
+/* 折叠标题：整行可点，右侧 caret（纯 CSS），与嵌套开关行同节奏。 */
+.settings-disclosure {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 24px;
+  padding: 0;
+  color: var(--text-body);
+  font-size: 0.82rem;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-disclosure-caret {
+  flex-shrink: 0;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid var(--text-muted);
+  transition: transform 140ms ease;
+}
+
+/* 折叠标题 + 其下方状态行的列布局（issue #117）。 */
+.settings-disclosure-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.settings-disclosure[aria-expanded="true"] .settings-disclosure-caret {
+  transform: rotate(90deg);
+}
+
 .settings-copy {
   display: flex;
   flex-direction: column;
@@ -892,6 +931,13 @@ p {
   color: var(--text-muted);
   font-size: 0.78rem;
   line-height: 1.6;
+}
+
+/* 收起态也要看得见哪项子开关是开的（issue #117）；文案由 paint 层写入。
+   放在 .settings-note 之后才能盖掉它的 max-width 与字重。 */
+.settings-disclosure-status {
+  max-width: none;
+  font-weight: 400;
 }
 
 .switch {
@@ -1096,5 +1142,9 @@ p {
   .action-button:hover:not(:disabled),
   .profile-pill:hover:not(:disabled) {
     transform: none;
+  }
+
+  .settings-disclosure-caret {
+    transition: none;
   }
 }
