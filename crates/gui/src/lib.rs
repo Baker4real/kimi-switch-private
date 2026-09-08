@@ -7,8 +7,8 @@ mod dto;
 
 pub use backend::Backend;
 pub use dto::{
-    AccountRow, AuthLink, CommandError, MessageTone, QuotaTone, QuotaView, Snapshot, ThemeId,
-    UiMessage, UiMessageKind, URGENT_USED_RATIO,
+    AccountRow, AuthLink, CommandError, MessageTone, QuotaTone, QuotaView, Snapshot, UiMessage,
+    UiMessageKind, URGENT_USED_RATIO,
 };
 pub use kimi_switch_core::QuotaCollectReason;
 
@@ -149,7 +149,6 @@ mod tests {
             current_label: "--".into(),
             account_count: 1,
             urgent_count: 0,
-            theme: ThemeId::Classic,
             proactive_renewal: false,
             auto_swap: false,
             auto_swap_prefer_lower_tier: false,
@@ -260,14 +259,6 @@ mod tests {
         assert_eq!(row.error.as_deref(), Some("429 rate limited"));
         assert!(!row.is_urgent());
         assert!(row.cached_at.is_none());
-    }
-
-    #[test]
-    fn theme_id_only_classic_or_jade_night() {
-        assert_eq!(ThemeId::parse("classic"), ThemeId::Classic);
-        assert_eq!(ThemeId::parse("jade-night"), ThemeId::JadeNight);
-        assert_eq!(ThemeId::parse("mica"), ThemeId::Classic);
-        assert_eq!(ThemeId::parse(""), ThemeId::Classic);
     }
 
     #[test]
@@ -1062,7 +1053,6 @@ mod tests {
             urgent_count: 0,
             current_label: "--".into(),
             accounts,
-            theme: ThemeId::Classic,
             proactive_renewal: false,
             auto_swap: false,
             auto_swap_prefer_lower_tier: false,

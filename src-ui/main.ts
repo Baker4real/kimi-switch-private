@@ -8,14 +8,11 @@ import { credentialRecoveredToast } from "./credentialToast";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
 import {
-  autoSwapNestedPanelToggle,
-  autoSwapNestedPanelView,
-  autoSwapNestedStatusText,
   autoSwapOptOutSwitchHtml,
   autoSwapPreferLowerTierSwitchView,
   autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
-  type AutoSwapNestedPanelOverride,
+  behaviorPanelStatusText,
 } from "./auto-swap";
 import { createSilentQuotaScheduler } from "./silent-quota";
 import { renewalSwitchView } from "./renewal";
@@ -31,17 +28,10 @@ import {
   type ListFocusKey,
   type SnapshotAnnounceSource,
 } from "./store";
-import {
-  parseMirroredTheme,
-  persistThemeMirror,
-  themeApplication,
-  THEME_STORAGE_KEY,
-  type ThemeId,
-} from "./theme";
 import { setupWindowControls } from "./window-controls";
 import { parseWebToken, webBindCopy, WEB_BIND_CONSOLE_URL } from "./webBind";
 
-type Route = "overview" | "library" | "settings";
+type Route = "overview" | "library";
 
 const BUSY_BUTTON_IDS = [
   "add-account-button",
@@ -57,7 +47,7 @@ const BUSY_BUTTON_IDS = [
   "auth-retry-button",
 ] as const;
 
-const routes: Route[] = ["overview", "library", "settings"];
+const routes: Route[] = ["overview", "library"];
 const store = createAppStore();
 let renameId = "";
 let deleteId = "";
@@ -76,10 +66,9 @@ let lastAuth: { target: string | null; displayName: string } | null = null;
 /** deviceAuth 失败也会调 close；为 true 时拦住，让对话框留着就近重试。 */
 let authHoldOpen = false;
 let toastTimer = 0;
-/** 「优先低档与回驻」折叠面板的会话记忆（issue #116/#117）；null=尚未点过，静态首帧收起。不落盘。 */
-let autoSwapNestedOverride: AutoSwapNestedPanelOverride = null;
-/** 本会话是否曾展开过（含自动展开）；只置 true，任何路径都不清回 false。不落盘。 */
-let autoSwapNestedOpened = false;
+/** 「账号行为」折叠的会话开合（issue #120）：单一布尔，默认收起，点标题取反。
+ * 不因任何开关已开而自动展开；快照 / 静默列出 / 换路由不得改写；不写任何盘上存储。 */
+let behaviorPanelExpanded = false;
 
 const silentQuota = createSilentQuotaScheduler({
   clock: {
@@ -303,29 +292,6 @@ function syncListedActionsBusy(): void {
   setListedActionsBusy(listedActionButtons(), store.get().busy);
 }
 
-function applyTheme(theme: ThemeId): void {
-  const decision = themeApplication(theme);
-  document.documentElement.dataset.theme = decision.dataTheme;
-  persistThemeMirror(decision.dataTheme);
-  const classic = required<HTMLButtonElement>("theme-classic");
-  const jade = required<HTMLButtonElement>("theme-jade-night");
-  classic.classList.toggle("is-active", decision.classic.active);
-  jade.classList.toggle("is-active", decision.jadeNight.active);
-  classic.setAttribute("aria-pressed", String(decision.classic.pressed));
-  jade.setAttribute("aria-pressed", String(decision.jadeNight.pressed));
-}
-
-function applyMirroredTheme(): void {
-  try {
-    const mirrored = parseMirroredTheme(localStorage.getItem(THEME_STORAGE_KEY));
-    if (mirrored) {
-      applyTheme(mirrored);
-    }
-  } catch {
-    // 镜像不可读时等快照权威值
-  }
-}
-
 function paintProactiveRenewal(enabled: boolean): void {
   const view = renewalSwitchView(enabled);
   required<HTMLButtonElement>("renewal-toggle").setAttribute(
@@ -359,43 +325,35 @@ function paintAutoSwapResidentLowerTier(
   toggle.disabled = view.disabled;
 }
 
-/** 读当前两个子开关的 DOM 状态（paint 层用；开合判定本身仍是纯函数）。 */
-function currentNestedSwitchState(): { prefer: boolean; resident: boolean } {
-  return {
-    prefer:
-      required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").getAttribute(
-        "aria-checked",
-      ) === "true",
-    resident:
-      required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").getAttribute(
-        "aria-checked",
-      ) === "true",
-  };
-}
-
 /**
- * 折叠面板 paint（issue #116/#117）：同步 aria-expanded、hidden、状态行文案与
- * aria-describedby；自动路径算出展开时把会话闩 opened 置 true。
+ * 账号行为折叠 paint（issue #120）：只涂 aria-expanded、面板隐藏与收起态状态行。
+ * 开合只由会话布尔 behaviorPanelExpanded 决定，任何开关已开都不得自动展开。
+ * 状态行只在收起且字符串非空时渲染，挂为折叠标题的描述；展开时不写；空则去掉描述。
  */
-function paintAutoSwapNestedPanel(preferLowerTier: boolean, residentLowerTier: boolean): void {
-  const view = autoSwapNestedPanelView(
-    autoSwapNestedOverride,
-    autoSwapNestedOpened,
-    preferLowerTier,
-    residentLowerTier,
+function paintBehaviorPanel(): void {
+  const toggle = required<HTMLButtonElement>("behavior-panel-toggle");
+  toggle.setAttribute("aria-expanded", String(behaviorPanelExpanded));
+  required<HTMLElement>("behavior-panel-body").classList.toggle(
+    "hidden",
+    !behaviorPanelExpanded,
   );
-  autoSwapNestedOpened = view.opened;
-  const toggle = required<HTMLButtonElement>("auto-swap-nested-toggle");
-  toggle.setAttribute("aria-expanded", String(view.expanded));
-  required<HTMLElement>("auto-swap-nested-panel").classList.toggle("hidden", !view.expanded);
-  const status = autoSwapNestedStatusText(preferLowerTier, residentLowerTier);
-  const statusEl = required<HTMLParagraphElement>("auto-swap-nested-status");
+  const checked = (id: string): boolean =>
+    required<HTMLButtonElement>(id).getAttribute("aria-checked") === "true";
+  const status = behaviorPanelExpanded
+    ? ""
+    : behaviorPanelStatusText(
+        checked("renewal-toggle"),
+        checked("auto-swap-toggle"),
+        checked("auto-swap-prefer-lower-tier-toggle"),
+        checked("auto-swap-resident-lower-tier-toggle"),
+      );
+  const statusEl = required<HTMLParagraphElement>("behavior-panel-status");
   statusEl.textContent = status;
   statusEl.classList.toggle("hidden", status === "");
   if (status === "") {
     toggle.removeAttribute("aria-describedby");
   } else {
-    toggle.setAttribute("aria-describedby", "auto-swap-nested-status");
+    toggle.setAttribute("aria-describedby", "behavior-panel-status");
   }
 }
 
@@ -486,13 +444,12 @@ function paintCurrentPlan(snapshot: Snapshot): void {
 function paintSnapshot(next: Snapshot): void {
   store.setSnapshot(next);
   setOverviewLoadError(false);
-  applyTheme(next.theme);
   paintProactiveRenewal(next.proactive_renewal);
   paintAutoSwap(next.auto_swap);
   paintAutoSwapPreferLowerTier(next.auto_swap, next.auto_swap_prefer_lower_tier);
   paintAutoSwapResidentLowerTier(next.auto_swap, next.auto_swap_resident_lower_tier);
-  // 折叠 paint 放在子开关之后：自动展开与状态行都要读刚涂好的子开关真值。
-  paintAutoSwapNestedPanel(next.auto_swap_prefer_lower_tier, next.auto_swap_resident_lower_tier);
+  // 折叠 paint 放在四个开关之后：收起态状态行要读刚涂好的开关真值；开合不因快照改写。
+  paintBehaviorPanel();
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
   rememberListFocus();
@@ -554,7 +511,6 @@ function applyRoute(route: Route): void {
   });
   required<HTMLElement>("page-overview").classList.toggle("active", route === "overview");
   required<HTMLElement>("page-library").classList.toggle("active", route === "library");
-  required<HTMLElement>("page-settings").classList.toggle("active", route === "settings");
 }
 
 // 用户操作一开始就占住世代，已在飞的静默结果会被当成落后快照丢掉。
@@ -626,7 +582,7 @@ async function runAction(label: string, action: () => Promise<Snapshot>): Promis
   }
 }
 
-/** 设置页异步操作：走同一套全局忙碌指示，失败进错误 toast。 */
+/** 账号库开关类异步操作：走同一套全局忙碌指示，失败进错误 toast。 */
 async function runSettingsAction(label: string, action: () => Promise<void>): Promise<void> {
   if (store.get().busy) {
     return;
@@ -953,7 +909,6 @@ function wireList(): void {
 
 async function init(): Promise<void> {
   await setupWindowControls();
-  applyMirroredTheme();
   applyRoute(routeFromHash());
   window.addEventListener("hashchange", () => applyRoute(routeFromHash()));
   wireSilentQuota();
@@ -982,36 +937,21 @@ async function init(): Promise<void> {
   required<HTMLButtonElement>("toast-alert-dismiss").addEventListener("click", () => {
     dismissAlertToast();
   });
-  required<HTMLButtonElement>("theme-classic").addEventListener("click", () => {
-    void runSettingsAction("正在切换主题…", async () => {
-      applyTheme(await api.setTheme("classic"));
-    });
-  });
-  required<HTMLButtonElement>("theme-jade-night").addEventListener("click", () => {
-    void runSettingsAction("正在切换主题…", async () => {
-      applyTheme(await api.setTheme("jade-night"));
-    });
-  });
   required<HTMLButtonElement>("renewal-toggle").addEventListener("click", () => {
     const toggle = required<HTMLButtonElement>("renewal-toggle");
     const next = toggle.getAttribute("aria-checked") !== "true";
     void runSettingsAction("正在保存设置…", async () => {
       const saved = await api.setProactiveRenewal(next);
       paintProactiveRenewal(saved);
+      // 续期也进状态行：保存成功后立刻重涂收起态文案，不等下一次快照。
+      paintBehaviorPanel();
       showToast(renewalSwitchView(saved).toast);
     });
   });
-  required<HTMLButtonElement>("auto-swap-nested-toggle").addEventListener("click", () => {
-    const state = currentNestedSwitchState();
-    const view = autoSwapNestedPanelToggle(
-      autoSwapNestedOverride,
-      autoSwapNestedOpened,
-      state.prefer,
-      state.resident,
-    );
-    autoSwapNestedOverride = view.override;
-    autoSwapNestedOpened = view.opened;
-    paintAutoSwapNestedPanel(state.prefer, state.resident);
+  required<HTMLButtonElement>("behavior-panel-toggle").addEventListener("click", () => {
+    // 开合只是会话布尔取反：busy 时仍可点、不弹 toast、不写盘。
+    behaviorPanelExpanded = !behaviorPanelExpanded;
+    paintBehaviorPanel();
   });
   required<HTMLButtonElement>("auto-swap-toggle").addEventListener("click", () => {
     const toggle = required<HTMLButtonElement>("auto-swap-toggle");
@@ -1029,6 +969,7 @@ async function init(): Promise<void> {
           "aria-checked",
         ) === "true";
       paintAutoSwapResidentLowerTier(saved, resident);
+      paintBehaviorPanel();
       showToast(autoSwapSwitchView(saved).toast);
     });
   });
@@ -1046,7 +987,7 @@ async function init(): Promise<void> {
           required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
           "true";
         paintAutoSwapPreferLowerTier(masterOn, saved);
-        paintAutoSwapNestedPanel(saved, currentNestedSwitchState().resident);
+        paintBehaviorPanel();
         showToast(autoSwapPreferLowerTierSwitchView(masterOn, saved).toast);
       });
     },
@@ -1065,7 +1006,7 @@ async function init(): Promise<void> {
           required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
           "true";
         paintAutoSwapResidentLowerTier(masterOn, saved);
-        paintAutoSwapNestedPanel(currentNestedSwitchState().prefer, saved);
+        paintBehaviorPanel();
         showToast(autoSwapResidentLowerTierSwitchView(masterOn, saved).toast);
       });
     },

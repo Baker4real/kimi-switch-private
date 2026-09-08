@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type { QuotaView } from "./quota";
-import type { ThemeId } from "./theme";
 
 export type MessageTone = "ok" | "err" | "info";
 
@@ -55,7 +54,6 @@ export interface Snapshot {
   current_label: string;
   account_count: number;
   urgent_count: number;
-  theme: ThemeId;
   /** 「当前账号主动续期」开关（issue #42）：与 CLI 同源，来自 config.toml。 */
   proactive_renewal: boolean;
   /** 「额度耗尽自动切换」开关（issue #68）：与 CLI 同源，来自 config.toml。 */
@@ -132,7 +130,6 @@ export function createApi(invokeFn: InvokeFn) {
     bindWebAccount: (id: string, token: string) =>
       call<Snapshot>("bind_web_account", { id, token }),
     openUrl: (url: string) => call<void>("open_url", { url }),
-    setTheme: (theme: ThemeId) => call<ThemeId>("set_theme", { theme }),
     setProactiveRenewal: (enabled: boolean) =>
       call<boolean>("set_proactive_renewal", { enabled }),
     setAutoSwap: (enabled: boolean) => call<boolean>("set_auto_swap", { enabled }),

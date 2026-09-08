@@ -99,7 +99,7 @@ describe("操作失败就近重试（issue #84）", () => {
   it("账号库切换失败有就近重试，不要求回到某一张卡上再点", () => {
     const library = html.slice(
       html.indexOf('id="page-library"'),
-      html.indexOf('id="page-settings"'),
+      html.indexOf('id="auth-dialog"'),
     );
     expect(library).toContain('id="library-action-error"');
     expect(library).toContain('id="library-retry-button"');

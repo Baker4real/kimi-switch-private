@@ -23,7 +23,7 @@ use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
 use kimi_switch_kimi::KimiProvider;
 
-use crate::dto::{AccountRow, AuthLink, QuotaView, Snapshot, ThemeId, UiMessage};
+use crate::dto::{AccountRow, AuthLink, QuotaView, Snapshot, UiMessage};
 
 pub struct Backend {
     store: Arc<dyn CredentialStore>,
@@ -100,21 +100,6 @@ impl Backend {
             web_membership,
             pending_auth: Mutex::new(None),
         })
-    }
-
-    pub fn load_theme() -> ThemeId {
-        AppPaths::resolve()
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p.config_dir.join("gui-theme")).ok())
-            .map(|s| ThemeId::parse(&s))
-            .unwrap_or(ThemeId::Classic)
-    }
-
-    pub fn save_theme(theme: ThemeId) -> Result<()> {
-        let paths = AppPaths::resolve()?;
-        std::fs::write(paths.config_dir.join("gui-theme"), theme.as_str())
-            .context("写入界面主题失败")?;
-        Ok(())
     }
 
     /// 直读 config.toml 里的「当前账号主动续期」开关；文件缺失/损坏都回落默认关。
@@ -314,7 +299,6 @@ impl Backend {
             urgent_count,
             current_label,
             accounts: rows,
-            theme: Self::load_theme(),
             proactive_renewal: Self::load_proactive_renewal(),
             auto_swap: Self::load_auto_swap(),
             auto_swap_prefer_lower_tier: Self::load_auto_swap_prefer_lower_tier(),

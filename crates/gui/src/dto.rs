@@ -1,7 +1,7 @@
 //! webview 可见的展示数据。禁止放入 token 或凭证 blob。
 
 use chrono::{DateTime, FixedOffset, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// 总览「额度告急」：任一窗口已用 ≥ 此比例。告急只看真实用量，额度查询失败不告急。
 pub const URGENT_USED_RATIO: f32 = 0.8;
@@ -183,7 +183,6 @@ pin_dto_fields!(
     "current_label",
     "account_count",
     "urgent_count",
-    "theme",
     "proactive_renewal",
     "auto_swap",
     "auto_swap_prefer_lower_tier",
@@ -191,29 +190,6 @@ pin_dto_fields!(
     "message",
 );
 pin_dto_fields!(UI_MESSAGE_JSON_KEYS, UI_API_TS, "text", "tone", "kind",);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ThemeId {
-    Classic,
-    JadeNight,
-}
-
-impl ThemeId {
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim() {
-            "jade-night" => Self::JadeNight,
-            _ => Self::Classic,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Classic => "classic",
-            Self::JadeNight => "jade-night",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QuotaView {
@@ -409,7 +385,6 @@ pub struct Snapshot {
     pub current_label: String,
     pub account_count: u32,
     pub urgent_count: u32,
-    pub theme: ThemeId,
     /// 「当前账号主动续期」开关（issue #42）：直读 config.toml，默认关。
     pub proactive_renewal: bool,
     /// 「额度耗尽自动切换」开关（issue #68）：直读 config.toml，默认关。

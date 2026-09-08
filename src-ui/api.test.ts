@@ -23,7 +23,6 @@ describe("createApi 动词与命令字符串", () => {
     await api.cancelDeviceAuth();
     await api.bindWebAccount("acc-5", "web-token");
     await api.openUrl("https://auth.kimi.com/x");
-    await api.setTheme("jade-night");
     await api.setProactiveRenewal(true);
     await api.setAutoSwap(true);
     await api.setAutoSwapPreferLowerTier(true);
@@ -43,7 +42,6 @@ describe("createApi 动词与命令字符串", () => {
       ["cancel_device_auth"],
       ["bind_web_account", { id: "acc-5", token: "web-token" }],
       ["open_url", { url: "https://auth.kimi.com/x" }],
-      ["set_theme", { theme: "jade-night" }],
       ["set_proactive_renewal", { enabled: true }],
       ["set_auto_swap", { enabled: true }],
       ["set_auto_swap_prefer_lower_tier", { enabled: true }],
@@ -52,11 +50,13 @@ describe("createApi 动词与命令字符串", () => {
     ]);
   });
 
-  it("不提供列出/刷新重复命令或取主题死命令", () => {
+  it("不提供列出/刷新重复命令或主题类死命令", () => {
     const api = createApi(mockInvoke());
     expect(api).not.toHaveProperty("refreshAccounts");
+    expect(api).not.toHaveProperty("setTheme");
     expect(api).not.toHaveProperty("getTheme");
     expect("refresh_accounts" in api).toBe(false);
+    expect("set_theme" in api).toBe(false);
     expect("get_theme" in api).toBe(false);
   });
 });

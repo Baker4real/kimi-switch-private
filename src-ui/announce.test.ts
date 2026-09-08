@@ -21,11 +21,7 @@ const overview = html.slice(
 );
 const library = html.slice(
   html.indexOf('id="page-library"'),
-  html.indexOf('id="page-settings"'),
-);
-const settings = html.slice(
-  html.indexOf('id="page-settings"'),
-  html.indexOf("auth-dialog"),
+  html.indexOf('id="auth-dialog"'),
 );
 
 describe("全局忙碌指示（issue #83）", () => {
@@ -36,14 +32,13 @@ describe("全局忙碌指示（issue #83）", () => {
     expect(overview).not.toContain('id="app-busy"');
     expect(overview).not.toContain("quota-monitor-label");
     expect(library).not.toContain('id="app-busy"');
-    expect(settings).not.toContain('id="app-busy"');
   });
 
-  it("主壳带 aria-busy，供三个页面感知异步占用", () => {
+  it("主壳带 aria-busy，供两个页面感知异步占用", () => {
     expect(html).toMatch(/id="app-shell"[^>]*aria-busy="false"/);
     expect(html).toContain('id="page-overview"');
     expect(html).toContain('id="page-library"');
-    expect(html).toContain('id="page-settings"');
+    expect(html).not.toContain('id="page-settings"');
   });
 });
 

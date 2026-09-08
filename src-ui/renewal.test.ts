@@ -12,7 +12,7 @@ const html = readFileSync(
 );
 const libraryPage = html.slice(
   html.indexOf('id="page-library"'),
-  html.indexOf('id="page-settings"'),
+  html.indexOf('id="auth-dialog"'),
 );
 
 describe("renewalSwitchView", () => {

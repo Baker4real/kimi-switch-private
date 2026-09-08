@@ -34,7 +34,7 @@
   color-scheme: light;
   --canvas-bg: #f2efea;
   /* 同一色相加深 H≈227° S≈24% L 74%→42%。叠在 --canvas-bg 上实测：
-     主按钮白字 5.62:1，激活 Tab / 主题钮白字 5.15:1，hover 6.70:1。 */
+     主按钮白字 5.62:1，激活 Tab 白字 5.15:1，hover 6.70:1。 */
   --surface-pressed: rgba(81, 92, 133, 0.92);
   --border: rgba(228, 223, 214, 0.92);
   --border-accent: rgba(208, 236, 244, 0.96);
@@ -96,57 +96,6 @@
   --tone-warn: linear-gradient(90deg, #d29922, #e3b341);
   --tone-high: linear-gradient(90deg, #f0883e, #f5a15a);
   --tone-full: linear-gradient(90deg, #f85173, #ff7b72);
-}
-
-:root[data-theme="jade-night"] {
-  color-scheme: dark;
-  --canvas-bg: #151816;
-  /* 与主色同色相；叠底后激活 Tab 深字 4.98:1，主按钮 5.11:1，body 11.95:1。
-     muted #9aa89c：canvas 7.20:1，表单底 6.29:1，面板浅沿 5.76:1，账号卡浅沿 5.47:1（均 ≥ 5.0）。 */
-  --surface-pressed: rgba(96, 149, 132, 0.94);
-  --border: rgba(83, 96, 86, 0.75);
-  --border-accent: rgba(98, 164, 147, 0.9);
-  --text-strong: #ecf1e8;
-  --text-body: #cbd6cc;
-  --text-muted: #9aa89c;
-  --text-inverse: #0f1411;
-  --track: #303831;
-  --blue-fill: #67c3ad;
-  --monitor-dot: #78d4b7;
-  --focus-ring: rgba(103, 195, 173, 0.95);
-  --app-background:
-    radial-gradient(circle at 12% 10%, rgba(70, 91, 77, 0.35), transparent 26rem),
-    linear-gradient(180deg, #1a1f1b 0%, #121512 100%);
-  --shell-background: linear-gradient(180deg, rgba(29, 35, 30, 0.98), rgba(18, 22, 19, 0.98));
-  --panel-background: linear-gradient(180deg, rgba(38, 45, 39, 0.96), rgba(28, 34, 29, 0.96));
-  --profile-background: linear-gradient(180deg, rgba(40, 48, 41, 0.98), rgba(29, 35, 30, 0.98));
-  --dialog-background: linear-gradient(180deg, rgba(40, 48, 41, 0.98), rgba(29, 35, 30, 0.98));
-  --route-tabs-background: rgba(31, 38, 33, 0.88);
-  --monitor-background: rgba(36, 43, 37, 0.92);
-  --primary-background: rgba(96, 149, 132, 0.96);
-  --primary-background-hover: rgba(112, 171, 151, 0.98);
-  --primary-shadow: 0 10px 20px rgba(41, 75, 62, 0.3);
-  --button-background: rgba(37, 45, 39, 0.95);
-  --button-border: rgba(84, 98, 87, 0.9);
-  --button-hover-background: rgba(49, 59, 51, 0.98);
-  --empty-background: rgba(35, 42, 36, 0.72);
-  --empty-border: rgba(80, 94, 83, 0.9);
-  --field-background: rgba(31, 38, 33, 0.96);
-  --field-border: rgba(78, 92, 81, 0.95);
-  --code-background: rgba(25, 31, 27, 0.96);
-  --highlight-inset: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  --monitor-ring: 0 0 0 4px rgba(120, 212, 183, 0.15);
-  --dialog-shadow: 0 28px 64px rgba(0, 0, 0, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  --toast-background: rgba(34, 41, 36, 0.98);
-  --toast-shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
-  --dialog-backdrop: rgba(5, 8, 6, 0.5);
-  --window-control-hover-background: rgba(54, 64, 56, 0.78);
-  --window-close-background: rgba(174, 84, 82, 0.94);
-  --danger-border: rgba(204, 130, 126, 0.72);
-  --danger-text: #dfa5a0;
-  --danger-hover-background: rgba(74, 41, 39, 0.82);
-  --shadow-soft: 0 24px 56px rgba(0, 0, 0, 0.18);
-  --shadow-card: 0 18px 42px rgba(0, 0, 0, 0.16);
 }
 
 * {
@@ -417,7 +366,6 @@ p {
 
 .rail-card,
 .profiles-stage,
-.settings-panel,
 .status-card {
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
@@ -626,8 +574,13 @@ p {
   box-shadow: var(--highlight-inset);
 }
 
+/* 「账号行为」标题即折叠按钮（issue #120）：h3 保留标题层级，按钮整行可点、
+   右侧 caret；按钮不继承 h3 字体，字号字重在此显式沿用标题排印。 */
 .behavior-panel-title {
   margin: 0;
+}
+
+.behavior-panel-title .settings-disclosure {
   font-family: var(--font-display);
   font-size: 1.05rem;
   font-weight: 600;
@@ -835,10 +788,6 @@ p {
   gap: 16px;
 }
 
-.settings-panel {
-  padding: 22px 18px;
-}
-
 .settings-row {
   display: flex;
   align-items: center;
@@ -848,28 +797,6 @@ p {
   padding-top: 16px;
   border-top: 1px solid var(--border);
   color: var(--text-body);
-}
-
-.theme-dots {
-  display: inline-flex;
-  gap: 8px;
-}
-
-.theme-dot {
-  min-width: 56px;
-  height: 28px;
-  padding: 0 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  color: var(--text-body);
-  font-size: 0.78rem;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.theme-dot.is-active {
-  background: var(--surface-pressed);
-  color: var(--text-inverse);
 }
 
 .settings-row--switch {
@@ -906,7 +833,7 @@ p {
   transition: transform 140ms ease;
 }
 
-/* 折叠标题 + 其下方状态行的列布局（issue #117）。 */
+/* 折叠标题 + 其下方状态行的列布局（issue #120 账号行为一层折叠沿用）。 */
 .settings-disclosure-block {
   display: flex;
   flex-direction: column;
@@ -933,8 +860,8 @@ p {
   line-height: 1.6;
 }
 
-/* 收起态也要看得见哪项子开关是开的（issue #117）；文案由 paint 层写入。
-   放在 .settings-note 之后才能盖掉它的 max-width 与字重。 */
+/* 收起态也要看得见哪些项已开（issue #120）；文案由 paint 层写入，只在收起且非空时显示。
+   放在 .settings-note 之后才能盖掉它的 max-width 与字重；太长换行、不用省略号。 */
 .settings-disclosure-status {
   max-width: none;
   font-weight: 400;

@@ -7,7 +7,7 @@ compile_error!(
 
 use std::sync::Arc;
 
-use kimi_switch_gui::{Backend, CommandError, QuotaCollectReason, Snapshot, ThemeId};
+use kimi_switch_gui::{Backend, CommandError, QuotaCollectReason, Snapshot};
 use tauri::{Manager, State};
 
 struct AppState {
@@ -108,13 +108,6 @@ async fn bind_web_account(
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), CommandError> {
     Backend::open_url(&url).await.map_err(map_err)
-}
-
-#[tauri::command]
-fn set_theme(theme: String) -> Result<ThemeId, CommandError> {
-    let theme = ThemeId::parse(&theme);
-    Backend::save_theme(theme).map_err(map_err)?;
-    Ok(theme)
 }
 
 /// 「当前账号主动续期」开关（issue #42）：写 config.toml，返回落盘后的生效值。
@@ -283,7 +276,6 @@ pub fn run() {
             cancel_device_auth,
             bind_web_account,
             open_url,
-            set_theme,
             set_proactive_renewal,
             set_auto_swap,
             set_auto_swap_prefer_lower_tier,

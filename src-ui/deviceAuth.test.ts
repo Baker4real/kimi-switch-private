@@ -15,7 +15,6 @@ function sampleSnapshot(): Snapshot {
     current_label: "--",
     account_count: 0,
     urgent_count: 0,
-    theme: "classic",
     proactive_renewal: false,
     auto_swap: false,
     auto_swap_prefer_lower_tier: false,

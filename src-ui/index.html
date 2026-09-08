@@ -4,14 +4,6 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Kimi 换号器</title>
-    <script>
-      try {
-        var t = localStorage.getItem("kimi-switch.theme");
-        if (t === "jade-night" || t === "classic") {
-          document.documentElement.setAttribute("data-theme", t);
-        }
-      } catch (e) {}
-    </script>
   </head>
   <body>
     <div class="window-shell">
@@ -38,7 +30,6 @@
           <nav class="route-tabs" aria-label="主导航">
             <a class="route-tab active" href="#overview" data-route="overview" aria-current="page">总览</a>
             <a class="route-tab" href="#library" data-route="library">账号库</a>
-            <a class="route-tab" href="#settings" data-route="settings">设置</a>
           </nav>
           <div id="app-busy" class="quota-monitor-pill" aria-live="polite">
             <span class="quota-monitor-dot" aria-hidden="true"></span>
@@ -108,35 +99,34 @@
               </div>
             </div>
             <section class="behavior-panel" aria-labelledby="behavior-panel-title">
-              <h3 class="behavior-panel-title" id="behavior-panel-title">账号行为</h3>
-              <div class="settings-row settings-row--switch">
-                <div class="settings-copy">
-                  <span id="renewal-toggle-label">当前账号主动续期</span>
-                  <p class="settings-note" id="renewal-toggle-note">仅在 Windows 生效。允许本工具为当前账号主动续期登录凭证；极端情况下官方会话可能要求重新登录。本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」。</p>
-                </div>
-                <button id="renewal-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="renewal-toggle-label" aria-describedby="renewal-toggle-note">
-                  <span class="switch-thumb" aria-hidden="true"></span>
-                </button>
-              </div>
-              <div class="settings-row settings-row--switch">
-                <div class="settings-copy">
-                  <span id="auto-swap-toggle-label">额度耗尽自动切换</span>
-                  <p class="settings-note" id="auto-swap-toggle-note">当前账号任一额度窗口达到阈值时，自动切到合格停泊账号（默认按已用比例升序）。默认关闭。</p>
-                </div>
-                <button id="auto-swap-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="auto-swap-toggle-label" aria-describedby="auto-swap-toggle-note">
-                  <span class="switch-thumb" aria-hidden="true"></span>
-                </button>
-              </div>
-              <div class="settings-row settings-row--switch settings-row--nested">
-                <div class="settings-disclosure-block">
-                  <button id="auto-swap-nested-toggle" class="settings-disclosure" type="button" aria-expanded="false" aria-controls="auto-swap-nested-panel">
-                    <span id="auto-swap-nested-toggle-label">优先低档与回驻</span>
+              <div class="settings-disclosure-block">
+                <h3 class="behavior-panel-title" id="behavior-panel-title">
+                  <button id="behavior-panel-toggle" class="settings-disclosure" type="button" aria-expanded="false" aria-controls="behavior-panel-body">
+                    <span>账号行为</span>
                     <span class="settings-disclosure-caret" aria-hidden="true"></span>
                   </button>
-                  <p id="auto-swap-nested-status" class="settings-note settings-disclosure-status hidden"></p>
-                </div>
+                </h3>
+                <p id="behavior-panel-status" class="settings-note settings-disclosure-status hidden"></p>
               </div>
-              <div id="auto-swap-nested-panel" class="settings-nested-panel hidden">
+              <div id="behavior-panel-body" class="hidden">
+                <div class="settings-row settings-row--switch">
+                  <div class="settings-copy">
+                    <span id="renewal-toggle-label">当前账号主动续期</span>
+                    <p class="settings-note" id="renewal-toggle-note">仅在 Windows 生效。允许本工具为当前账号主动续期登录凭证；极端情况下官方会话可能要求重新登录。本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」。</p>
+                  </div>
+                  <button id="renewal-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="renewal-toggle-label" aria-describedby="renewal-toggle-note">
+                    <span class="switch-thumb" aria-hidden="true"></span>
+                  </button>
+                </div>
+                <div class="settings-row settings-row--switch">
+                  <div class="settings-copy">
+                    <span id="auto-swap-toggle-label">额度耗尽自动切换</span>
+                    <p class="settings-note" id="auto-swap-toggle-note">当前账号任一额度窗口达到阈值时，自动切到合格停泊账号（默认按已用比例升序）。默认关闭。</p>
+                  </div>
+                  <button id="auto-swap-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="auto-swap-toggle-label" aria-describedby="auto-swap-toggle-note">
+                    <span class="switch-thumb" aria-hidden="true"></span>
+                  </button>
+                </div>
                 <div class="settings-row settings-row--switch settings-row--nested">
                   <div class="settings-copy">
                     <span id="auto-swap-prefer-lower-tier-toggle-label">自动切换时优先低档位账号</span>
@@ -165,23 +155,6 @@
               </button>
             </div>
             <div id="accounts-list" class="profiles-grid"></div>
-          </div>
-        </section>
-
-        <section class="page" id="page-settings">
-          <div class="settings-panel">
-            <h2 class="section-title">设置</h2>
-            <div class="settings-row">
-              <span>主题</span>
-              <div class="theme-dots" role="group" aria-label="主题">
-                <button id="theme-classic" class="theme-dot is-active" type="button" data-theme="classic" title="纸色浅色" aria-pressed="true">
-                  纸色
-                </button>
-                <button id="theme-jade-night" class="theme-dot" type="button" data-theme="jade-night" title="Jade Night" aria-pressed="false">
-                  深色
-                </button>
-              </div>
-            </div>
           </div>
         </section>
       </main>

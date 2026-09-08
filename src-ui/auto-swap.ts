@@ -67,89 +67,33 @@ export function autoSwapResidentLowerTierSwitchView(
 }
 
 /**
- * 「优先低档与回驻」折叠面板（issue #116/#117）的开合决策。不碰 DOM、不读盘、不落盘。
- * override 只活在 GUI 会话内存：null=用户尚未点过（静态首帧收起）。
- * opened 是本会话「曾经展开过（含自动展开）」的闩，只由调用方写回模块级变量。
+ * 「账号行为」一层折叠收起态的状态行文案（issue #120，取代 #116/#117 内层折叠）：
+ * 标题下用一行字写出当前生效项。纯函数，不碰 DOM、不碰盘；由 paint 层只在收起时渲染。
+ * 总开关关闭时不写「优先低档」/「回驻」（置灰不算生效项）；全关返回空串（不写状态行）。
  */
-export type AutoSwapNestedPanelOverride = "open" | "closed" | null;
-
-export interface AutoSwapNestedPanelView {
-  /** 面板是否展开（true 对应 aria-expanded="true" 且面板不隐藏）。 */
-  expanded: boolean;
-  /** 写回会话记忆的「曾展开过」闩；任何路径都不得清回 false。 */
-  opened: boolean;
-}
-
-/**
- * 折叠面板开合真值表（issue #117）：
- * - override=open  → 展开
- * - override=closed → 收起
- * - override=null  → opened 或任一子开关为开则展开
- * 自动路径算出展开时把 opened 闩住；收起不改写 opened。
- */
-export function autoSwapNestedPanelView(
-  override: AutoSwapNestedPanelOverride,
-  opened: boolean,
-  preferLowerTier: boolean,
-  residentLowerTier: boolean,
-): AutoSwapNestedPanelView {
-  if (override === "open") {
-    return { expanded: true, opened: true };
-  }
-  if (override === "closed") {
-    return { expanded: false, opened };
-  }
-  const expanded = opened || preferLowerTier || residentLowerTier;
-  return { expanded, opened: expanded ? true : opened };
-}
-
-export interface AutoSwapNestedPanelToggleView extends AutoSwapNestedPanelView {
-  /** 点击后写回会话记忆的 override 值。 */
-  override: AutoSwapNestedPanelOverride;
-}
-
-/**
- * 点击折叠标题后的开合决策：目标开合取当前展开态的反面；目标为展开时把 opened 置 true，
- * 目标为收起时 opened 保持不变（不清回 false）。
- */
-export function autoSwapNestedPanelToggle(
-  override: AutoSwapNestedPanelOverride,
-  opened: boolean,
-  preferLowerTier: boolean,
-  residentLowerTier: boolean,
-): AutoSwapNestedPanelToggleView {
-  const current = autoSwapNestedPanelView(
-    override,
-    opened,
-    preferLowerTier,
-    residentLowerTier,
-  );
-  const expanded = !current.expanded;
-  return {
-    expanded,
-    override: expanded ? "open" : "closed",
-    opened: expanded ? true : current.opened,
-  };
-}
-
-/**
- * 折叠标题下方状态行文案（issue #117）：收起态也要标明哪项已开。
- * 都关时返回空串（不写状态行、折叠标题也不挂 aria-describedby）。
- */
-export function autoSwapNestedStatusText(
+export function behaviorPanelStatusText(
+  proactiveRenewal: boolean,
+  autoSwapEnabled: boolean,
   preferLowerTier: boolean,
   residentLowerTier: boolean,
 ): string {
-  if (preferLowerTier && residentLowerTier) {
-    return "优先低档、回驻已开";
+  const items: string[] = [];
+  if (proactiveRenewal) {
+    items.push("主动续期");
   }
-  if (preferLowerTier) {
-    return "优先低档已开";
+  if (autoSwapEnabled) {
+    items.push("自动切换");
+    if (preferLowerTier) {
+      items.push("优先低档");
+    }
+    if (residentLowerTier) {
+      items.push("回驻");
+    }
   }
-  if (residentLowerTier) {
-    return "回驻已开";
+  if (items.length === 0) {
+    return "";
   }
-  return "";
+  return `${items.join("、")}已开`;
 }
 
 /** 90s 静默列出只保留自动切换通知；「刚刚更新过」等节流提示仍丢弃。 */
