@@ -1,5 +1,6 @@
 //! webview 可见的展示数据。禁止放入 token 或凭证 blob。
 
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 
 /// 总览「额度告急」：任一窗口已用 ≥ 此比例。告急只看真实用量，额度查询失败不告急。
@@ -173,6 +174,7 @@ pin_dto_fields!(
     "cached_at",
     "display_name",
     "official_nickname_known",
+    "auto_swap_opt_out",
 );
 pin_dto_fields!(
     SNAPSHOT_JSON_KEYS,
@@ -269,6 +271,8 @@ pub struct AccountRow {
     pub display_name: String,
     /// 官方昵称缓存非空。已知时前端隐藏「重命名」入口。
     pub official_nickname_known: bool,
+    /// 摘出自动切换：true 时不作为耗尽/回驻候选；手动切换不受影响。
+    pub auto_swap_opt_out: bool,
 }
 
 impl AccountRow {
@@ -370,9 +374,16 @@ impl UiMessage {
         }
     }
 
-    pub fn auto_swap_no_candidate() -> Self {
+    pub fn auto_swap_no_candidate(earliest_reset: Option<DateTime<Utc>>) -> Self {
+        let text = match earliest_reset {
+            Some(at) => format!(
+                "没有可自动切换的账号，最早恢复 {}",
+                at.with_timezone(&east8()).format("%Y-%m-%d %H:%M")
+            ),
+            None => "没有可自动切换的账号".into(),
+        };
         Self {
-            text: "没有可自动切换的账号".into(),
+            text,
             tone: MessageTone::Err,
             kind: UiMessageKind::AutoSwapNoCandidate,
         }
@@ -385,6 +396,11 @@ impl UiMessage {
             kind: UiMessageKind::AutoSwapFailed,
         }
     }
+}
+
+/// 无候选 toast 的最早恢复时刻：固定东八区，不跟操作系统时区走。
+fn east8() -> FixedOffset {
+    FixedOffset::east_opt(8 * 3600).expect("UTC+8 是合法偏移")
 }
 
 #[derive(Debug, Clone, Serialize)]

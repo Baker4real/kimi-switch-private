@@ -6,7 +6,8 @@
 //!   [`reload_from_file`]，设置页落盘后下一次读取可见新值。单元测试跳过补水，以免本机配置污染并行用例。
 //! - **显式重载**：[`reload_from_file`] 供 CLI 启动时把解析/校验错误返回给调用方（CLI 短命）。
 //! - **失败兜底**：文件不存在 → 用默认值；文件存在但解析或校验失败 → 沿用上一次成功加载的值并打 warn。
-//! - **校验**：`auto_swap.threshold` 收敛到 `0.0..=1.0`；冷却/宽限等时间类拒绝负值。
+//! - **校验**：`auto_swap.threshold`、`auto_swap.candidate_margin` 与
+//!   `auto_swap.pace_warn_threshold` 收敛到 `0.0..=1.0`；冷却/宽限等时间类拒绝负值。
 //! - **访问入口**：[`current`] 返回 `Arc<Settings>`，所有调用点都从这里读，不要长期缓存返回值。
 //!
 //! 字段命名遵循「按 domain 分组」的 TOML 表，方便 `vim ~/.config/kimi-switch/config.toml`。
@@ -63,11 +64,27 @@ pub struct AutoSwap {
     pub settle_grace_ms: i64,
     /// 合格停泊账号中优先选档位更低者。默认关闭，与现状比较链一致。
     pub prefer_lower_tier: bool,
+    /// 合格停泊账号中优先选距 `reset_at` 更近者（issue #109 / ADR-0011）。
+    /// 默认关闭；只改耗尽路径候选排序，不改资格线，不作用于回驻。
+    pub prefer_soonest_reset: bool,
     /// 回驻子开关（issue #95 / ADR-0008）：当前账号未耗尽、但存在档位严格更低的
     /// 合格停泊账号时自动切回其中档位最低者。默认关闭；不影响耗尽切换。
     pub resident_lower_tier: bool,
     /// 手动切换后的回驻保持期（毫秒）。期间不回驻；耗尽被迫切换不受影响。
     pub manual_hold_ms: i64,
+    /// 耗尽 / pace 路径候选防抖边际（0.0~1.0，issue #108 / ADR-0010）。停泊账号
+    /// 最大已用比例须 ≤ 当前账号最大已用比例 − 此值，才成为目标。默认 0，与未配置
+    /// 时行为一致。不改触发线，不作用于回驻。pace 复用此键，不另造差值（ADR-0013）。
+    pub candidate_margin: f64,
+    /// 回驻确认期（issue #111 / ADR-0012）：目标停泊账号须连续这么多个快照周期
+    /// 保持合格才真正切回。默认 2；0 与 1 同义。只约束回驻路径，不进 GUI。
+    pub resident_confirm_n: u32,
+    /// pace 预切换子开关（issue #114 / ADR-0013）。默认关闭。开启后，未达耗尽
+    /// 阈值也可能因预测撑不到 reset 而提前切换。不进 GUI。
+    pub pace_pre_swap: bool,
+    /// pace 预切换预警水位（0.0~1.0）。当前账号最大已用须 ≥ 此值才考虑 pace。
+    /// 加载时 clamp 到 `0.0..=1.0`（与 threshold 同一套）。默认 0.8。
+    pub pace_warn_threshold: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,8 +156,13 @@ impl Default for AutoSwap {
             cooldown_ms: defaults::AUTO_SWAP_COOLDOWN_MS,
             settle_grace_ms: defaults::AUTO_SWAP_SETTLE_GRACE_MS,
             prefer_lower_tier: false,
+            prefer_soonest_reset: false,
             resident_lower_tier: false,
             manual_hold_ms: defaults::AUTO_SWAP_MANUAL_HOLD_MS,
+            candidate_margin: defaults::AUTO_SWAP_CANDIDATE_MARGIN,
+            resident_confirm_n: defaults::AUTO_SWAP_RESIDENT_CONFIRM_N,
+            pace_pre_swap: defaults::AUTO_SWAP_PACE_PRE_SWAP,
+            pace_warn_threshold: defaults::AUTO_SWAP_PACE_WARN_THRESHOLD,
         }
     }
 }
@@ -233,6 +255,22 @@ fn validate_and_normalize(settings: &mut Settings) -> Result<()> {
         return Err(Error::Config("auto_swap.threshold 必须是有限数值".into()));
     }
     settings.auto_swap.threshold = threshold.clamp(0.0, 1.0);
+
+    let margin = settings.auto_swap.candidate_margin;
+    if !margin.is_finite() {
+        return Err(Error::Config(
+            "auto_swap.candidate_margin 必须是有限数值".into(),
+        ));
+    }
+    settings.auto_swap.candidate_margin = margin.clamp(0.0, 1.0);
+
+    let pace_warn = settings.auto_swap.pace_warn_threshold;
+    if !pace_warn.is_finite() {
+        return Err(Error::Config(
+            "auto_swap.pace_warn_threshold 必须是有限数值".into(),
+        ));
+    }
+    settings.auto_swap.pace_warn_threshold = pace_warn.clamp(0.0, 1.0);
 
     fn reject_negative(name: &str, value: i64) -> Result<()> {
         if value < 0 {
@@ -457,6 +495,115 @@ threshold = 0.5
         let stock = load_from(&path).unwrap();
         assert!(stock.auto_swap.enabled);
         assert!(!stock.auto_swap.prefer_lower_tier);
+    }
+
+    /// issue #109：键缺失或 Default 均为 false，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn prefer_soonest_reset_defaults_off() {
+        assert!(!AutoSwap::default().prefer_soonest_reset);
+        assert!(!Settings::default().auto_swap.prefer_soonest_reset);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert!(!s.auto_swap.prefer_soonest_reset);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert!(!stock.auto_swap.prefer_soonest_reset);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[auto_swap]\nprefer_soonest_reset = true\n").unwrap();
+        assert!(load_from(&explicit).unwrap().auto_swap.prefer_soonest_reset);
+    }
+
+    /// issue #108：键缺失或 Default 均为 0，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn candidate_margin_defaults_zero() {
+        assert_eq!(AutoSwap::default().candidate_margin, 0.0);
+        assert_eq!(Settings::default().auto_swap.candidate_margin, 0.0);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert_eq!(s.auto_swap.candidate_margin, 0.0);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert_eq!(stock.auto_swap.candidate_margin, 0.0);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[auto_swap]\ncandidate_margin = 0.05\n").unwrap();
+        assert_eq!(
+            load_from(&explicit).unwrap().auto_swap.candidate_margin,
+            0.05
+        );
+    }
+
+    /// issue #111：键缺失或 Default 均为 2，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn resident_confirm_n_defaults_two() {
+        assert_eq!(AutoSwap::default().resident_confirm_n, 2);
+        assert_eq!(Settings::default().auto_swap.resident_confirm_n, 2);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert_eq!(s.auto_swap.resident_confirm_n, 2);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert_eq!(stock.auto_swap.resident_confirm_n, 2);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[auto_swap]\nresident_confirm_n = 4\n").unwrap();
+        assert_eq!(
+            load_from(&explicit).unwrap().auto_swap.resident_confirm_n,
+            4
+        );
+    }
+
+    /// issue #114：键缺失或 Default 均为 false，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn pace_pre_swap_defaults_off() {
+        assert!(!AutoSwap::default().pace_pre_swap);
+        assert!(!Settings::default().auto_swap.pace_pre_swap);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert!(!s.auto_swap.pace_pre_swap);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert!(!stock.auto_swap.pace_pre_swap);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[auto_swap]\npace_pre_swap = true\n").unwrap();
+        assert!(load_from(&explicit).unwrap().auto_swap.pace_pre_swap);
+    }
+
+    /// issue #114：键缺失或 Default 均为 0.8，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn pace_warn_threshold_defaults_point_eight() {
+        assert_eq!(AutoSwap::default().pace_warn_threshold, 0.8);
+        assert_eq!(Settings::default().auto_swap.pace_warn_threshold, 0.8);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert_eq!(s.auto_swap.pace_warn_threshold, 0.8);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert_eq!(stock.auto_swap.pace_warn_threshold, 0.8);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[auto_swap]\npace_warn_threshold = 0.7\n").unwrap();
+        assert_eq!(
+            load_from(&explicit).unwrap().auto_swap.pace_warn_threshold,
+            0.7
+        );
     }
 
     #[test]
@@ -709,6 +856,8 @@ usage_cache_max_age_ms = 4000
     fn out_of_range_numbers_are_clamped_or_rejected() {
         enum Expect {
             Threshold(f64),
+            Margin(f64),
+            PaceWarn(f64),
             ErrContains(&'static str),
         }
         let cases: &[(&str, &str, Expect)] = &[
@@ -731,6 +880,46 @@ usage_cache_max_age_ms = 4000
                 "threshold_one",
                 "[auto_swap]\nthreshold = 1.0\n",
                 Expect::Threshold(1.0),
+            ),
+            (
+                "candidate_margin_above_one",
+                "[auto_swap]\ncandidate_margin = 1.5\n",
+                Expect::Margin(1.0),
+            ),
+            (
+                "candidate_margin_below_zero",
+                "[auto_swap]\ncandidate_margin = -0.2\n",
+                Expect::Margin(0.0),
+            ),
+            (
+                "candidate_margin_zero",
+                "[auto_swap]\ncandidate_margin = 0.0\n",
+                Expect::Margin(0.0),
+            ),
+            (
+                "candidate_margin_one",
+                "[auto_swap]\ncandidate_margin = 1.0\n",
+                Expect::Margin(1.0),
+            ),
+            (
+                "pace_warn_above_one",
+                "[auto_swap]\npace_warn_threshold = 1.5\n",
+                Expect::PaceWarn(1.0),
+            ),
+            (
+                "pace_warn_below_zero",
+                "[auto_swap]\npace_warn_threshold = -0.2\n",
+                Expect::PaceWarn(0.0),
+            ),
+            (
+                "pace_warn_zero",
+                "[auto_swap]\npace_warn_threshold = 0.0\n",
+                Expect::PaceWarn(0.0),
+            ),
+            (
+                "pace_warn_one",
+                "[auto_swap]\npace_warn_threshold = 1.0\n",
+                Expect::PaceWarn(1.0),
             ),
             (
                 "cooldown_negative",
@@ -768,6 +957,14 @@ usage_cache_max_age_ms = 4000
                 Expect::Threshold(want) => {
                     let s = got.unwrap_or_else(|e| panic!("{name}: unexpected error {e}"));
                     assert_eq!(s.auto_swap.threshold, *want, "{name}");
+                }
+                Expect::Margin(want) => {
+                    let s = got.unwrap_or_else(|e| panic!("{name}: unexpected error {e}"));
+                    assert_eq!(s.auto_swap.candidate_margin, *want, "{name}");
+                }
+                Expect::PaceWarn(want) => {
+                    let s = got.unwrap_or_else(|e| panic!("{name}: unexpected error {e}"));
+                    assert_eq!(s.auto_swap.pace_warn_threshold, *want, "{name}");
                 }
                 Expect::ErrContains(needle) => {
                     let err = got.unwrap_err().to_string();

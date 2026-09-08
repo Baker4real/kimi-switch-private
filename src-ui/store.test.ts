@@ -55,6 +55,7 @@ describe("列表保焦", () => {
       true,
     );
     expect(parts.some((part) => part === "#accounts-list [data-swap]")).toBe(true);
+    expect(parts.some((part) => part === "#accounts-list [data-optout]")).toBe(true);
     expect(parts.some((part) => part === "#current-plan [data-bind]")).toBe(true);
   });
 

@@ -75,7 +75,7 @@ pub struct QuotaCollectOutcome {
 /// 内部读缓存、按收集原因做成功节流、失败退避、并发查询（含超时重试）、陈旧回退并写回缓存。
 /// [`QuotaCollectReason::Scheduled`] 用配置里的最小间隔（默认 90s）；
 /// [`QuotaCollectReason::UserInitiated`] 用 5s 连点窗口。
-/// 失败退避：429 与鉴权（401/403/凭证待续期）两种原因都不打网；
+/// 失败退避：429 不打网；鉴权（401/403/凭证待续期）仅计划内跳过（有凭证恢复信号则仍查），用户发起会再查；
 /// 超时/网络等 [`Error::is_retryable`] 失败仅计划内跳过，用户发起会再查。
 pub async fn collect<P>(
     provider: Arc<P>,
@@ -148,25 +148,29 @@ where
             cache.in_failure_backoff(provider_id, &id.0, min_refresh, backoff_cap)
         {
             let error = failure.as_error();
-            // 用户点「刷新」时，可重试失败（超时/网络等）忽略退避再打一次；
-            // 429 与鉴权失败两种原因都继续跳过。
+            // 用户点「刷新」时，可重试失败（超时/网络等）与鉴权失败/凭证待续期
+            // 忽略退避再打一次；429 限流继续跳过。
             let retry_now = reason == QuotaCollectReason::UserInitiated
-                && error.is_retryable()
-                && !error.is_authentication_failure();
+                && (error.is_retryable() || error.is_authentication_failure());
             if !retry_now {
-                if error.http_status() == Some(429) {
-                    stats.skipped_rate_limit += 1;
-                } else if error.is_authentication_failure() {
-                    stats.skipped_auth += 1;
-                }
-                let failed_at = failure.failed_at;
-                out[idx] = Some(match cache.get(provider_id, &id.0) {
-                    Some(entry) if !error.is_authentication_failure() => {
-                        from_cache(id, entry, true)
+                // 将要因鉴权退避跳过时，凭证恢复信号放行真实查询；429 / 超时仍跳过。
+                let recovered = error.is_authentication_failure()
+                    && provider.credential_changed_since(id, failure.failed_at);
+                if !recovered {
+                    if error.http_status() == Some(429) {
+                        stats.skipped_rate_limit += 1;
+                    } else if error.is_authentication_failure() {
+                        stats.skipped_auth += 1;
                     }
-                    _ => failed(id, error, failed_at),
-                });
-                continue;
+                    let failed_at = failure.failed_at;
+                    out[idx] = Some(match cache.get(provider_id, &id.0) {
+                        Some(entry) if !error.is_authentication_failure() => {
+                            from_cache(id, entry, true)
+                        }
+                        _ => failed(id, error, failed_at),
+                    });
+                    continue;
+                }
             }
         }
         stats.queried += 1;
@@ -263,6 +267,28 @@ fn membership_of(quotas: &[Quota]) -> Option<String> {
     })
 }
 
+/// 可用快照窗口里最早的 `reset_at`。
+///
+/// Ready 一律计入；Cached 仅非 stale 计入；Failed 与 stale Cached 不算可用。
+/// 窗口缺 `reset_at` 则跳过；全部缺或没有可用窗口时返回 `None`。
+pub fn earliest_reset_at(snapshots: &[QuotaSnapshot]) -> Option<DateTime<Utc>> {
+    snapshots
+        .iter()
+        .filter_map(usable_quota_windows)
+        .flatten()
+        .filter_map(|quota| quota.reset_at)
+        .min()
+}
+
+/// Ready 一律可用；Cached 仅在非 stale 回落时可用；Failed（含凭证待续期）不可用。
+fn usable_quota_windows(snapshot: &QuotaSnapshot) -> Option<&[Quota]> {
+    match &snapshot.state {
+        QuotaState::Failed(_) => None,
+        QuotaState::Cached(_) if snapshot.stale => None,
+        QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => Some(quotas.as_slice()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,7 +299,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
 
-    use crate::error::{Error, QuotaFailureKind, Result};
+    use crate::error::{Error, QuotaFailure, QuotaFailureKind, Result};
     use crate::model::{QuotaStatus, QuotaWindow};
 
     struct ScriptedProvider {
@@ -282,6 +308,8 @@ mod tests {
         max_inflight: AtomicUsize,
         delay: Duration,
         responses: Mutex<HashMap<String, std::result::Result<Vec<Quota>, Error>>>,
+        /// 脚本化当前登录文件 mtime；缺省视为无凭证恢复信号。
+        credential_mtime: Mutex<HashMap<String, DateTime<Utc>>>,
     }
 
     impl ScriptedProvider {
@@ -308,7 +336,20 @@ mod tests {
                         })
                         .collect(),
                 ),
+                credential_mtime: Mutex::new(HashMap::new()),
             })
+        }
+
+        fn mark_credential_changed(&self, id: &str) {
+            // 晚于刚写入的失败时间，模拟官方刚重写当前登录文件。
+            self.mark_credential_changed_at(id, Utc::now() + ChronoDuration::hours(1));
+        }
+
+        fn mark_credential_changed_at(&self, id: &str, mtime: DateTime<Utc>) {
+            self.credential_mtime
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), mtime);
         }
     }
 
@@ -348,6 +389,18 @@ mod tests {
                 Some(Err(err)) => Err(err),
                 None => Err(Error::quota_other(format!("no fixture for {}", id.0))),
             }
+        }
+
+        fn credential_changed_since(
+            &self,
+            account_id: &AccountId,
+            failed_at: DateTime<Utc>,
+        ) -> bool {
+            self.credential_mtime
+                .lock()
+                .unwrap()
+                .get(&account_id.0)
+                .is_some_and(|mtime| *mtime > failed_at)
         }
     }
 
@@ -889,7 +942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_initiated_skips_query_during_credential_expired_backoff() {
+    async fn user_initiated_queries_during_credential_expired_backoff() {
         let dir = tempfile::tempdir().unwrap();
         let path = cache_path(&dir);
         let mut cache = QuotaCache::default();
@@ -902,7 +955,13 @@ mod tests {
         );
         cache.save(&path);
 
-        let provider = ScriptedProvider::new(Duration::ZERO, &[("alice", Ok(vec![]))]);
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+            )],
+        );
         let snaps = collect(
             provider.clone(),
             "kimi",
@@ -912,13 +971,152 @@ mod tests {
         )
         .await;
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        match &snaps[0].state {
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(!snaps[0].stale);
+        assert!(matches!(snaps[0].state, QuotaState::Ready(_)));
+        assert_eq!(snaps[0].membership.as_deref(), Some("LEVEL_ADVANCED"));
+    }
+
+    #[tokio::test]
+    async fn user_initiated_requery_keeps_credential_expired_on_still_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.record_failure(
+            "kimi",
+            "alice",
+            &Error::quota_credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            ),
+        );
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Err(Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                )),
+            )],
+        );
+        let outcome = collect_detailed(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::UserInitiated,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.stats.queried, 1);
+        assert_eq!(outcome.stats.skipped_auth, 0);
+        match &outcome.snapshots[0].state {
             QuotaState::Failed(failure) => {
                 assert_eq!(failure.kind, QuotaFailureKind::CredentialExpired);
                 assert_eq!(failure.status, Some(401));
+                assert!(failure.message.contains("凭证已过期"), "{failure}");
             }
-            other => panic!("expected failed, got {other:?}"),
+            other => panic!("expected credential expired, got {other:?}"),
+        }
+        assert!(outcome.snapshots[0].membership.is_none());
+
+        let written = QuotaCache::load(&path);
+        let recorded = written
+            .in_failure_backoff(
+                "kimi",
+                "alice",
+                Duration::from_secs(90),
+                Duration::from_secs(900),
+            )
+            .expect("failure record kept");
+        assert_eq!(recorded.kind, QuotaFailureKind::CredentialExpired);
+        assert_eq!(recorded.status, Some(401));
+        assert_eq!(recorded.consecutive, 2);
+        assert!(written.get("kimi", "alice").is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_retry_now_bypasses_auth_backoff_not_429() {
+        struct Case {
+            name: &'static str,
+            reason: QuotaCollectReason,
+            error: Error,
+            expect_query: bool,
+        }
+        let cases = [
+            Case {
+                name: "凭证待续期 + UserInitiated",
+                reason: QuotaCollectReason::UserInitiated,
+                error: Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                ),
+                expect_query: true,
+            },
+            Case {
+                name: "401 + UserInitiated",
+                reason: QuotaCollectReason::UserInitiated,
+                error: Error::quota_http(401, "unauthorized"),
+                expect_query: true,
+            },
+            Case {
+                name: "403 + UserInitiated",
+                reason: QuotaCollectReason::UserInitiated,
+                error: Error::quota_http(403, "forbidden"),
+                expect_query: true,
+            },
+            Case {
+                name: "429 + UserInitiated",
+                reason: QuotaCollectReason::UserInitiated,
+                error: Error::quota_http(429, "429 rate limited"),
+                expect_query: false,
+            },
+            Case {
+                name: "凭证待续期 + Scheduled",
+                reason: QuotaCollectReason::Scheduled,
+                error: Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                ),
+                expect_query: false,
+            },
+            Case {
+                name: "401 + Scheduled",
+                reason: QuotaCollectReason::Scheduled,
+                error: Error::quota_http(401, "unauthorized"),
+                expect_query: false,
+            },
+        ];
+
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = cache_path(&dir);
+            let mut cache = QuotaCache::default();
+            cache.record_failure("kimi", "alice", &case.error);
+            cache.save(&path);
+
+            let provider = ScriptedProvider::new(
+                Duration::ZERO,
+                &[(
+                    "alice",
+                    Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+                )],
+            );
+            let _ = collect(
+                provider.clone(),
+                "kimi",
+                &ids(&["alice"]),
+                &path,
+                case.reason,
+            )
+            .await;
+            let expected_calls = usize::from(case.expect_query);
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                expected_calls,
+                "{}",
+                case.name
+            );
         }
     }
 
@@ -1020,10 +1218,402 @@ mod tests {
         )
         .await;
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(outcome.stats.queried, 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.stats.queried, 1);
         assert_eq!(outcome.stats.skipped_success_throttle, 1);
         assert_eq!(outcome.stats.skipped_rate_limit, 1);
+        assert_eq!(outcome.stats.skipped_auth, 0);
+        match &outcome.snapshots[2].state {
+            QuotaState::Ready(quotas) => assert!(quotas.is_empty()),
+            other => panic!("expected queried ready, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_recovery_signal_bypasses_auth_backoff_not_429() {
+        struct Case {
+            name: &'static str,
+            reason: QuotaCollectReason,
+            error: Error,
+            signal: bool,
+            expect_query: bool,
+        }
+        let cases = [
+            Case {
+                name: "凭证待续期 + Scheduled + 恢复信号",
+                reason: QuotaCollectReason::Scheduled,
+                error: Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                ),
+                signal: true,
+                expect_query: true,
+            },
+            Case {
+                name: "401 + Scheduled + 恢复信号",
+                reason: QuotaCollectReason::Scheduled,
+                error: Error::quota_http(401, "unauthorized"),
+                signal: true,
+                expect_query: true,
+            },
+            Case {
+                name: "凭证待续期 + Scheduled + 无信号",
+                reason: QuotaCollectReason::Scheduled,
+                error: Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                ),
+                signal: false,
+                expect_query: false,
+            },
+            Case {
+                name: "429 + Scheduled + 恢复信号",
+                reason: QuotaCollectReason::Scheduled,
+                error: Error::quota_http(429, "429 rate limited"),
+                signal: true,
+                expect_query: false,
+            },
+            Case {
+                name: "超时 + Scheduled + 恢复信号",
+                reason: QuotaCollectReason::Scheduled,
+                error: Error::quota_timeout(),
+                signal: true,
+                expect_query: false,
+            },
+            Case {
+                name: "凭证待续期 + UserInitiated + 恢复信号",
+                reason: QuotaCollectReason::UserInitiated,
+                error: Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                ),
+                signal: true,
+                expect_query: true,
+            },
+            Case {
+                name: "429 + UserInitiated + 恢复信号",
+                reason: QuotaCollectReason::UserInitiated,
+                error: Error::quota_http(429, "429 rate limited"),
+                signal: true,
+                expect_query: false,
+            },
+        ];
+
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = cache_path(&dir);
+            let mut cache = QuotaCache::default();
+            cache.record_failure("kimi", "alice", &case.error);
+            cache.save(&path);
+
+            let provider = ScriptedProvider::new(
+                Duration::ZERO,
+                &[(
+                    "alice",
+                    Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+                )],
+            );
+            if case.signal {
+                provider.mark_credential_changed("alice");
+            }
+            let outcome = collect_detailed(
+                provider.clone(),
+                "kimi",
+                &ids(&["alice"]),
+                &path,
+                case.reason,
+            )
+            .await;
+            let expected_calls = usize::from(case.expect_query);
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                expected_calls,
+                "{}",
+                case.name
+            );
+            assert_eq!(outcome.stats.queried, expected_calls, "{}", case.name);
+            if case.expect_query {
+                assert_eq!(outcome.stats.skipped_auth, 0, "{}", case.name);
+                assert_eq!(outcome.stats.skipped_rate_limit, 0, "{}", case.name);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_recovery_signal_queries_only_signaled_auth_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.record_failure(
+            "kimi",
+            "alice",
+            &Error::quota_credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            ),
+        );
+        cache.record_failure(
+            "kimi",
+            "bob",
+            &Error::quota_credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            ),
+        );
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[
+                (
+                    "alice",
+                    Ok(vec![sample("alice", Some("LEVEL_ADVANCED"), None)]),
+                ),
+                ("bob", Ok(vec![sample("bob", Some("LEVEL_ADVANCED"), None)])),
+            ],
+        );
+        provider.mark_credential_changed("alice");
+        let outcome = collect_detailed(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice", "bob"]),
+            &path,
+            QuotaCollectReason::Scheduled,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.stats.queried, 1);
         assert_eq!(outcome.stats.skipped_auth, 1);
+        assert!(matches!(outcome.snapshots[0].state, QuotaState::Ready(_)));
+        match &outcome.snapshots[1].state {
+            QuotaState::Failed(failure) => {
+                assert_eq!(failure.kind, QuotaFailureKind::CredentialExpired);
+            }
+            other => panic!("expected bob still 凭证待续期, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_recovery_signal_requery_keeps_credential_expired_on_still_401() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let mut cache = QuotaCache::default();
+        cache.record_failure(
+            "kimi",
+            "alice",
+            &Error::quota_credential_expired(
+                "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+            ),
+        );
+        cache.save(&path);
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Err(Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                )),
+            )],
+        );
+        provider.mark_credential_changed("alice");
+        let outcome = collect_detailed(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::Scheduled,
+        )
+        .await;
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.stats.queried, 1);
+        assert_eq!(outcome.stats.skipped_auth, 0);
+        match &outcome.snapshots[0].state {
+            QuotaState::Failed(failure) => {
+                assert_eq!(failure.kind, QuotaFailureKind::CredentialExpired);
+                assert_eq!(failure.status, Some(401));
+            }
+            other => panic!("expected credential expired, got {other:?}"),
+        }
+
+        let written = QuotaCache::load(&path);
+        let recorded = written
+            .in_failure_backoff(
+                "kimi",
+                "alice",
+                Duration::from_secs(90),
+                Duration::from_secs(900),
+            )
+            .expect("failure record kept");
+        assert_eq!(recorded.kind, QuotaFailureKind::CredentialExpired);
+        assert_eq!(recorded.consecutive, 2);
+    }
+
+    #[tokio::test]
+    async fn scheduled_recovery_signal_is_one_shot_after_requery_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = cache_path(&dir);
+        let failed_at = Utc::now() - ChronoDuration::seconds(60);
+        let mtime = Utc::now() - ChronoDuration::seconds(30);
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "entries": {},
+                "failures": {
+                    "kimi::alice": {
+                        "failed_at": failed_at,
+                        "consecutive": 1,
+                        "error": "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                        "kind": "credential_expired",
+                        "status": 401
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let provider = ScriptedProvider::new(
+            Duration::ZERO,
+            &[(
+                "alice",
+                Err(Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                )),
+            )],
+        );
+        provider.mark_credential_changed_at("alice", mtime);
+
+        let first = collect_detailed(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::Scheduled,
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.stats.queried, 1);
+        assert_eq!(first.stats.skipped_auth, 0);
+
+        let second = collect_detailed(
+            provider.clone(),
+            "kimi",
+            &ids(&["alice"]),
+            &path,
+            QuotaCollectReason::Scheduled,
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.stats.queried, 0);
+        assert_eq!(second.stats.skipped_auth, 1);
+        match &second.snapshots[0].state {
+            QuotaState::Failed(failure) => {
+                assert_eq!(failure.kind, QuotaFailureKind::CredentialExpired);
+            }
+            other => panic!("expected still 凭证待续期, got {other:?}"),
+        }
+    }
+
+    fn utc(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn quota_at(id: &str, reset_at: Option<DateTime<Utc>>) -> Quota {
+        Quota {
+            provider: "kimi".into(),
+            account_id: AccountId(id.into()),
+            window: QuotaWindow::FiveHour,
+            used: 99,
+            limit: 100,
+            reset_at,
+            status: QuotaStatus::Ok,
+            note: None,
+            membership: None,
+        }
+    }
+
+    fn snap(id: &str, stale: bool, state: QuotaState) -> QuotaSnapshot {
+        QuotaSnapshot {
+            account_id: AccountId(id.into()),
+            fetched_at: utc("2026-09-03T12:00:00Z"),
+            stale,
+            membership: None,
+            state,
+        }
+    }
+
+    fn ready_at(id: &str, reset_at: Option<DateTime<Utc>>) -> QuotaSnapshot {
+        snap(id, false, QuotaState::Ready(vec![quota_at(id, reset_at)]))
+    }
+
+    /// 可用窗口取 `reset_at` 最小值；Failed / stale Cached 不计入。
+    #[test]
+    fn earliest_reset_at_min_of_usable_windows() {
+        let early = utc("2026-09-03T16:00:00Z");
+        let late = utc("2026-09-03T20:00:00Z");
+        let later = utc("2026-09-04T08:00:00Z");
+        let mut two_windows = quota_at("carol", Some(later));
+        two_windows.window = QuotaWindow::SevenDay;
+        assert_eq!(
+            earliest_reset_at(&[
+                ready_at("alice", Some(late)),
+                ready_at("bob", Some(early)),
+                snap(
+                    "carol",
+                    false,
+                    QuotaState::Ready(vec![quota_at("carol", Some(later)), two_windows]),
+                ),
+            ]),
+            Some(early)
+        );
+    }
+
+    #[test]
+    fn earliest_reset_at_includes_fresh_cached_not_failed_or_stale() {
+        let cached_early = utc("2026-09-03T15:00:00Z");
+        let stale_earlier = utc("2026-09-03T10:00:00Z");
+        let ready_late = utc("2026-09-03T18:00:00Z");
+        assert_eq!(
+            earliest_reset_at(&[
+                snap(
+                    "cached",
+                    false,
+                    QuotaState::Cached(vec![quota_at("cached", Some(cached_early))]),
+                ),
+                snap(
+                    "stale",
+                    true,
+                    QuotaState::Cached(vec![quota_at("stale", Some(stale_earlier))]),
+                ),
+                snap(
+                    "failed",
+                    false,
+                    QuotaState::Failed(QuotaFailure::other("quota fetch failed")),
+                ),
+                ready_at("ready", Some(ready_late)),
+            ]),
+            Some(cached_early)
+        );
+    }
+
+    #[test]
+    fn earliest_reset_at_none_when_usable_windows_lack_reset() {
+        assert_eq!(earliest_reset_at(&[]), None);
+        assert_eq!(
+            earliest_reset_at(&[
+                ready_at("alice", None),
+                snap(
+                    "stale",
+                    true,
+                    QuotaState::Cached(vec![quota_at("stale", Some(utc("2026-09-03T10:00:00Z")))]),
+                ),
+                snap(
+                    "failed",
+                    false,
+                    QuotaState::Failed(QuotaFailure::other("quota fetch failed")),
+                ),
+            ]),
+            None
+        );
     }
 }

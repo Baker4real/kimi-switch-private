@@ -3,6 +3,7 @@
 pub mod account_registry;
 pub mod audit;
 pub mod auto_swap;
+pub mod auto_swap_opt_out;
 pub mod defaults;
 pub mod display_name;
 pub mod error;
@@ -25,9 +26,14 @@ pub mod time;
 pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
 pub use auto_swap::{
-    decide_auto_swap, decide_resident_return, read_last_auto_swap_at, read_manual_hold_until,
-    set_manual_hold_until, write_last_auto_swap_at, AutoSwapDecision, AutoSwapReturn,
-    AutoSwapSkipReason, AutoSwapTarget,
+    decide_auto_swap, decide_resident_return, decide_resident_return_from_state,
+    read_last_auto_swap_at, read_manual_hold_until, read_resident_confirm_counts,
+    set_manual_hold_until, write_last_auto_swap_at, write_resident_confirm_counts,
+    AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget,
+};
+pub use auto_swap_opt_out::{
+    account_auto_swap_opt_out, auto_swap_opt_out_from_extra, persist_auto_swap_opt_out,
+    write_auto_swap_opt_out_extra, EXTRA_AUTO_SWAP_OPT_OUT,
 };
 pub use display_name::{
     display_name, official_nickname_from_extra, official_nickname_known, persist_official_nickname,
@@ -48,7 +54,8 @@ pub use provider::Provider;
 pub use quota_cache::{CachedEntry, QuotaCache, ValidEntry};
 pub use quota_query::query_quota_with_retry;
 pub use quota_snapshot::{
-    QuotaCollectOutcome, QuotaCollectReason, QuotaCollectStats, QuotaSnapshot, QuotaState,
+    earliest_reset_at, QuotaCollectOutcome, QuotaCollectReason, QuotaCollectStats, QuotaSnapshot,
+    QuotaState,
 };
 pub use remove_account::remove_account;
 pub use removed::RemovedAccounts;

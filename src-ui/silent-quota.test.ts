@@ -3,8 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { Snapshot, UiMessage } from "./api";
 import {
   SILENT_QUOTA_INTERVAL_MS,
+  SILENT_QUOTA_PENDING_RENEWAL_INTERVAL_MS,
   createSilentQuotaScheduler,
   createSnapshotGenerationGuard,
+  silentQuotaIntervalMs,
   type SilentQuotaClock,
   type SilentQuotaHost,
 } from "./silent-quota";
@@ -25,6 +27,7 @@ function sampleAccount(): Snapshot["accounts"][number] {
     cached_at: null,
     display_name: "工作机",
     official_nickname_known: false,
+    auto_swap_opt_out: false,
   };
 }
 
@@ -105,15 +108,28 @@ function createFakeClock(start = 1_000_000): FakeClock {
   return clock;
 }
 
-function createHarness(overrides: Partial<{ accountCount: number | null }> = {}) {
+function createHarness(
+  overrides: Partial<{
+    accountCount: number | null;
+    accounts: Snapshot["accounts"] | null;
+  }> = {},
+) {
   const clock = createFakeClock();
   const generation = createSnapshotGenerationGuard();
   const applied: Array<{ snapshot: Snapshot; generation: number }> = [];
   const toasts: Array<{ text: string; isError: boolean }> = [];
+  const accountCount =
+    overrides.accountCount === undefined ? 1 : overrides.accountCount;
   const flags = {
     hidden: false,
     busy: false,
-    accountCount: overrides.accountCount === undefined ? 1 : overrides.accountCount,
+    accountCount,
+    accounts:
+      overrides.accounts !== undefined
+        ? overrides.accounts
+        : accountCount === null
+          ? null
+          : [sampleAccount()],
   };
   let listImpl: () => Promise<Snapshot> = () => Promise.resolve(sampleSnapshot());
   const listAccounts = vi.fn(() => listImpl());
@@ -121,9 +137,12 @@ function createHarness(overrides: Partial<{ accountCount: number | null }> = {})
     isHidden: () => flags.hidden,
     isBusy: () => flags.busy,
     accountCount: () => flags.accountCount,
+    accounts: () => flags.accounts,
     listAccounts,
     applySnapshot(snapshot, generation) {
       applied.push({ snapshot, generation });
+      flags.accounts = snapshot.accounts;
+      flags.accountCount = snapshot.accounts.length;
     },
     toast(text, isError) {
       toasts.push({ text, isError });
@@ -143,6 +162,21 @@ function createHarness(overrides: Partial<{ accountCount: number | null }> = {})
     },
   };
 }
+
+describe("silentQuotaIntervalMs", () => {
+  it("有待续期行返回 5s，否则 90s", () => {
+    expect(silentQuotaIntervalMs(null)).toBe(90_000);
+    expect(silentQuotaIntervalMs([])).toBe(90_000);
+    expect(silentQuotaIntervalMs([{ credential_expired: false }])).toBe(90_000);
+    expect(silentQuotaIntervalMs([{ credential_expired: true }])).toBe(5_000);
+    expect(
+      silentQuotaIntervalMs([
+        { credential_expired: false },
+        { credential_expired: true },
+      ]),
+    ).toBe(5_000);
+  });
+});
 
 describe("createSnapshotGenerationGuard 世代比较方向", () => {
   it("用户世代已占用则更早静默结果丢弃", () => {
@@ -166,6 +200,10 @@ describe("createSnapshotGenerationGuard 世代比较方向", () => {
 describe("静默额度调度器", () => {
   it("钉住 90 秒间隔常量", () => {
     expect(SILENT_QUOTA_INTERVAL_MS).toBe(90_000);
+  });
+
+  it("钉住待续期加密间隔常量", () => {
+    expect(SILENT_QUOTA_PENDING_RENEWAL_INTERVAL_MS).toBe(5_000);
   });
 
   it("迟到快照丢弃：用户世代已占用后不应用更早的静默结果", async () => {
@@ -323,5 +361,99 @@ describe("静默额度调度器", () => {
     await flushMicrotasks();
     expect(h2.applied[0]?.snapshot.message).toEqual(message);
     expect(h2.toasts).toEqual([]);
+  });
+
+  it("快照含凭证待续期行时 5s 后静默列出", async () => {
+    const h = createHarness({
+      accounts: [{ ...sampleAccount(), credential_expired: true }],
+    });
+    h.scheduler.noteApplied();
+    h.scheduler.arm();
+    h.clock.advance(4_999);
+    expect(h.listAccounts).not.toHaveBeenCalled();
+    h.clock.advance(1);
+    await flushMicrotasks();
+    expect(h.listAccounts).toHaveBeenCalledTimes(1);
+  });
+
+  it("快照不含凭证待续期行时仍 90s", async () => {
+    const h = createHarness();
+    h.scheduler.noteApplied();
+    h.scheduler.arm();
+    h.clock.advance(89_999);
+    expect(h.listAccounts).not.toHaveBeenCalled();
+    h.clock.advance(1);
+    await flushMicrotasks();
+    expect(h.listAccounts).toHaveBeenCalledTimes(1);
+  });
+
+  it("任一账号待续期即加密；待续期消失后回到 90s", async () => {
+    const parked = { ...sampleAccount(), id: "a2", label: "停泊", display_name: "停泊" };
+    const h = createHarness({
+      accountCount: 2,
+      accounts: [sampleAccount(), { ...parked, credential_expired: true }],
+    });
+    h.setList(() =>
+      Promise.resolve({
+        ...sampleSnapshot(),
+        accounts: [sampleAccount(), { ...parked, credential_expired: false }],
+        account_count: 2,
+      }),
+    );
+    h.scheduler.noteApplied();
+    h.scheduler.arm();
+    h.clock.advance(5_000);
+    await flushMicrotasks();
+    expect(h.listAccounts).toHaveBeenCalledTimes(1);
+
+    h.clock.advance(5_000);
+    await flushMicrotasks();
+    expect(h.listAccounts).toHaveBeenCalledTimes(1);
+
+    h.clock.advance(85_000);
+    await flushMicrotasks();
+    expect(h.listAccounts).toHaveBeenCalledTimes(2);
+  });
+
+  it("窗口隐藏暂停，到期也不列出", () => {
+    const h = createHarness();
+    h.scheduler.noteApplied();
+    h.scheduler.arm();
+    h.flags.hidden = true;
+    h.scheduler.pause();
+    h.clock.advance(90_000);
+    expect(h.listAccounts).not.toHaveBeenCalled();
+  });
+
+  it("回到可见且间隔已过则立即补一跳", async () => {
+    const h = createHarness();
+    h.scheduler.noteApplied();
+    h.scheduler.arm();
+    h.flags.hidden = true;
+    h.scheduler.pause();
+    h.clock.advance(90_000);
+    expect(h.listAccounts).not.toHaveBeenCalled();
+    h.flags.hidden = false;
+    h.scheduler.arm();
+    h.clock.advance(0);
+    await flushMicrotasks();
+    expect(h.listAccounts).toHaveBeenCalledTimes(1);
+  });
+
+  it("待续期加密期间隐藏暂停，回可见立即补一跳", async () => {
+    const h = createHarness({
+      accounts: [{ ...sampleAccount(), credential_expired: true }],
+    });
+    h.scheduler.noteApplied();
+    h.scheduler.arm();
+    h.flags.hidden = true;
+    h.scheduler.pause();
+    h.clock.advance(5_000);
+    expect(h.listAccounts).not.toHaveBeenCalled();
+    h.flags.hidden = false;
+    h.scheduler.arm();
+    h.clock.advance(0);
+    await flushMicrotasks();
+    expect(h.listAccounts).toHaveBeenCalledTimes(1);
   });
 });

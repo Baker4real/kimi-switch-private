@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::swap::{swap_with_snapshot, SwapTarget};
@@ -429,7 +429,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 }
 
 // ---------------------------------------------------------------------------
-// Provider 实现：activate + query_quota
+// Provider 实现：activate + query_quota + 凭证恢复信号
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -502,6 +502,20 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
             )
         })?;
         self.runtime.fetch_quota(&access, &account).await
+    }
+
+    /// 当前账号：当前登录文件 mtime 晚于 `failed_at` 即凭证恢复信号；停泊账号恒无信号。
+    fn credential_changed_since(&self, account_id: &AccountId, failed_at: DateTime<Utc>) -> bool {
+        let Ok(Some(account)) = self.registry.find(self.runtime.id(), account_id) else {
+            return false;
+        };
+        if !account.active {
+            return false;
+        }
+        let Ok(modified) = fs::metadata(self.live_path()).and_then(|meta| meta.modified()) else {
+            return false;
+        };
+        DateTime::<Utc>::from(modified) > failed_at
     }
 }
 
@@ -1993,5 +2007,88 @@ mod tests {
                 "swap 不得改动网页凭证 field"
             );
         }
+    }
+
+    fn live_mtime(p: &FileBlobProvider<FakeRuntime>) -> DateTime<Utc> {
+        DateTime::<Utc>::from(
+            fs::metadata(p.test_live_path())
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+    }
+
+    fn seed_active_and_parked(p: &FileBlobProvider<FakeRuntime>) -> (Account, Account) {
+        let active = p
+            .import_raw(
+                r#"{"uid":"u1","access_token":"A1"}"#.into(),
+                None,
+                Some(true),
+            )
+            .unwrap();
+        let parked = p
+            .import_raw(
+                r#"{"uid":"u2","access_token":"A2"}"#.into(),
+                None,
+                Some(false),
+            )
+            .unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), r#"{"uid":"u1","access_token":"A1"}"#).unwrap();
+        (active, parked)
+    }
+
+    /// issue #103：当前账号当前登录文件 mtime 晚于失败时间 → 凭证恢复信号。
+    #[test]
+    fn credential_changed_since_active_when_live_mtime_after_failed_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        let (active, parked) = seed_active_and_parked(&p);
+        let mtime = live_mtime(&p);
+        let failed_at = mtime - chrono::Duration::seconds(90);
+
+        assert!(
+            p.credential_changed_since(&active.id, failed_at),
+            "当前账号 live mtime 晚于失败时间应有凭证恢复信号"
+        );
+        assert!(
+            !p.credential_changed_since(&parked.id, failed_at),
+            "停泊账号恒无恢复信号"
+        );
+        assert!(
+            !p.credential_changed_since(&AccountId("missing".into()), failed_at),
+            "未知账号无恢复信号"
+        );
+    }
+
+    /// issue #103：信号一次性——失败时间刷新到不早于同一 mtime 后不再放行。
+    #[test]
+    fn credential_changed_since_same_mtime_is_one_shot_after_failed_at_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        let (active, _) = seed_active_and_parked(&p);
+        let mtime = live_mtime(&p);
+
+        assert!(p.credential_changed_since(&active.id, mtime - chrono::Duration::seconds(1)));
+        assert!(
+            !p.credential_changed_since(&active.id, mtime),
+            "同一 mtime 不得晚于刷新后的失败时间"
+        );
+        assert!(!p.credential_changed_since(&active.id, mtime + chrono::Duration::seconds(1)));
+    }
+
+    #[test]
+    fn credential_changed_since_missing_live_is_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        let active = p
+            .import_raw(
+                r#"{"uid":"u1","access_token":"A1"}"#.into(),
+                None,
+                Some(true),
+            )
+            .unwrap();
+        let failed_at = Utc::now() - chrono::Duration::seconds(90);
+        assert!(!p.credential_changed_since(&active.id, failed_at));
     }
 }

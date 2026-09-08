@@ -57,6 +57,20 @@ async fn rename_account(
     state.backend.rename(&id, &label).await.map_err(map_err)
 }
 
+/// 账号卡「摘出自动切换」开关（issue #112）：写 extra，返回含 toast 的快照。
+#[tauri::command]
+async fn set_auto_swap_opt_out(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<Snapshot, CommandError> {
+    state
+        .backend
+        .set_auto_swap_opt_out(&id, enabled)
+        .await
+        .map_err(map_err)
+}
+
 // 按卡授权：`target` 传目标账号 id 即为该卡重新授权；缺省（null/不传）= 添加新账号。
 #[tauri::command]
 async fn start_device_auth(
@@ -274,6 +288,7 @@ pub fn run() {
             set_auto_swap,
             set_auto_swap_prefer_lower_tier,
             set_auto_swap_resident_lower_tier,
+            set_auto_swap_opt_out,
         ])
         .run(tauri::generate_context!())
         .expect("error while running kimi-switch");

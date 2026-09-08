@@ -1,5 +1,7 @@
 //! Provider 抽象。生产实现是 Kimi 的文件型引擎。
 
+use chrono::{DateTime, Utc};
+
 use crate::error::Result;
 use crate::model::{AccountId, Quota};
 use async_trait::async_trait;
@@ -19,4 +21,11 @@ pub trait Provider: Send + Sync {
     /// 查询某账号的额度。可能返回多窗口（例如 5h + 7d）。
     /// 实现允许返回 `Vec` 为空表示"暂无可查"，但应优先返回 status=Unknown 的占位。
     async fn query_quota(&self, id: &AccountId) -> Result<Vec<Quota>>;
+
+    /// 该账号是否出现凭证恢复信号：当前登录文件在 `failed_at` 之后被重写。
+    ///
+    /// 默认不放行。共享引擎只对当前账号比较 live 文件 mtime；停泊账号恒为 false。
+    fn credential_changed_since(&self, _account_id: &AccountId, _failed_at: DateTime<Utc>) -> bool {
+        false
+    }
 }

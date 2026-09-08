@@ -29,10 +29,11 @@ mod tests {
     use crate::backend::{
         account_for_notice, account_row, account_row_at, apply_snapshot_auto_swap,
         attach_auto_swap_message, attach_skip_message, auth_success_message,
-        auto_swap_success_message, bind_web_success_message, bind_web_user_message,
-        cached_membership_plan, collect_account_rows, delete_success_message,
-        import_success_message, reauth_success_message, rename_success_message,
-        swap_failure_message, swap_success_message, AutoSwapSnapshotEffect, WebMembershipRefresh,
+        auto_swap_opt_out_message, auto_swap_success_message, bind_web_success_message,
+        bind_web_user_message, cached_membership_plan, collect_account_rows,
+        delete_success_message, import_success_message, reauth_success_message,
+        rename_success_message, swap_failure_message, swap_success_message, AutoSwapSnapshotEffect,
+        WebMembershipRefresh,
     };
     use kimi_switch_core::{AuditEvent, AuditLog};
 
@@ -126,6 +127,7 @@ mod tests {
             cached_at: None,
             display_name: "a".into(),
             official_nickname_known: false,
+            auto_swap_opt_out: false,
         };
         assert_eq!(
             json_object_keys(&serde_json::to_value(&row).unwrap()),
@@ -185,6 +187,7 @@ mod tests {
             cached_at: None,
             display_name: "a".into(),
             official_nickname_known: false,
+            auto_swap_opt_out: false,
         };
         assert!(!quiet.is_urgent());
 
@@ -934,6 +937,47 @@ mod tests {
         let row = account_row(&sample_account("acc-1"), &snap, None);
         assert_eq!(row.display_name, "acc-1");
         assert!(!row.official_nickname_known);
+        assert!(!row.auto_swap_opt_out);
+    }
+
+    #[test]
+    fn account_row_carries_auto_swap_opt_out() {
+        let snap = QuotaSnapshot {
+            account_id: AccountId("alice".into()),
+            fetched_at: Utc::now(),
+            stale: false,
+            membership: None,
+            state: QuotaState::Failed(kimi_switch_core::QuotaFailure::other("n/a")),
+        };
+        let mut opted = sample_account("alice");
+        kimi_switch_core::write_auto_swap_opt_out_extra(&mut opted.extra, true);
+        let row = account_row(&opted, &snap, None);
+        assert!(row.auto_swap_opt_out);
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["auto_swap_opt_out"],
+            true
+        );
+
+        let row = account_row(&sample_account("alice"), &snap, None);
+        assert!(!row.auto_swap_opt_out);
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["auto_swap_opt_out"],
+            false
+        );
+    }
+
+    #[test]
+    fn auto_swap_opt_out_toast_uses_display_name() {
+        let mut account = sample_account("acc-1");
+        account.label = "工作机".into();
+        assert_eq!(
+            auto_swap_opt_out_message(&account, true),
+            "已将 工作机 摘出自动切换"
+        );
+        assert_eq!(
+            auto_swap_opt_out_message(&account, false),
+            "已恢复 工作机 参与自动切换"
+        );
     }
 
     /// 剩余天数跟展示日走（#61）：有到期日才有值；刷新失败跟着缓存日期；
@@ -1125,8 +1169,25 @@ mod tests {
         assert_eq!(message.kind, UiMessageKind::Generic);
     }
 
+    /// UserInitiated 对凭证待续期直查（#102）：仍 401 则保持待续期，不弹额度查询失败 toast。
     #[tokio::test]
     async fn user_initiated_snapshot_message_none_when_only_auth_skipped() {
+        struct StillExpiredProvider {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for StillExpiredProvider {
+            async fn activate(&self, _id: &AccountId) -> kimi_switch_core::Result<()> {
+                Ok(())
+            }
+            async fn query_quota(&self, _id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(kimi_switch_core::Error::quota_credential_expired(
+                    "凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权",
+                ))
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let cache_path = dir.path().join("quota_cache.json");
         let mut cache = QuotaCache::default();
@@ -1139,7 +1200,7 @@ mod tests {
         );
         cache.save(&cache_path);
 
-        let provider = Arc::new(CountingProvider {
+        let provider = Arc::new(StillExpiredProvider {
             calls: AtomicUsize::new(0),
         });
         let (rows, stats, _) = collect_account_rows(
@@ -1151,8 +1212,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert!(rows[0].credential_expired);
+        assert!(!rows[0].is_urgent());
         let snapshot = snapshot_message_of(rows, QuotaCollectReason::UserInitiated, &stats);
         assert!(snapshot.message.is_none());
     }
@@ -1432,12 +1494,7 @@ mod tests {
     fn auto_swap_on() -> kimi_switch_core::settings::AutoSwap {
         kimi_switch_core::settings::AutoSwap {
             enabled: true,
-            threshold: 0.99,
-            cooldown_ms: 5 * 60 * 1000,
-            settle_grace_ms: 60 * 1000,
-            prefer_lower_tier: false,
-            resident_lower_tier: false,
-            manual_hold_ms: 8 * 60 * 60 * 1000,
+            ..kimi_switch_core::settings::AutoSwap::default()
         }
     }
 
@@ -1453,7 +1510,22 @@ mod tests {
         }
     }
 
+    fn auto_swap_opted_out(id: &str, active: bool) -> Account {
+        let mut account = auto_swap_acc(id, active);
+        kimi_switch_core::write_auto_swap_opt_out_extra(&mut account.extra, true);
+        account
+    }
+
     fn auto_swap_ready(id: &str, used: u64, limit: u64) -> QuotaSnapshot {
+        auto_swap_ready_at(id, used, limit, None)
+    }
+
+    fn auto_swap_ready_at(
+        id: &str,
+        used: u64,
+        limit: u64,
+        reset_at: Option<chrono::DateTime<Utc>>,
+    ) -> QuotaSnapshot {
         QuotaSnapshot {
             account_id: AccountId(id.into()),
             fetched_at: auto_swap_now(),
@@ -1465,7 +1537,7 @@ mod tests {
                 window: QuotaWindow::FiveHour,
                 used,
                 limit,
-                reset_at: None,
+                reset_at,
                 status: QuotaStatus::Ok,
                 note: None,
                 membership: None,
@@ -1592,10 +1664,159 @@ mod tests {
         assert!(detail.contains("from=alice"), "{detail}");
         assert!(detail.contains("window=5h"), "{detail}");
         assert!(detail.contains("used=99%"), "{detail}");
+        assert!(
+            !detail.contains("kind="),
+            "耗尽路径保持无 kind= 的既有 detail: {detail}"
+        );
     }
 
-    /// 回驻成功（issue #95 / ADR-0008）：当前账号未耗尽、停泊账号档位严格更低时
-    /// 经同一条 activate 路径切回；toast / 审计 kind=return 区分非耗尽触发。
+    /// issue #114：pace 预切换成功 → 审计 kind=pace；toast 仍走自动切换成功通道。
+    #[tokio::test]
+    async fn snapshot_auto_swap_pace_activates_and_audits_kind_pace() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.pace_pre_swap = true;
+        let mut bob = auto_swap_acc("bob", false);
+        bob.label = "工作机".into();
+        let half = auto_swap_now() + chrono::Duration::minutes(150);
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &settings,
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), bob],
+            &[
+                auto_swap_ready_at("alice", 85, 100, Some(half)),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("pace toast");
+        assert_eq!(message.text, "已自动切换到 工作机");
+        assert_eq!(message.tone, MessageTone::Ok);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapSuccess);
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob")
+        );
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "ok");
+        let detail = event.detail.expect("pace audit has detail");
+        assert!(detail.contains("kind=pace"), "{detail}");
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("window=5h"), "{detail}");
+        assert!(detail.contains("used=85%"), "{detail}");
+    }
+
+    /// issue #112：摘出停泊账号不是候选；效应层 activate 下一合格账号。
+    #[tokio::test]
+    async fn snapshot_auto_swap_skips_opted_out_candidate() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("alice".into())),
+            &[
+                auto_swap_acc("alice", true),
+                auto_swap_opted_out("bob", false),
+                auto_swap_acc("carol", false),
+            ],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+                auto_swap_ready("carol", 20, 100),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("carol")
+        );
+    }
+
+    /// issue #112：被摘出的当前账号耗尽时仍被自动切走。
+    #[tokio::test]
+    async fn snapshot_auto_swap_still_leaves_opted_out_current() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("alice".into())),
+            &[
+                auto_swap_opted_out("alice", true),
+                auto_swap_acc("bob", false),
+            ],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob")
+        );
+    }
+
+    /// 回驻成功（issue #95 / #111）：默认确认期 N=2，首个合格周期静默；第 2 个周期
+    /// 才经同一条 activate 路径切回；toast / 审计 kind=return 区分非耗尽触发。
     #[tokio::test]
     async fn snapshot_resident_return_activates_audits_and_toasts_display_name() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1609,6 +1830,30 @@ mod tests {
         alice_snap.membership = Some("LEVEL_ADVANCED".into());
         let mut bob_snap = auto_swap_ready("bob", 20, 100);
         bob_snap.membership = Some("LEVEL_INTERMEDIATE".into());
+        let first = apply_snapshot_auto_swap(
+            &settings,
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), bob.clone()],
+            &[alice_snap.clone(), bob_snap.clone()],
+            auto_swap_now(),
+            None,
+            None,
+            |_id| async { panic!("确认期未满不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(!first.swapped);
+        assert!(first.message.is_none());
+        assert!(!audit.path().exists());
+        assert_eq!(
+            kimi_switch_core::read_resident_confirm_counts(&state)
+                .get(&AccountId("bob".into()))
+                .copied(),
+            Some(1)
+        );
+
         let activated = Arc::new(Mutex::new(None));
         let activated_cb = activated.clone();
         let effect = apply_snapshot_auto_swap(
@@ -1757,6 +2002,66 @@ mod tests {
         assert_eq!(event.action, "auto_swap");
         assert_eq!(event.result, "error");
         assert_eq!(event.account.as_deref(), Some("alice"));
+        assert_eq!(event.detail.as_deref(), Some("no eligible candidate"));
+    }
+
+    #[test]
+    fn auto_swap_no_candidate_appends_east8_reset() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let message = UiMessage::auto_swap_no_candidate(Some(at));
+        assert_eq!(
+            message.text,
+            "没有可自动切换的账号，最早恢复 2026-09-03 20:00"
+        );
+        assert_eq!(message.tone, MessageTone::Err);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapNoCandidate);
+    }
+
+    #[test]
+    fn auto_swap_no_candidate_keeps_copy_without_reset() {
+        let message = UiMessage::auto_swap_no_candidate(None);
+        assert_eq!(message.text, "没有可自动切换的账号");
+        assert_eq!(message.tone, MessageTone::Err);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapNoCandidate);
+    }
+
+    /// 无合格候选且有 reset_at：toast 附东八区最早恢复时刻，仍不切换、不写冷却。
+    #[tokio::test]
+    async fn snapshot_auto_swap_no_candidate_appends_earliest_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let early = Utc.with_ymd_and_hms(2026, 9, 3, 16, 0, 0).unwrap();
+        let late = Utc.with_ymd_and_hms(2026, 9, 4, 8, 0, 0).unwrap();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready_at("alice", 99, 100, Some(late)),
+                auto_swap_ready_at("bob", 99, 100, Some(early)),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            |_id| async { panic!("无候选不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("no-candidate toast");
+        assert_eq!(
+            message.text,
+            "没有可自动切换的账号，最早恢复 2026-09-04 00:00"
+        );
+        assert_eq!(message.tone, MessageTone::Err);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapNoCandidate);
+        assert!(!effect.swapped);
+        assert!(!state.exists());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "error");
         assert_eq!(event.detail.as_deref(), Some("no eligible candidate"));
     }
 

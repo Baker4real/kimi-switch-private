@@ -37,14 +37,21 @@ export function createAppStore(initial?: Partial<AppState>) {
 export type AppStore = ReturnType<typeof createAppStore>;
 
 /** 账号库卡片上的操作 data-*，忙碌时只改这些按钮的 disabled。 */
-export type ListActionAttr = "swap" | "reauth" | "rename" | "delete" | "bind";
+export type ListActionAttr = "swap" | "reauth" | "rename" | "delete" | "bind" | "optout";
 
 export interface ListFocusKey {
   action: ListActionAttr | null;
   accountId: string;
 }
 
-const LIST_ACTION_ATTRS: ListActionAttr[] = ["swap", "reauth", "rename", "delete", "bind"];
+const LIST_ACTION_ATTRS: ListActionAttr[] = [
+  "swap",
+  "reauth",
+  "rename",
+  "delete",
+  "bind",
+  "optout",
+];
 
 /** 把 data-* 选择器限定在给定根下，避免逗号选择器漏出作用域。 */
 export function listedActionSelector(roots: readonly string[]): string {
@@ -65,6 +72,7 @@ export function listFocusKey(
     rename?: string;
     delete?: string;
     bind?: string;
+    optout?: string;
   },
   accountId?: string,
 ): ListFocusKey | null {

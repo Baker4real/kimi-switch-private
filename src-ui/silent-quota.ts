@@ -4,6 +4,19 @@ import { silentQuotaMessage } from "./auto-swap";
 /** 与 core `QUOTA_MIN_REFRESH_INTERVAL_MS` 默认一致；前端拿不到运行时配置。 */
 export const SILENT_QUOTA_INTERVAL_MS = 90_000;
 
+/** 快照含凭证待续期行时的静默间隔；无恢复信号时后端 Scheduled 鉴权退避跳过真实查询。 */
+export const SILENT_QUOTA_PENDING_RENEWAL_INTERVAL_MS = 5_000;
+
+/** 快照含凭证待续期行时加密到 5s，否则 90s。 */
+export function silentQuotaIntervalMs(
+  accounts: ReadonlyArray<{ credential_expired: boolean }> | null,
+): number {
+  if (accounts?.some((row) => row.credential_expired === true)) {
+    return SILENT_QUOTA_PENDING_RENEWAL_INTERVAL_MS;
+  }
+  return SILENT_QUOTA_INTERVAL_MS;
+}
+
 export interface SnapshotGenerationGuard {
   next(): number;
   /** 用户操作一开始就占住世代，已在飞的静默结果会被当成落后快照丢掉。 */
@@ -52,6 +65,8 @@ export interface SilentQuotaHost {
   isBusy(): boolean;
   /** 尚无成功快照为 null；空账号列表不预约。 */
   accountCount(): number | null;
+  /** 最近成功快照的账号行；尚无快照为 null。间隔按其中的凭证待续期决定。 */
+  accounts(): Snapshot["accounts"] | null;
   listAccounts(): Promise<Snapshot>;
   applySnapshot(snapshot: Snapshot, generation: number): void;
   toast(text: string, isError: boolean): void;
@@ -100,11 +115,12 @@ export function createSilentQuotaScheduler(opts: {
       return;
     }
     const count = host.accountCount();
-    // 首载失败不自动静默重试；成功快照后才按 90s 节奏。
+    // 首载失败不自动静默重试；成功快照后才按 90s / 待续期 5s 节奏。
     if (count === null || count === 0) {
       return;
     }
-    const delay = Math.max(0, SILENT_QUOTA_INTERVAL_MS - (clock.now() - lastSnapshotAt));
+    const intervalMs = silentQuotaIntervalMs(host.accounts());
+    const delay = Math.max(0, intervalMs - (clock.now() - lastSnapshotAt));
     timer = clock.setTimeout(() => {
       void run();
     }, delay);

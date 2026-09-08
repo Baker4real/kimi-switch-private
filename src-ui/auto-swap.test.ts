@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
+  autoSwapOptOutSwitchHtml,
+  autoSwapOptOutSwitchView,
   autoSwapPreferLowerTierSwitchView,
   autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
@@ -199,5 +201,48 @@ describe("账号库页「额度恢复后回驻低档账号」子开关（issue #
     const snippet = libraryPage.slice(start, start + 900);
     expect(snippet).not.toContain("套餐");
     expect(snippet).not.toMatch(/\bplan\b/i);
+  });
+});
+
+describe("autoSwapOptOutSwitchView（issue #112）", () => {
+  it("开态映射 checked 与摘出 toast", () => {
+    expect(autoSwapOptOutSwitchView(true)).toEqual({
+      checked: true,
+      toast: "已摘出自动切换",
+    });
+  });
+
+  it("关态映射 unchecked 与恢复 toast", () => {
+    expect(autoSwapOptOutSwitchView(false)).toEqual({
+      checked: false,
+      toast: "已恢复参与自动切换",
+    });
+  });
+});
+
+describe("账号卡片摘出开关 HTML（issue #112）", () => {
+  it("关态可见：role=switch、aria-checked=false、带账号 id", () => {
+    const html = autoSwapOptOutSwitchHtml({ id: "acc-1", auto_swap_opt_out: false }, false);
+    expect(html).toContain("摘出自动切换");
+    expect(html).toMatch(/role="switch"/);
+    expect(html).toMatch(/aria-checked="false"/);
+    expect(html).toContain('data-optout="acc-1"');
+    expect(html).not.toMatch(/\sdisabled/);
+  });
+
+  it("开态 aria-checked=true，忙碌时禁用", () => {
+    const html = autoSwapOptOutSwitchHtml({ id: "bob", auto_swap_opt_out: true }, true);
+    expect(html).toMatch(/aria-checked="true"/);
+    expect(html).toContain('data-optout="bob"');
+    expect(html).toMatch(/\sdisabled/);
+  });
+
+  it("转义账号 id，不把尖括号写进属性", () => {
+    const html = autoSwapOptOutSwitchHtml(
+      { id: `a"b<c>`, auto_swap_opt_out: false },
+      false,
+    );
+    expect(html).toContain('data-optout="a&quot;b&lt;c&gt;"');
+    expect(html).not.toContain('data-optout="a"b<c>"');
   });
 });

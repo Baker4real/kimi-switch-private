@@ -646,7 +646,8 @@ p {
   grid-template-columns: minmax(0, 1fr) var(--profile-actions-column);
   grid-template-areas:
     "title actions"
-    "quotas actions";
+    "quotas actions"
+    "optout actions";
   align-items: center;
   row-gap: 10px;
   column-gap: 18px;
@@ -673,6 +674,18 @@ p {
   grid-area: quotas;
 }
 
+.profile-optout {
+  grid-area: optout;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.profile-optout-label {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
 .profile-card-actions {
   grid-area: actions;
   display: flex;
@@ -688,6 +701,7 @@ p {
     grid-template-areas:
       "title"
       "quotas"
+      "optout"
       "actions";
   }
 

@@ -4,9 +4,11 @@ import { api, commandError, type Snapshot } from "./api";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { escapeHtml } from "./escape";
 import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
+import { credentialRecoveredToast } from "./credentialToast";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
 import {
+  autoSwapOptOutSwitchHtml,
   autoSwapPreferLowerTierSwitchView,
   autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
@@ -86,6 +88,7 @@ const silentQuota = createSilentQuotaScheduler({
       const snapshot = store.get().snapshot;
       return snapshot ? snapshot.accounts.length : null;
     },
+    accounts: () => store.get().snapshot?.accounts ?? null,
     listAccounts: () => api.listAccounts(),
     applySnapshot: (snapshot, generation) => applySnapshot(snapshot, generation),
     toast: (text, isError) => showToast(text, isError),
@@ -406,6 +409,7 @@ function paintAccountCards(next: Snapshot): void {
           <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, false)}</span>
         </div>
         <div class="profile-quota-stack">${quotaStackHtml(row)}</div>
+        ${autoSwapOptOutSwitchHtml(row, false)}
         <div class="profile-card-actions">${cardActionButtons(row, false)}</div>
       </article>`;
     })
@@ -517,10 +521,16 @@ function applySnapshot(
     return;
   }
   silentQuota.noteApplied();
+  // paintSnapshot 会覆盖 store 快照，待续期 diff 必须用上一份。
+  const previousAccounts = store.get().snapshot?.accounts ?? null;
   paintSnapshot(next);
   const announcement = snapshotAnnouncement(next.message, source);
   if (announcement) {
     showToast(announcement.text, announcement.isError);
+  }
+  const recovered = credentialRecoveredToast(previousAccounts, next.accounts);
+  if (recovered !== null) {
+    showToast(recovered);
   }
   silentQuota.arm();
 }
@@ -835,6 +845,13 @@ function wireList(): void {
     const rename = target.closest<HTMLElement>("[data-rename]");
     const remove = target.closest<HTMLElement>("[data-delete]");
     const bind = target.closest<HTMLElement>("[data-bind]");
+    const optout = target.closest<HTMLElement>("[data-optout]");
+    if (optout?.dataset.optout) {
+      const id = optout.dataset.optout;
+      const next = optout.getAttribute("aria-checked") !== "true";
+      void runAction("正在保存…", () => api.setAutoSwapOptOut(id, next));
+      return;
+    }
     if (swap?.dataset.swap) {
       const id = swap.dataset.swap;
       const retrySwap = (): void => {

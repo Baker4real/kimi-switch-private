@@ -40,6 +40,8 @@ export interface AccountRow {
   display_name: string;
   /** 官方昵称缓存非空。已知时隐藏「重命名」入口。 */
   official_nickname_known: boolean;
+  /** 摘出自动切换：true 时不作为耗尽/回驻候选；手动切换不受影响。 */
+  auto_swap_opt_out: boolean;
 }
 
 export interface UiMessage {
@@ -138,6 +140,8 @@ export function createApi(invokeFn: InvokeFn) {
       call<boolean>("set_auto_swap_prefer_lower_tier", { enabled }),
     setAutoSwapResidentLowerTier: (enabled: boolean) =>
       call<boolean>("set_auto_swap_resident_lower_tier", { enabled }),
+    setAutoSwapOptOut: (id: string, enabled: boolean) =>
+      call<Snapshot>("set_auto_swap_opt_out", { id, enabled }),
   };
 }
 

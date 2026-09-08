@@ -9,6 +9,7 @@ const dir = dirname(fileURLToPath(import.meta.url));
 /** 用户可见 GUI 源（不含测试、api 字段注释、theme/escape、静默额度）。 */
 const productionFiles = [
   "main.ts",
+  "credentialToast.ts",
   "membership.ts",
   "membershipToast.ts",
   "webBind.ts",

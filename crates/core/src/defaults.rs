@@ -35,6 +35,29 @@ pub const AUTO_SWAP_SETTLE_GRACE_MS: i64 = 60 * 1000;
 /// 档位偏好切换），耗尽被迫切换不受影响。不进 GUI，只在 config.toml 调。
 pub const AUTO_SWAP_MANUAL_HOLD_MS: i64 = 8 * 60 * 60 * 1000;
 
+/// 耗尽自动切换的候选防抖边际（0.0~1.0）（issue #108 / ADR-0010）。
+///
+/// 停泊账号最大已用比例须 ≤ 当前账号最大已用比例 − 此值，才成为耗尽切换目标。
+/// 默认 0：与未配置时行为一致。不进 GUI，只在 config.toml 调；不作用于回驻。
+pub const AUTO_SWAP_CANDIDATE_MARGIN: f64 = 0.0;
+
+/// 回驻确认期：目标须连续合格的快照周期数（issue #111 / ADR-0012）。
+///
+/// 默认 2：首个合格周期不切回。0 与 1 同义（第一个合格周期即切）。
+/// 只约束回驻路径，不进 GUI，只在 config.toml 调。
+pub const AUTO_SWAP_RESIDENT_CONFIRM_N: u32 = 2;
+
+/// pace 预切换子开关（issue #114 / ADR-0013）。默认关闭。
+///
+/// 开启后，当前账号未达耗尽阈值、但已用/窗口已流逝比 > 1（预测撑不到 reset）
+/// 且最大已用已达预警水位时，可提前切到更健康的停泊账号。不进 GUI。
+pub const AUTO_SWAP_PACE_PRE_SWAP: bool = false;
+
+/// pace 预切换预警水位（0.0~1.0）（issue #114 / ADR-0013）。
+///
+/// 当前账号最大已用比例须 ≥ 此值才走 pace 路径。默认 0.8。不进 GUI。
+pub const AUTO_SWAP_PACE_WARN_THRESHOLD: f64 = 0.8;
+
 // ============================================================
 // 额度状态视觉阈值（仅影响展示，不影响 AutoSwap 决策）
 // ============================================================

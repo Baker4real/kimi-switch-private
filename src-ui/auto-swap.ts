@@ -1,4 +1,5 @@
 import type { UiMessage } from "./api";
+import { escapeHtml } from "./escape";
 
 /** 「额度耗尽自动切换」开关（issue #68）的展示决策。不碰 DOM。 */
 
@@ -78,4 +79,34 @@ export function silentQuotaMessage(message: UiMessage | null): UiMessage | null 
     default:
       return null;
   }
+}
+
+/** 账号卡「摘出自动切换」开关（issue #112）的展示决策。不碰 DOM。 */
+export interface AutoSwapOptOutSwitchView {
+  /** 开关是否处于开态（对应 aria-checked）。真=已摘出。 */
+  checked: boolean;
+  /** 切换成功后的短 toast；实际 toast 由后端快照带显示名。 */
+  toast: string;
+}
+
+export function autoSwapOptOutSwitchView(optedOut: boolean): AutoSwapOptOutSwitchView {
+  return {
+    checked: optedOut,
+    toast: optedOut ? "已摘出自动切换" : "已恢复参与自动切换",
+  };
+}
+
+/** 账号卡上的摘出开关：role=switch，状态可见。 */
+export function autoSwapOptOutSwitchHtml(
+  row: { id: string; auto_swap_opt_out: boolean },
+  busy: boolean,
+): string {
+  const view = autoSwapOptOutSwitchView(row.auto_swap_opt_out);
+  const disabled = busy ? " disabled" : "";
+  return `<div class="profile-optout">
+        <span class="profile-optout-label">摘出自动切换</span>
+        <button class="switch" type="button" role="switch" aria-checked="${String(view.checked)}" data-optout="${escapeHtml(row.id)}" aria-label="摘出自动切换" title="不作为自动切换候选，手动切换不受影响"${disabled}>
+          <span class="switch-thumb" aria-hidden="true"></span>
+        </button>
+      </div>`;
 }

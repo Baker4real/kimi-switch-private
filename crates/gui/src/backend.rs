@@ -9,12 +9,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    decide_auto_swap, decide_resident_return, display_name, membership_expiry_from_extra,
-    membership_period_days, membership_remaining_days, membership_start_from_extra,
-    official_nickname_known, prettify_membership, read_last_auto_swap_at, read_manual_hold_until,
+    auto_swap_opt_out_from_extra, decide_auto_swap, decide_resident_return_from_state,
+    display_name, earliest_reset_at, membership_expiry_from_extra, membership_period_days,
+    membership_remaining_days, membership_start_from_extra, official_nickname_known,
+    persist_auto_swap_opt_out, prettify_membership, read_last_auto_swap_at, read_manual_hold_until,
     set_manual_hold_until, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
-    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget,
-    CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
+    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason,
+    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
     QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
     WEB_STORE_FIELD,
 };
@@ -455,6 +456,22 @@ impl Backend {
             .await)
     }
 
+    /// 账号卡「摘出自动切换」开关（issue #112）：写 extra，返回含 toast 的快照。
+    pub async fn set_auto_swap_opt_out(&self, id: &str, enabled: bool) -> Result<Snapshot> {
+        let id = AccountId(id.to_string());
+        let account = self
+            .registry
+            .find("kimi", &id)?
+            .ok_or_else(|| anyhow::anyhow!("账号 {id} 不存在"))?;
+        persist_auto_swap_opt_out(self.registry.as_ref(), "kimi", &id, enabled)?;
+        Ok(self
+            .snapshot(
+                Some(UiMessage::ok(auto_swap_opt_out_message(&account, enabled))),
+                QuotaCollectReason::Scheduled,
+            )
+            .await)
+    }
+
     /// 发起设备码授权。
     ///
     /// `target = None`：现行「添加新账号」流程，行为不变；
@@ -857,6 +874,15 @@ pub(crate) fn auto_swap_success_message(account: &Account) -> String {
     format!("已自动切换到 {}", display_name(account))
 }
 
+pub(crate) fn auto_swap_opt_out_message(account: &Account, opted_out: bool) -> String {
+    let display = display_name(account);
+    if opted_out {
+        format!("已将 {display} 摘出自动切换")
+    } else {
+        format!("已恢复 {display} 参与自动切换")
+    }
+}
+
 /// 只读本地额度缓存里的会员等级，映射成官网档位名。读取失败或无缓存则 `None`，不打网。
 pub(crate) fn cached_membership_plan(
     cache: &kimi_switch_core::QuotaCache,
@@ -984,12 +1010,15 @@ where
                 "no eligible candidate",
             ));
             AutoSwapSnapshotEffect {
-                message: Some(UiMessage::auto_swap_no_candidate()),
+                message: Some(UiMessage::auto_swap_no_candidate(earliest_reset_at(
+                    snapshots,
+                ))),
                 swapped: false,
             }
         }
         AutoSwapDecision::Stay { .. } => {
-            match decide_resident_return(
+            match decide_resident_return_from_state(
+                state_path,
                 accounts,
                 snapshots,
                 auto_swap,
@@ -1087,12 +1116,16 @@ fn quota_window_short(window: QuotaWindow) -> &'static str {
 }
 
 fn auto_swap_audit_detail(target: &AutoSwapTarget) -> String {
-    format!(
+    let body = format!(
         "from={} window={} used={}%",
         target.from,
         quota_window_short(target.trigger_window),
         auto_swap_pct(target.usage_ratio)
-    )
+    );
+    match target.kind {
+        AutoSwapKind::Pace => format!("kind=pace {body}"),
+        AutoSwapKind::Exhausted => body,
+    }
 }
 
 /// 回驻审计细节：kind=return 标识非耗尽触发；目标账号在事件的 account 字段里。
@@ -1218,6 +1251,7 @@ pub(crate) fn account_row_at(
         cached_at,
         display_name: display_name(account),
         official_nickname_known: official_nickname_known(&account.extra),
+        auto_swap_opt_out: auto_swap_opt_out_from_extra(&account.extra),
     }
 }
 
@@ -1335,12 +1369,7 @@ mod pending_lifecycle_tests {
         let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 9, 3, 12, 0, 0).unwrap();
         let settings = kimi_switch_core::settings::AutoSwap {
             enabled: true,
-            threshold: 0.99,
-            cooldown_ms: 5 * 60 * 1000,
-            settle_grace_ms: 60 * 1000,
-            prefer_lower_tier: false,
-            resident_lower_tier: false,
-            manual_hold_ms: 8 * 60 * 60 * 1000,
+            ..kimi_switch_core::settings::AutoSwap::default()
         };
 
         let live_effect = apply_snapshot_auto_swap(
