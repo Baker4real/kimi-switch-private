@@ -35,9 +35,9 @@ pub const AUTO_SWAP_SETTLE_GRACE_MS: i64 = 60 * 1000;
 /// 档位偏好切换），耗尽被迫切换不受影响。不进 GUI，只在 config.toml 调。
 pub const AUTO_SWAP_MANUAL_HOLD_MS: i64 = 8 * 60 * 60 * 1000;
 
-/// 耗尽自动切换的候选防抖边际（0.0~1.0）（issue #108 / ADR-0010）。
+/// 耗尽 / pace 路径候选防抖边际（0.0~1.0）（issue #108 / ADR-0010，pace 复用见 ADR-0013）。
 ///
-/// 停泊账号最大已用比例须 ≤ 当前账号最大已用比例 − 此值，才成为耗尽切换目标。
+/// 停泊账号最大已用比例须 ≤ 当前账号最大已用比例 − 此值，才成为耗尽或 pace 目标。
 /// 默认 0：与未配置时行为一致。不进 GUI，只在 config.toml 调；不作用于回驻。
 pub const AUTO_SWAP_CANDIDATE_MARGIN: f64 = 0.0;
 
