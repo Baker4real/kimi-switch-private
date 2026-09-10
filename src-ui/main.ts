@@ -18,11 +18,15 @@ import { createSilentQuotaScheduler } from "./silent-quota";
 import { renewalSwitchView } from "./renewal";
 import {
   accountFocusAttr,
+  controlDisabledByBusy,
   createAppStore,
   listedActionSelector,
   listFocusKey,
   pickRestoredFocus,
   setListedActionsBusy,
+  overviewCurrentEmptyCopy,
+  parkedAccountCount,
+  shouldArmToastDismiss,
   snapshotAnnouncement,
   toastDismissMs,
   type ListFocusKey,
@@ -45,6 +49,10 @@ const BUSY_BUTTON_IDS = [
   "bind-retry-button",
   "delete-retry-button",
   "auth-retry-button",
+  "renewal-toggle",
+  "auto-swap-toggle",
+  "auto-swap-prefer-lower-tier-toggle",
+  "auto-swap-resident-lower-tier-toggle",
 ] as const;
 
 const routes: Route[] = ["overview", "library"];
@@ -312,7 +320,7 @@ function paintAutoSwapPreferLowerTier(autoSwapEnabled: boolean, preferLowerTier:
   const view = autoSwapPreferLowerTierSwitchView(autoSwapEnabled, preferLowerTier);
   const toggle = required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle");
   toggle.setAttribute("aria-checked", String(view.checked));
-  toggle.disabled = view.disabled;
+  toggle.disabled = controlDisabledByBusy(store.get().busy, view.disabled);
 }
 
 function paintAutoSwapResidentLowerTier(
@@ -322,7 +330,7 @@ function paintAutoSwapResidentLowerTier(
   const view = autoSwapResidentLowerTierSwitchView(autoSwapEnabled, residentLowerTier);
   const toggle = required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle");
   toggle.setAttribute("aria-checked", String(view.checked));
-  toggle.disabled = view.disabled;
+  toggle.disabled = controlDisabledByBusy(store.get().busy, view.disabled);
 }
 
 /**
@@ -357,6 +365,35 @@ function paintBehaviorPanel(): void {
   }
 }
 
+function hasOpenDialog(): boolean {
+  return document.querySelector("dialog[open]") != null;
+}
+
+function armToastDismiss(el: HTMLElement, text: string, isError: boolean): void {
+  if (!shouldArmToastDismiss(isError, hasOpenDialog())) {
+    return;
+  }
+  toastTimer = window.setTimeout(() => {
+    el.classList.add("hidden");
+  }, toastDismissMs(text, isError));
+}
+
+/** 对话框关掉后，若错误 toast 仍在则开始计时（开着时不在背后白跑）。 */
+function armPendingErrorToast(): void {
+  const alert = required<HTMLDivElement>("toast-alert");
+  if (alert.classList.contains("hidden")) {
+    return;
+  }
+  const text = required<HTMLElement>("toast-alert-text").textContent ?? "";
+  window.clearTimeout(toastTimer);
+  if (!shouldArmToastDismiss(true, hasOpenDialog())) {
+    return;
+  }
+  toastTimer = window.setTimeout(() => {
+    alert.classList.add("hidden");
+  }, toastDismissMs(text, true));
+}
+
 function showToast(text: string, isError = false): void {
   window.clearTimeout(toastTimer);
   const status = required<HTMLDivElement>("toast-status");
@@ -365,17 +402,13 @@ function showToast(text: string, isError = false): void {
     status.classList.add("hidden");
     required<HTMLElement>("toast-alert-text").textContent = text;
     alert.classList.remove("hidden");
-    toastTimer = window.setTimeout(() => {
-      alert.classList.add("hidden");
-    }, toastDismissMs(text, true));
+    armToastDismiss(alert, text, true);
     return;
   }
   alert.classList.add("hidden");
   status.textContent = text;
   status.classList.remove("hidden");
-  toastTimer = window.setTimeout(() => {
-    status.classList.add("hidden");
-  }, toastDismissMs(text, false));
+  armToastDismiss(status, text, false);
 }
 
 function dismissAlertToast(): void {
@@ -457,8 +490,10 @@ function paintSnapshot(next: Snapshot): void {
   paintCurrentPlan(next);
   required<HTMLDivElement>("current-quota-panel").innerHTML = current
     ? quotaStackHtml(current)
-    : `<p class="quota-reset">暂无当前账号，请先切换。</p>`;
-  required<HTMLElement>("metric-current").textContent = next.current_label;
+    : `<p class="quota-reset">${overviewCurrentEmptyCopy(next.accounts.length)}</p>`;
+  required<HTMLElement>("metric-current").textContent = String(
+    parkedAccountCount(next.accounts.length, current != null),
+  );
   required<HTMLElement>("metric-total").textContent = String(next.account_count);
   required<HTMLElement>("metric-urgent").textContent = String(next.urgent_count);
   paintAccountCards(next);
@@ -478,6 +513,12 @@ function syncBusyChrome(): void {
   for (const id of BUSY_BUTTON_IDS) {
     required<HTMLButtonElement>(id).disabled = busy;
   }
+  const masterOn =
+    required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") === "true";
+  required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").disabled =
+    controlDisabledByBusy(busy, !masterOn);
+  required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").disabled =
+    controlDisabledByBusy(busy, !masterOn);
   syncListedActionsBusy();
 }
 
@@ -746,6 +787,11 @@ function openBindDialog(id: string): void {
 }
 
 function wireDialogs(): void {
+  document.querySelectorAll("dialog").forEach((dialog) => {
+    dialog.addEventListener("close", () => {
+      armPendingErrorToast();
+    });
+  });
   required<HTMLButtonElement>("auth-copy-url").addEventListener("click", () => {
     const input = required<HTMLInputElement>("auth-url");
     void copyWithFallback(input.value, "已复制链接", "复制失败，请手动复制链接", input);

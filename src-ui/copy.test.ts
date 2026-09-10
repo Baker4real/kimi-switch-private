@@ -57,3 +57,77 @@ describe("CONTEXT 术语（issue #86）", () => {
     expect(withoutDatePhrase).not.toContain("有效期");
   });
 });
+
+describe("文案与空态（issue #127）", () => {
+  it("状态 pill 空闲是「就绪」，加载失败时不得再声称额度健康", () => {
+    const corpus = loadCorpus();
+    expect(corpus).toContain('id="app-busy-label">就绪</span>');
+    expect(corpus).not.toContain("额度就绪");
+  });
+
+  it("账号库空态指引当前视图的「添加账号」，并提示可切到总览导入", () => {
+    const html = readFileSync(join(dir, "index.html"), "utf8");
+    const library = html.slice(
+      html.indexOf('id="page-library"'),
+      html.indexOf('id="auth-dialog"'),
+    );
+    expect(library).toContain('id="library-add-button"');
+    const emptyStart = library.indexOf('id="accounts-empty"');
+    const emptyInnerStart = library.indexOf(">", emptyStart);
+    const emptyInnerEnd = library.indexOf("</div>", emptyInnerStart);
+    const empty = library.slice(emptyInnerStart + 1, emptyInnerEnd);
+    expect(empty).toContain("添加账号");
+    expect(empty).toContain("总览");
+    expect(empty.indexOf("总览")).toBeLessThan(empty.indexOf("导入"));
+    expect(empty).not.toContain("或先在 Kimi Code 登录后点「导入当前账号」");
+  });
+
+  it("总览空态按账号数分支，不再写「请先切换」", () => {
+    const corpus = loadCorpus();
+    expect(corpus).toContain("请先添加或导入");
+    expect(corpus).toContain("请到「账号库」切换");
+    expect(corpus).not.toContain("暂无当前账号，请先切换");
+  });
+
+  it("凭证恢复 toast 是「凭证已恢复」，不是额度事件", () => {
+    const corpus = loadCorpus();
+    expect(corpus).toContain("凭证已恢复");
+    expect(corpus).not.toContain("额度已恢复");
+  });
+
+  it("授权对话框两个复制按钮语义可区分", () => {
+    const html = readFileSync(join(dir, "index.html"), "utf8");
+    expect(html).toMatch(/id="auth-copy-url"[^>]*>复制链接</);
+    expect(html).toMatch(/id="auth-copy-code"[^>]*>复制授权码</);
+  });
+
+  it("「控制面板」标题改为「账号操作」", () => {
+    const corpus = loadCorpus();
+    expect(corpus).toContain("账号操作");
+    expect(corpus).not.toContain("控制面板");
+  });
+
+  it("总览状态卡不与 hero 重复「当前账号」，改为「可切换」", () => {
+    const html = readFileSync(join(dir, "index.html"), "utf8");
+    const overview = html.slice(
+      html.indexOf('id="page-overview"'),
+      html.indexOf('id="page-library"'),
+    );
+    expect(overview).toContain(">当前账号<");
+    const grid = overview.slice(
+      overview.indexOf("status-grid"),
+      overview.indexOf("control-deck"),
+    );
+    expect(grid).toContain("可切换");
+    expect(grid).not.toContain("当前账号");
+    expect(grid).toContain('id="metric-current"');
+  });
+
+  it("额度相关用户可见冒号用全角", () => {
+    const corpus = loadCorpus();
+    expect(corpus).toContain("额度查询失败：");
+    expect(corpus).toContain("额度：n/a");
+    expect(corpus).not.toContain("额度查询失败: ");
+    expect(corpus).not.toContain("额度: n/a");
+  });
+});

@@ -16,12 +16,12 @@ function quota(partial: Partial<QuotaView> = {}): QuotaView {
 describe("quotaHtml", () => {
   it("查询失败时保持原文案且不含进度条", () => {
     const html = quotaHtml([], `失败 <x>`, null, false);
-    expect(html).toBe(`<p class="quota-error">额度查询失败: 失败 &lt;x&gt;</p>`);
+    expect(html).toBe(`<p class="quota-error">额度查询失败：失败 &lt;x&gt;</p>`);
     expect(html).not.toContain("progressbar");
   });
 
   it("无额度窗口时输出 n/a", () => {
-    expect(quotaHtml([], null, null, false)).toBe(`<p class="quota-reset">额度: n/a</p>`);
+    expect(quotaHtml([], null, null, false)).toBe(`<p class="quota-reset">额度：n/a</p>`);
   });
 
   it("额度条带 progressbar 语义与窗口名、用量文字", () => {
@@ -66,7 +66,7 @@ describe("quotaHtml", () => {
 
   it("有 cached_at 时追加灰字时间", () => {
     const cached = quotaHtml([], "超时", "缓存于 12:00", false);
-    expect(cached).toContain(`额度查询失败: 超时`);
+    expect(cached).toContain(`额度查询失败：超时`);
     expect(cached).toContain(`<p class="quota-cached">缓存于 12:00</p>`);
 
     const updated = quotaHtml([quota()], null, "更新于 12:00", false);
@@ -82,8 +82,9 @@ describe("quotaHtml", () => {
       true,
     );
     expect(html).toBe(
-      `<p class="quota-expired">凭证待续期 · 凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权</p>`,
+      `<p class="quota-expired">凭证已过期：在 Kimi CLI 里发条消息即可恢复，或重新授权</p>`,
     );
+    expect(html).not.toContain("凭证待续期 ·");
     expect(html).not.toContain("quota-error");
     expect(html).not.toContain("额度查询失败");
     expect(html).not.toContain("progressbar");
@@ -98,6 +99,6 @@ describe("quotaHtml", () => {
   it("credential_expired 为 false 时仍是查询失败样式", () => {
     const html = quotaHtml([], "凭证已过期", null, false);
     expect(html).toContain(`quota-error`);
-    expect(html).toContain(`额度查询失败: 凭证已过期`);
+    expect(html).toContain(`额度查询失败：凭证已过期`);
   });
 });

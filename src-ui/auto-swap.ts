@@ -68,7 +68,7 @@ export function autoSwapResidentLowerTierSwitchView(
 
 /**
  * 「账号行为」一层折叠收起态的状态行文案（issue #120，取代 #116/#117 内层折叠）：
- * 标题下用一行字写出当前生效项。纯函数，不碰 DOM、不碰盘；由 paint 层只在收起时渲染。
+ * 标题下用一行字写出当前生效项（「已开启：……」）。纯函数，不碰 DOM、不碰盘；由 paint 层只在收起时渲染。
  * 总开关关闭时不写「优先低档」/「回驻」（置灰不算生效项）；全关返回空串（不写状态行）。
  */
 export function behaviorPanelStatusText(
@@ -93,7 +93,7 @@ export function behaviorPanelStatusText(
   if (items.length === 0) {
     return "";
   }
-  return `${items.join("、")}已开`;
+  return `已开启：${items.join("、")}`;
 }
 
 /** 90s 静默列出只保留自动切换通知；「刚刚更新过」等节流提示仍丢弃。 */

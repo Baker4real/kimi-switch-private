@@ -271,7 +271,7 @@ describe("quotaStackHtml", () => {
       cached_at: null,
       credential_expired: false,
     });
-    expect(na.indexOf("会员")).toBeGreaterThan(na.indexOf("额度: n/a"));
+    expect(na.indexOf("会员")).toBeGreaterThan(na.indexOf("额度：n/a"));
 
     const failed = quotaStackHtml({
       ...trackFields(),

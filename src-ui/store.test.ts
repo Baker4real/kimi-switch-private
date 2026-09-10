@@ -1,11 +1,20 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
   accountFocusAttr,
+  controlDisabledByBusy,
+  createAppStore,
   listFocusKey,
   listedActionSelector,
+  overviewCurrentEmptyCopy,
+  parkedAccountCount,
   pickRestoredFocus,
   setListedActionsBusy,
+  shouldArmToastDismiss,
 } from "./store";
 
 describe("列表保焦", () => {
@@ -67,5 +76,76 @@ describe("列表保焦", () => {
     expect(swap.disabled).toBe(true);
     setListedActionsBusy(buttons, false);
     expect(swap.disabled).toBe(false);
+  });
+});
+
+describe("空闲 pill 与总览空态（issue #127）", () => {
+  it("空闲 busyLabel 是「就绪」，忙完后回到同一文案", () => {
+    const store = createAppStore();
+    expect(store.get().busyLabel).toBe("就绪");
+    store.setBusy(true, "加载中…");
+    expect(store.get().busyLabel).toBe("加载中…");
+    store.setBusy(false);
+    expect(store.get().busyLabel).toBe("就绪");
+  });
+
+  it("停泊账号数 = 总数减去当前账号（若有）", () => {
+    expect(parkedAccountCount(0, false)).toBe(0);
+    expect(parkedAccountCount(0, true)).toBe(0);
+    expect(parkedAccountCount(1, true)).toBe(0);
+    expect(parkedAccountCount(2, false)).toBe(2);
+    expect(parkedAccountCount(3, true)).toBe(2);
+  });
+
+  it("总览无当前账号时按账号数分支空态文案", () => {
+    expect(overviewCurrentEmptyCopy(0)).toBe("请先添加或导入");
+    expect(overviewCurrentEmptyCopy(1)).toBe("请到「账号库」切换");
+    expect(overviewCurrentEmptyCopy(4)).toBe("请到「账号库」切换");
+  });
+});
+
+describe("忙碌闸门与错误 toast 计时（issue #126）", () => {
+  it("忙碌或视图禁用任一为真则控件禁用", () => {
+    expect(controlDisabledByBusy(true, false)).toBe(true);
+    expect(controlDisabledByBusy(true, true)).toBe(true);
+    expect(controlDisabledByBusy(false, true)).toBe(true);
+    expect(controlDisabledByBusy(false, false)).toBe(false);
+  });
+
+  it("对话框打开时错误 toast 不排程；成功 toast 仍排程", () => {
+    expect(shouldArmToastDismiss(true, true)).toBe(false);
+    expect(shouldArmToastDismiss(true, false)).toBe(true);
+    expect(shouldArmToastDismiss(false, true)).toBe(true);
+    expect(shouldArmToastDismiss(false, false)).toBe(true);
+  });
+
+  it("忙碌列表含四个设置开关；子开关 paint 与忙碌取或", () => {
+    const main = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "main.ts"),
+      "utf8",
+    );
+    const busyList = main.slice(
+      main.indexOf("const BUSY_BUTTON_IDS = ["),
+      main.indexOf("] as const;", main.indexOf("const BUSY_BUTTON_IDS = [")),
+    );
+    expect(busyList).toContain('"renewal-toggle"');
+    expect(busyList).toContain('"auto-swap-toggle"');
+    expect(busyList).toContain('"auto-swap-prefer-lower-tier-toggle"');
+    expect(busyList).toContain('"auto-swap-resident-lower-tier-toggle"');
+    expect(busyList).not.toContain("behavior-panel-toggle");
+
+    const functionSrc = (name: string): string => {
+      const start = main.indexOf(`function ${name}(`);
+      expect(start, `缺少函数: ${name}`).toBeGreaterThan(-1);
+      const next = main.indexOf("\nfunction ", start + 1);
+      return main.slice(start, next < 0 ? main.length : next);
+    };
+    const prefer = functionSrc("paintAutoSwapPreferLowerTier");
+    const resident = functionSrc("paintAutoSwapResidentLowerTier");
+    expect(prefer).toContain("controlDisabledByBusy");
+    expect(resident).toContain("controlDisabledByBusy");
+    expect(prefer).not.toMatch(/toggle\.disabled\s*=\s*view\.disabled\s*;/);
+    expect(resident).not.toMatch(/toggle\.disabled\s*=\s*view\.disabled\s*;/);
+    expect(functionSrc("syncBusyChrome")).toContain("controlDisabledByBusy");
   });
 });

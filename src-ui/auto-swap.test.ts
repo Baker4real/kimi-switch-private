@@ -97,27 +97,29 @@ describe("账号库页「额度耗尽自动切换」开关（issue #68）", () =
 });
 
 describe("behaviorPanelStatusText 收起态状态行真值表（issue #120）", () => {
-  it("全关返回空串；只开续期 → 主动续期已开", () => {
+  it("全关返回空串；只开续期 → 已开启：主动续期", () => {
     expect(behaviorPanelStatusText(false, false, false, false)).toBe("");
-    expect(behaviorPanelStatusText(true, false, false, false)).toBe("主动续期已开");
+    expect(behaviorPanelStatusText(true, false, false, false)).toBe("已开启：主动续期");
   });
 
-  it("只开自动切换 → 自动切换已开；自动切换 + 回驻 → 自动切换、回驻已开", () => {
-    expect(behaviorPanelStatusText(false, true, false, false)).toBe("自动切换已开");
-    expect(behaviorPanelStatusText(false, true, false, true)).toBe("自动切换、回驻已开");
+  it("只开自动切换 → 已开启：自动切换；自动切换 + 回驻 → 已开启：自动切换、回驻", () => {
+    expect(behaviorPanelStatusText(false, true, false, false)).toBe("已开启：自动切换");
+    expect(behaviorPanelStatusText(false, true, false, true)).toBe("已开启：自动切换、回驻");
   });
 
-  it("自动切换 + 优先低档 → 自动切换、优先低档已开；全开四项钉版", () => {
-    expect(behaviorPanelStatusText(false, true, true, false)).toBe("自动切换、优先低档已开");
+  it("自动切换 + 优先低档 → 已开启：自动切换、优先低档；全开四项钉版", () => {
+    expect(behaviorPanelStatusText(false, true, true, false)).toBe(
+      "已开启：自动切换、优先低档",
+    );
     expect(behaviorPanelStatusText(true, true, true, true)).toBe(
-      "主动续期、自动切换、优先低档、回驻已开",
+      "已开启：主动续期、自动切换、优先低档、回驻",
     );
   });
 
   it("自动切换关时不写优先低档 / 回驻（总开关关不算生效项）", () => {
     expect(behaviorPanelStatusText(false, false, true, true)).toBe("");
     // 续期也关则无状态行；续期开则只写续期。
-    expect(behaviorPanelStatusText(true, false, true, true)).toBe("主动续期已开");
+    expect(behaviorPanelStatusText(true, false, true, true)).toBe("已开启：主动续期");
   });
 
   it("文案不含禁用词", () => {

@@ -10,7 +10,7 @@
       <header id="window-titlebar-drag-surface" class="window-titlebar">
         <div class="window-drag-region">
           <span class="window-app-mark" aria-hidden="true"></span>
-          <span class="window-app-title">Kimi 换号器</span>
+          <h1 class="window-app-title">Kimi 换号器</h1>
         </div>
         <div class="window-controls" role="group" aria-label="窗口控制">
           <button id="window-minimize-button" class="window-control-button" type="button" aria-label="最小化">
@@ -25,7 +25,7 @@
         </div>
       </header>
 
-      <main id="app-shell" class="dashboard dashboard-shell" aria-busy="false">
+      <main id="app-shell" class="dashboard-shell" aria-busy="false">
         <section class="app-toolbar">
           <nav class="route-tabs" aria-label="主导航">
             <a class="route-tab active" href="#overview" data-route="overview" aria-current="page">总览</a>
@@ -33,7 +33,7 @@
           </nav>
           <div id="app-busy" class="quota-monitor-pill" aria-live="polite">
             <span class="quota-monitor-dot" aria-hidden="true"></span>
-            <span id="app-busy-label">额度就绪</span>
+            <span id="app-busy-label">就绪</span>
           </div>
         </section>
 
@@ -59,7 +59,7 @@
             <section class="overview-panel">
               <div class="status-grid status-grid--three">
                 <article class="status-card">
-                  <span>当前账号</span>
+                  <span>可切换</span>
                   <strong id="metric-current">--</strong>
                 </article>
                 <article class="status-card">
@@ -72,7 +72,7 @@
                 </article>
               </div>
               <article class="rail-card control-deck">
-                <h2 class="section-title">控制面板</h2>
+                <h2 class="section-title">账号操作</h2>
                 <div class="control-stack control-stack--three">
                   <button id="add-account-button" class="action-button action-button-primary" type="button">
                     添加账号
@@ -147,7 +147,7 @@
                 </div>
               </div>
             </section>
-            <div id="accounts-empty" class="empty-state hidden">暂无账号。用「添加账号」浏览器授权，或先在 Kimi Code 登录后点「导入当前账号」。</div>
+            <div id="accounts-empty" class="empty-state hidden">暂无账号。点「添加账号」用浏览器授权。已在 Kimi Code 登录的，可切到总览导入。</div>
             <div id="library-action-error" class="action-retry hidden">
               <p id="library-action-error-text"></p>
               <button id="library-retry-button" class="action-button action-button-primary" type="button">
@@ -178,7 +178,7 @@
         <button id="auth-retry-button" class="action-button action-button-primary" type="button">重试</button>
       </div>
       <div class="dialog-actions">
-        <button id="auth-copy-code" class="action-button" type="button">复制</button>
+        <button id="auth-copy-code" class="action-button" type="button">复制授权码</button>
         <button id="auth-cancel" class="action-button" type="button">取消</button>
       </div>
     </dialog>

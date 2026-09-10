@@ -1,7 +1,7 @@
 import { escapeHtml } from "./escape";
 import { isErrorMessageTone, type Snapshot } from "./api";
 
-const IDLE_BUSY_LABEL = "额度就绪";
+const IDLE_BUSY_LABEL = "就绪";
 
 export interface AppState {
   snapshot: Snapshot | null;
@@ -35,6 +35,16 @@ export function createAppStore(initial?: Partial<AppState>) {
 }
 
 export type AppStore = ReturnType<typeof createAppStore>;
+
+/** 停泊账号数：账号库总数减去当前账号（若有）。 */
+export function parkedAccountCount(accountCount: number, hasCurrent: boolean): number {
+  return Math.max(0, accountCount - (hasCurrent ? 1 : 0));
+}
+
+/** 总览无当前账号时的空态文案：零账号先添加或导入；有停泊账号则去账号库切换。 */
+export function overviewCurrentEmptyCopy(accountCount: number): string {
+  return accountCount === 0 ? "请先添加或导入" : "请到「账号库」切换";
+}
 
 /** 账号库卡片上的操作 data-*，忙碌时只改这些按钮的 disabled。 */
 export type ListActionAttr = "swap" | "reauth" | "rename" | "delete" | "bind" | "optout";
@@ -154,4 +164,14 @@ export function toastDismissMs(text: string, isError: boolean): number {
     return SUCCESS_TOAST_MS;
   }
   return Math.max(ERROR_TOAST_MIN_MS, text.length * ERROR_TOAST_MS_PER_CHAR);
+}
+
+/** 忙碌闸门与视图禁用取或：paint 不得在忙碌时把 disabled 清掉。 */
+export function controlDisabledByBusy(busy: boolean, viewDisabled: boolean): boolean {
+  return busy || viewDisabled;
+}
+
+/** 对话框开着时错误 toast 不自动收起；成功 toast 仍按原计时。 */
+export function shouldArmToastDismiss(isError: boolean, dialogOpen: boolean): boolean {
+  return !(isError && dialogOpen);
 }

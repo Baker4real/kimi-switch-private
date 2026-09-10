@@ -24,11 +24,13 @@ export function quotaHtml(
   let body: string;
   if (error && credentialExpired) {
     // 凭证待续期是凭证生命周期状态，不是查询故障：不按错误红渲染。
-    body = `<p class="quota-expired">凭证待续期 · ${escapeHtml(error)}</p>`;
+    // 后端引导若已以「凭证已过期」开头，不再叠「凭证待续期 · 」前缀。
+    const text = error.startsWith("凭证已过期") ? error : `凭证待续期 · ${error}`;
+    body = `<p class="quota-expired">${escapeHtml(text)}</p>`;
   } else if (error) {
-    body = `<p class="quota-error">额度查询失败: ${escapeHtml(error)}</p>`;
+    body = `<p class="quota-error">额度查询失败：${escapeHtml(error)}</p>`;
   } else if (quotas.length === 0) {
-    body = `<p class="quota-reset">额度: n/a</p>`;
+    body = `<p class="quota-reset">额度：n/a</p>`;
   } else {
     body = quotas
       .map((q) => {

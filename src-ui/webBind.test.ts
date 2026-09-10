@@ -30,4 +30,16 @@ describe("webBindCopy", () => {
     expect(copy).not.toContain("会员有效期");
     expect(copy).not.toContain("有效期");
   });
+
+  it("拆成编号短句，便于按步操作", () => {
+    const copy = webBindCopy("工作机");
+    expect(copy).toContain("1. 绑定「工作机」后这张卡可显示会员到期。");
+    expect(copy).toContain("2. 打开 kimi.com 控制台并登录同一账号。");
+    expect(copy).toContain("3. ");
+    expect(copy).toContain("access_token");
+    expect(copy).toContain("4. 粘贴到下面。");
+    expect(copy.indexOf("1. ")).toBeLessThan(copy.indexOf("2. "));
+    expect(copy.indexOf("2. ")).toBeLessThan(copy.indexOf("3. "));
+    expect(copy.indexOf("3. ")).toBeLessThan(copy.indexOf("4. "));
+  });
 });

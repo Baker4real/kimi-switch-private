@@ -65,6 +65,15 @@ describe("小按钮可点尺寸（issue #85）", () => {
   });
 });
 
+describe("设置开关可点尺寸（issue #126）", () => {
+  it("开关轨道 min-height 至少 24px，可视尺寸 44×24", () => {
+    expect(declaredMinHeightPx(".switch")).toBeGreaterThanOrEqual(24);
+    const body = ruleBody(".switch");
+    expect(body).toMatch(/width:\s*44px/);
+    expect(body).toMatch(/height:\s*24px/);
+  });
+});
+
 describe("窗口控制语义（issue #85）", () => {
   it("窗口控制容器用语义化 role 承载分组名，不只把 aria-label 挂在无语义 div 上", () => {
     const tag = tagWithId(html, "window-minimize-button");

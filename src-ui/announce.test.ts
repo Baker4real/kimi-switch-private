@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { snapshotAnnouncement, toastDismissMs } from "./store";
+import { snapshotAnnouncement, shouldArmToastDismiss, toastDismissMs } from "./store";
 
 const html = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "index.html"),
@@ -121,5 +121,32 @@ describe("toastDismissMs", () => {
     expect(toastDismissMs("字".repeat(80), true)).toBeGreaterThan(
       toastDismissMs("短错误", true),
     );
+  });
+
+  it("对话框打开时错误 toast 不排程自动收起；成功仍 3200ms", () => {
+    expect(toastDismissMs("额度已刷新", false)).toBe(3200);
+    expect(shouldArmToastDismiss(true, true)).toBe(false);
+    expect(shouldArmToastDismiss(false, true)).toBe(true);
+  });
+
+  it("showToast 错误路径按对话框开合决定是否 setTimeout，关闭后再允许计时", () => {
+    const main = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "main.ts"),
+      "utf8",
+    );
+    const functionSrc = (name: string): string => {
+      const start = main.indexOf(`function ${name}(`);
+      expect(start, `缺少函数: ${name}`).toBeGreaterThan(-1);
+      const next = main.indexOf("\nfunction ", start + 1);
+      return main.slice(start, next < 0 ? main.length : next);
+    };
+    expect(main).toContain("shouldArmToastDismiss");
+    expect(main).toContain('querySelector("dialog[open]")');
+    expect(main).toContain("armPendingErrorToast");
+    expect(functionSrc("showToast")).not.toMatch(
+      /toastTimer = window\.setTimeout\([\s\S]*?toastDismissMs\(text, true\)/,
+    );
+    expect(functionSrc("armPendingErrorToast")).toContain("shouldArmToastDismiss");
+    expect(functionSrc("wireDialogs")).toContain("armPendingErrorToast");
   });
 });

@@ -20,10 +20,10 @@ function row(
 }
 
 describe("credentialRecoveredToast", () => {
-  it("待续期行在相邻快照间消失时产生且仅一次「额度已恢复」", () => {
+  it("待续期行在相邻快照间消失时产生且仅一次「凭证已恢复」", () => {
     const expired = [row({ credential_expired: true })];
     const recovered = [row({ credential_expired: false })];
-    expect(credentialRecoveredToast(expired, recovered)).toBe("额度已恢复");
+    expect(credentialRecoveredToast(expired, recovered)).toBe("凭证已恢复");
     expect(credentialRecoveredToast(recovered, recovered)).toBeNull();
   });
 
@@ -78,8 +78,8 @@ describe("credentialRecoveredToast", () => {
       row({ id: "a1", credential_expired: false }),
       row({ id: "a2", credential_expired: false }),
     ];
-    expect(credentialRecoveredToast(prev, oneRecovered)).toBe("额度已恢复");
-    expect(credentialRecoveredToast(prev, bothRecovered)).toBe("额度已恢复");
+    expect(credentialRecoveredToast(prev, oneRecovered)).toBe("凭证已恢复");
+    expect(credentialRecoveredToast(prev, bothRecovered)).toBe("凭证已恢复");
   });
 });
 

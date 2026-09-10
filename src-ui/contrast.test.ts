@@ -172,6 +172,120 @@ describe("muted 在实际面板表面", () => {
   });
 });
 
+describe("danger / body 在实际表面", () => {
+  it("danger-text 对 panel / empty / button / toast 均 ≥ 4.5:1", () => {
+    const report: string[] = [];
+    const danger = parseColor(paper["danger-text"]);
+    const surfaces = [
+      "panel-background",
+      "empty-background",
+      "button-background",
+      "toast-background",
+    ] as const;
+    for (const token of surfaces) {
+      for (const surface of opaqueSurfaces(paper, token)) {
+        const ratio = contrastRatio(danger, surface.bg);
+        report.push(`danger-text / ${surface.label}: ${ratio.toFixed(2)}:1`);
+        expect(
+          ratio,
+          `danger-text / ${surface.label} 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+    expect(report.length).toBeGreaterThan(0);
+  });
+
+  it("text-body 对 field / profile 均 ≥ 4.5:1", () => {
+    const report: string[] = [];
+    const body = parseColor(paper["text-body"]);
+    const surfaces = ["field-background", "profile-background"] as const;
+    for (const token of surfaces) {
+      for (const surface of opaqueSurfaces(paper, token)) {
+        const ratio = contrastRatio(body, surface.bg);
+        report.push(`text-body / ${surface.label}: ${ratio.toFixed(2)}:1`);
+        expect(
+          ratio,
+          `text-body / ${surface.label} 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+    expect(report.length).toBeGreaterThan(0);
+  });
+});
+
+describe("非文本边界对比度（issue #126）", () => {
+  it("输入框边框对 field-background ≥ 3:1", () => {
+    const canvas = parseColor(paper["canvas-bg"]);
+    const [field] = opaqueSurfaces(paper, "field-background");
+    const border = parseColor(paper["field-border"]);
+    const painted = border.a < 1 ? composite(border, field.bg) : border;
+    const ratio = contrastRatio(painted, field.bg);
+    expect(
+      ratio,
+      `field-border / field-background 应为 ≥ 3:1，实际 ${ratio.toFixed(2)}:1`,
+    ).toBeGreaterThanOrEqual(3);
+    expect(canvas.a).toBe(1);
+  });
+
+  it("未选中开关边框对轨道与纸面 ≥ 3:1", () => {
+    const canvas = parseColor(paper["canvas-bg"]);
+    const track = parseColor(paper["track"]);
+    const border = parseColor(paper["switch-border"]);
+    const pairs: { bg: Rgba; label: string }[] = [
+      { bg: track, label: "track" },
+      { bg: canvas, label: "canvas-bg" },
+    ];
+    for (const pair of pairs) {
+      const ratio = contrastRatio(border, pair.bg);
+      expect(
+        ratio,
+        `switch-border / ${pair.label} 应为 ≥ 3:1，实际 ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+});
+
+describe("状态色非文本对比度（issue #128）", () => {
+  const expectedTones = {
+    "tone-ok": "#1a7f37",
+    "tone-warn": "#9a6700",
+    "tone-high": "#bc4c00",
+    "tone-full": "#cf222e",
+  } as const;
+
+  it("四档 tone 为指定纯色且对轨道 ≥ 3:1", () => {
+    const track = parseColor(paper.track);
+    const report: string[] = [];
+    for (const [token, hex] of Object.entries(expectedTones)) {
+      const raw = paper[token];
+      expect(raw, `--${token} 须为指定纯色`).toBe(hex);
+      expect(raw, `--${token} 不得使用渐变`).not.toMatch(/linear-gradient/i);
+      const ratio = contrastRatio(parseColor(raw), track);
+      report.push(`${token} / track: ${ratio.toFixed(2)}:1`);
+      expect(
+        ratio,
+        `${token} / track 应为 ≥ 3:1，实际 ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+    expect(report).toHaveLength(4);
+  });
+
+  it("body / muted 为指定层次且对 canvas ≥ 4.5:1", () => {
+    expect(paper["text-body"]).toBe("#5b5d6e");
+    expect(paper["text-muted"]).toBe("#686a7e");
+    const canvas = parseColor(paper["canvas-bg"]);
+    const bodyRatio = contrastRatio(parseColor(paper["text-body"]), canvas);
+    const mutedRatio = contrastRatio(parseColor(paper["text-muted"]), canvas);
+    expect(bodyRatio, `body / canvas 实际 ${bodyRatio.toFixed(2)}:1`).toBeGreaterThanOrEqual(
+      4.5,
+    );
+    expect(mutedRatio, `muted / canvas 实际 ${mutedRatio.toFixed(2)}:1`).toBeGreaterThanOrEqual(
+      4.5,
+    );
+    expect(bodyRatio).toBeGreaterThan(mutedRatio);
+  });
+});
+
 describe("焦点环对比度", () => {
   it("focus-ring 对 canvas/面板表面均 ≥ 3:1", () => {
     const report: string[] = [];
