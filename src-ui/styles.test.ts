@@ -454,6 +454,12 @@ describe("状态色与视觉层次（issue #128）", () => {
     expect(ruleBody(".window-titlebar")).not.toMatch(/max-width:\s*1200px/);
   });
 
+  it(".page 须有确定宽度：纵向 flex 父级下 auto margin 会取代 stretch 导致内容收缩", () => {
+    // 回归：仅 max-width + margin-inline:auto 时页面按 max-content 收缩，
+    // 账号卡额度轨道（1fr 列 + 绝对定位徽章）塌成约 6px，进度条被徽章盖住。
+    expect(ruleBody(".page")).toMatch(/width:\s*100%\s*;/);
+  });
+
   it("cyan 点缀仍留在窗口徽标与监控脉冲点", () => {
     expect(ruleBody(".window-app-mark")).toMatch(/var\(--blue-fill\)/);
     expect(ruleBody(".window-app-mark")).toMatch(/var\(--monitor-dot\)/);

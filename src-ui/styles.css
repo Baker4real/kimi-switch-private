@@ -387,6 +387,10 @@ p {
   display: none;
   min-height: 0;
   max-width: 1200px;
+  /* 父级 .dashboard-shell 是纵向 flex：交叉轴 auto margin 会取代默认 stretch，
+     页面按内容 shrink-to-fit，额度轨道（1fr + 绝对定位徽章）会塌成几个像素。
+     width:100% 给定确定宽度后，限宽 1200 与 auto 居中才在宽窗口下同时成立。 */
+  width: 100%;
   margin-inline: auto;
 }
 
