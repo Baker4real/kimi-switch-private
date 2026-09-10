@@ -1,9 +1,10 @@
 /// <reference types="vite/client" />
 import "./styles.css";
 import { api, commandError, type Snapshot } from "./api";
+import { accountStatusBodyHtml, accountStatusView } from "./account-status";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { escapeHtml } from "./escape";
-import { accountCardTitle, accountDisplayName, parseAliasInput, renameButtonHtml } from "./labels";
+import { accountCardTitle, accountDisplayName, displayInitial, parseAliasInput, renameButtonHtml } from "./labels";
 import { credentialRecoveredToast } from "./credentialToast";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
@@ -33,6 +34,7 @@ import {
   type SnapshotAnnounceSource,
 } from "./store";
 import { setupWindowControls } from "./window-controls";
+import { appVersionLabel, injectedAppVersion } from "./app-version";
 import { parseWebToken, webBindCopy, WEB_BIND_CONSOLE_URL } from "./webBind";
 
 type Route = "overview" | "library";
@@ -443,12 +445,21 @@ function paintAccountCards(next: Snapshot): void {
   list.innerHTML = next.accounts
     .map((row) => {
       return `<article class="profile-card${row.active ? " is-current" : ""}" ${accountFocusAttr(row.id)}>
-        <div class="profile-title-wrap">
-          <span class="profile-title">${escapeHtml(accountCardTitle(row))}</span>
-          <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, false)}</span>
+        <div class="profile-identity">
+          <span class="profile-avatar" aria-hidden="true">${escapeHtml(displayInitial(row.display_name))}</span>
+          <div class="profile-identity-copy">
+            <div class="profile-title-wrap">
+              <span class="profile-title">${escapeHtml(accountCardTitle(row))}</span>
+              <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, false)}</span>
+            </div>
+            <span class="profile-updated">${row.credential_expired ? "凭证待续期" : row.active ? "当前使用中" : "已加入账号库"}</span>
+            ${autoSwapOptOutSwitchHtml(row, false)}
+          </div>
         </div>
-        <div class="profile-quota-stack">${quotaStackHtml(row)}</div>
-        ${autoSwapOptOutSwitchHtml(row, false)}
+        <div class="profile-quota-block">
+          <span class="profile-quota-heading">额度使用情况</span>
+          <div class="profile-quota-stack">${quotaStackHtml(row)}</div>
+        </div>
         <div class="profile-card-actions">${cardActionButtons(row, false)}</div>
       </article>`;
     })
@@ -472,6 +483,26 @@ function paintCurrentPlan(snapshot: Snapshot): void {
   required<HTMLParagraphElement>("current-plan").innerHTML = current
     ? currentPlanHtml(current, false)
     : "--";
+  // 「会员账号」徽章（issue #133）：档位与到期日同在时出现，与会员轨道同一数据门。
+  required<HTMLElement>("current-membership-badge").classList.toggle(
+    "hidden",
+    !(current?.membership && current.membership_expiry),
+  );
+}
+
+/** 总览「账号状态」汇总条（issue #134）：决策来自 account-status 纯函数，
+ * 只读当前账号快照派生；无当前账号时整条隐藏（空态文案由额度面板承担）。
+ * 不进 live region：每次快照都会重涂，播报会盖住用户操作结果。 */
+function paintCurrentStatus(current: Snapshot["accounts"][number] | null): void {
+  const banner = required<HTMLDivElement>("current-status-banner");
+  const view = accountStatusView(current);
+  if (view === null) {
+    banner.className = "account-status-banner hidden";
+    banner.innerHTML = "";
+    return;
+  }
+  banner.className = `account-status-banner account-status-banner--${view.tone}`;
+  banner.innerHTML = accountStatusBodyHtml(view);
 }
 
 function paintSnapshot(next: Snapshot): void {
@@ -485,12 +516,17 @@ function paintSnapshot(next: Snapshot): void {
   paintBehaviorPanel();
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
+  // 头像圆取 display_name 首字符（单一出处；缩略图-文字等价，装饰属性已 aria-hidden）。
+  required<HTMLElement>("current-avatar").textContent = current
+    ? displayInitial(current.display_name)
+    : "--";
   rememberListFocus();
   const key = captureListFocus() ?? pendingListFocus;
   paintCurrentPlan(next);
   required<HTMLDivElement>("current-quota-panel").innerHTML = current
-    ? quotaStackHtml(current)
+    ? quotaStackHtml(current, "hero")
     : `<p class="quota-reset">${overviewCurrentEmptyCopy(next.accounts.length)}</p>`;
+  paintCurrentStatus(current ?? null);
   required<HTMLElement>("metric-current").textContent = String(
     parkedAccountCount(next.accounts.length, current != null),
   );
@@ -955,6 +991,8 @@ function wireList(): void {
 
 async function init(): Promise<void> {
   await setupWindowControls();
+  // 状态栏版本号：构建时注入的 package.json version，缺失/非法时回退 0.0.0。
+  required<HTMLElement>("app-version").textContent = appVersionLabel(injectedAppVersion);
   applyRoute(routeFromHash());
   window.addEventListener("hashchange", () => applyRoute(routeFromHash()));
   wireSilentQuota();

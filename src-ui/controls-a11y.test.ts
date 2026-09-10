@@ -125,6 +125,25 @@ describe("窗口控制语义（issue #85）", () => {
       /maximizeButton\.classList\.toggle\("is-maximized"/,
     );
   });
+
+  it("标题栏 K 徽标是纯装饰内联 SVG，读屏只播报 h1 标题", () => {
+    const mark = html.slice(
+      html.indexOf('<svg class="window-app-mark"'),
+      html.indexOf("</svg>"),
+    );
+    expect(mark).toContain("<svg");
+    expect(mark).toContain('aria-hidden="true"');
+    expect(mark).toContain('focusable="false"');
+    // 徽标内不重新出现「Kimi 换号器」文本，避免读屏重复播报。
+    expect(mark).not.toContain("Kimi 换号器");
+  });
+
+  it("拖动 / 双击最大化用 Element 判定，SVG 子元素上也能触发", () => {
+    expect(windowControlsSrc).toContain("target instanceof Element");
+    expect(windowControlsSrc).not.toContain("target instanceof HTMLElement");
+    expect(windowControlsSrc).toContain("event.detail === 2");
+    expect(windowControlsSrc).toContain("appWindow.startDragging()");
+  });
 });
 
 describe("对话框标题关联（issue #85）", () => {

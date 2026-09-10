@@ -74,7 +74,9 @@ export async function setupWindowControls(): Promise<void> {
       return;
     }
     const target = event.target;
-    if (!(target instanceof HTMLElement) || target.closest(".window-controls")) {
+    // 徽标是内联 SVG（SVGElement 不是 HTMLElement）：用 Element 判定，
+    // 否则点在方块或 K 字形上无法拖动 / 双击最大化。
+    if (!(target instanceof Element) || target.closest(".window-controls")) {
       return;
     }
     if (event.detail === 2) {

@@ -1,12 +1,4 @@
 @font-face {
-  font-family: "Cormorant Garamond Custom";
-  src: url("./fonts/CormorantGaramond-SemiBold.ttf") format("truetype");
-  font-style: normal;
-  font-weight: 600;
-  font-display: swap;
-}
-
-@font-face {
   font-family: "IBM Plex Sans Custom";
   src: url("./fonts/IBMPlexSans-Regular.ttf") format("truetype");
   font-style: normal;
@@ -40,74 +32,91 @@
 
 :root {
   color-scheme: light;
-  --canvas-bg: #f2efea;
-  /* 同一色相加深 H≈227° S≈24% L 74%→42%。叠在 --canvas-bg 上实测：
-     主按钮白字 5.62:1，激活 Tab 白字 5.15:1，hover 6.70:1。 */
-  --surface-pressed: rgba(81, 92, 133, 0.92);
-  --border: rgba(228, 223, 214, 0.92);
-  --border-accent: rgba(208, 236, 244, 0.96);
-  /* 账号卡 / 行为面板 slate 发丝边；cyan --border-accent 只留给点缀。 */
-  --border-card: rgba(139, 150, 196, 0.38);
-  --border-current: rgba(91, 99, 128, 0.72);
-  --text-strong: #565867;
-  /* body #5b5d6e on canvas 5.66:1；muted #686a7e on canvas 4.63:1（均 ≥ 4.5）。 */
-  --text-body: #5b5d6e;
-  --text-muted: #686a7e;
-  --text-inverse: #f9f8f4;
-  --track: #ebe7e1;
-  /* 未选中开关边框叠在 --track / --canvas-bg 上 ≥ 3:1。text-body 0.45 alpha 不够，用 0.8。 */
-  --switch-border: rgba(98, 102, 116, 0.8);
-  --blue-fill: #8fd4f3;
-  --monitor-dot: #94dbf1;
-  /* 焦点环叠在 --canvas-bg / --field-background 上 ≥ 3:1（实测 canvas 4.00:1）。 */
-  --focus-ring: rgba(47, 118, 158, 0.95);
+  /* 浅蓝白底：参考图窗口底色带极浅蓝调，白卡片叠于其上形成层次。 */
+  --canvas-bg: #eef4fd;
+  /* 激活态（药丸 tab 当前项 / 开关选中）：参考图亮蓝，白字实测 4.78:1。 */
+  --surface-pressed: #2568f6;
+  --border: rgba(206, 220, 240, 0.92);
+  --border-accent: rgba(178, 212, 255, 0.96);
+  /* 卡片 / 行为面板蓝灰发丝边；--border-accent 只留给点缀。 */
+  --border-card: rgba(197, 214, 238, 0.72);
+  --border-current: rgba(37, 104, 246, 0.62);
+  /* 文字三层：深藏青标题 / 蓝灰正文 / 更浅蓝灰弱化。
+     body #5f6884 on canvas 5.00:1；muted #666e8c on canvas 4.55:1（均 ≥ 4.5）。 */
+  --text-strong: #1b2545;
+  --text-body: #5f6884;
+  --text-muted: #666e8c;
+  --text-inverse: #ffffff;
+  --track: #e8eef9;
+  /* 未选中开关边框叠在 --track / --canvas-bg 上 ≥ 3:1（实测 3.73 / 3.93）。 */
+  --switch-border: #6b7a94;
+  --blue-fill: #60a5fa;
+  --monitor-dot: #3b82f6;
+  /* 焦点环叠在 --canvas-bg / --field-background 上 ≥ 3:1（实测 canvas 4.33:1）。 */
+  --focus-ring: #2568f6;
   --app-background:
-    radial-gradient(circle at 12% 12%, rgba(255, 255, 255, 0.92), transparent 26rem),
-    radial-gradient(circle at 88% 14%, rgba(222, 231, 244, 0.54), transparent 22rem),
-    radial-gradient(circle at 50% 100%, rgba(239, 229, 223, 0.52), transparent 24rem),
-    linear-gradient(180deg, #f4f1ec 0%, #efebe5 100%);
+    radial-gradient(circle at 14% 8%, rgba(255, 255, 255, 0.96), transparent 30rem),
+    radial-gradient(circle at 86% 12%, rgba(206, 226, 255, 0.55), transparent 26rem),
+    radial-gradient(circle at 50% 100%, rgba(196, 219, 255, 0.42), transparent 30rem),
+    linear-gradient(180deg, #f7fbff 0%, #e9f1fd 100%);
   --shell-background:
-    radial-gradient(circle at 0% 0%, rgba(255, 255, 255, 0.76), transparent 24rem),
-    radial-gradient(circle at 100% 100%, rgba(233, 227, 219, 0.48), transparent 24rem),
-    linear-gradient(180deg, rgba(250, 248, 244, 0.98), rgba(244, 240, 235, 0.98));
-  --panel-background: linear-gradient(180deg, rgba(251, 249, 245, 0.96), rgba(244, 240, 235, 0.96));
-  --profile-background: linear-gradient(180deg, rgba(250, 248, 244, 0.98), rgba(243, 239, 234, 0.98));
-  --dialog-background: linear-gradient(180deg, rgba(250, 248, 244, 0.98), rgba(243, 239, 234, 0.98));
-  --route-tabs-background: rgba(248, 245, 240, 0.88);
-  --monitor-background: rgba(248, 245, 240, 0.92);
-  --primary-background: rgba(81, 92, 133, 0.96);
-  --primary-background-hover: rgba(73, 84, 120, 0.98);
-  --primary-shadow: 0 10px 20px rgba(166, 170, 191, 0.18);
-  --button-background: rgba(250, 248, 244, 0.94);
-  --button-border: rgba(227, 221, 214, 0.98);
-  --button-hover-background: rgba(255, 253, 249, 0.98);
-  --empty-background: rgba(250, 248, 244, 0.7);
-  --empty-border: rgba(220, 214, 207, 0.98);
-  --field-background: rgba(252, 250, 246, 0.96);
-  /* 输入框边框叠在 --field-background 上 ≥ 3:1（原 0.98 暖灰约 1.3:1）。 */
-  --field-border: rgba(98, 102, 116, 0.78);
-  --code-background: rgba(239, 234, 227, 0.96);
-  --highlight-inset: inset 0 1px 0 rgba(255, 255, 255, 0.9);
-  --monitor-ring: 0 0 0 4px rgba(148, 219, 241, 0.18);
-  /* 当前账号卡光晕：slate 同族，与停泊卡发丝边可辨。 */
-  --current-card-ring: 0 0 0 3px rgba(139, 150, 196, 0.28);
-  --dialog-shadow: 0 28px 64px rgba(98, 88, 80, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.9);
-  --toast-background: rgba(250, 248, 244, 0.96);
-  --toast-shadow: 0 18px 42px rgba(110, 98, 90, 0.16);
-  --dialog-backdrop: rgba(72, 65, 60, 0.24);
-  --window-control-hover-background: rgba(233, 228, 221, 0.72);
-  --window-close-background: rgba(203, 86, 91, 0.94);
-  --window-close-text: #fff;
-  --danger-border: rgba(212, 150, 142, 0.72);
-  --danger-text: #8f3b35;
-  --danger-hover-background: rgba(255, 247, 245, 0.98);
-  --shadow-soft: 0 24px 56px rgba(118, 110, 102, 0.08);
-  --shadow-card: 0 18px 42px rgba(133, 123, 113, 0.08);
-  --radius-card: 24px;
-  --radius-metric: 18px;
+    radial-gradient(circle at 0% 0%, rgba(255, 255, 255, 0.9), transparent 26rem),
+    radial-gradient(circle at 100% 100%, rgba(214, 230, 253, 0.5), transparent 26rem),
+    linear-gradient(180deg, rgba(252, 254, 255, 0.98), rgba(238, 245, 253, 0.98));
+  /* 壳层底部波浪装饰（issue #132）：参考图底缘有肉眼可辨的丘形，弧顶高出状态栏约 130px。
+     横向半径与纵向半径同量级，弧才有横向起伏；弧顶落在条上方、下端被条裁掉。
+     0→92% 保持实心、92→100% 快速收边，得到参考图那种清晰的上沿轮廓。
+     强度按 autocontrast 对照校到参考图量级（条上方横向极差约 13–18，条内约 4–5 级灰阶）。 */
+  --shell-bottom-wave:
+    radial-gradient(230px 140px at 4% 100%, rgba(150, 187, 243, 0.12) 0 92%, transparent 100%),
+    radial-gradient(170px 104px at 26% 100%, rgba(150, 187, 243, 0.12) 0 92%, transparent 100%),
+    radial-gradient(210px 160px at 95% 100%, rgba(150, 187, 243, 0.12) 0 92%, transparent 100%),
+    radial-gradient(190px 128px at 68% 100%, rgba(150, 187, 243, 0.11) 0 92%, transparent 100%);
+  /* 状态栏是叠在波浪之上的半透明釉面：参考图条内仍能辨出约 5 级灰阶的弧形明暗。 */
+  --statusbar-background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(242, 247, 255, 0.8));
+  --panel-background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(250, 253, 255, 0.98));
+  /* 账号卡 / 行为面板 / 对话框统一纯白卡面（issue #135）：清掉旧纸感的双层暖渐变写法。 */
+  --profile-background: #ffffff;
+  --dialog-background: #ffffff;
+  --route-tabs-background: rgba(255, 255, 255, 0.92);
+  --monitor-background: rgba(255, 255, 255, 0.92);
+  --primary-background: #2568f6;
+  --primary-background-hover: #1f5ae0;
+  --primary-shadow: 0 10px 24px rgba(37, 104, 246, 0.24);
+  --button-background: rgba(255, 255, 255, 0.96);
+  --button-border: rgba(206, 220, 240, 0.98);
+  --button-hover-background: #f4f9ff;
+  --empty-background: rgba(248, 251, 255, 0.8);
+  --empty-border: rgba(191, 212, 240, 0.98);
+  --field-background: #ffffff;
+  /* 输入框边框叠在 --field-background 上 ≥ 3:1（实测 3.14:1）。 */
+  --field-border: #8492ab;
+  --code-background: rgba(238, 243, 251, 0.96);
+  --monitor-ring: 0 0 0 4px rgba(59, 130, 246, 0.18);
+  /* 当前账号卡光晕：主色同族，与停泊卡发丝边可辨。 */
+  --current-card-ring: 0 0 0 3px rgba(37, 104, 246, 0.22);
+  /* 对话框投影：纯蓝调外投影，去掉旧纸感的内高光（issue #135）。 */
+  --dialog-shadow: 0 28px 64px rgba(30, 58, 110, 0.18);
+  --toast-background: rgba(255, 255, 255, 0.98);
+  --toast-shadow: 0 18px 42px rgba(30, 58, 110, 0.16);
+  --dialog-backdrop: rgba(24, 38, 66, 0.28);
+  --window-control-hover-background: rgba(226, 236, 250, 0.8);
+  --window-close-background: rgba(214, 69, 69, 0.96);
+  --window-close-text: #ffffff;
+  --danger-border: rgba(220, 120, 110, 0.72);
+  --danger-text: #b42318;
+  --danger-hover-background: #fff5f4;
+  --shadow-soft: 0 24px 56px rgba(37, 78, 150, 0.08);
+  --shadow-card: 0 18px 42px rgba(37, 78, 150, 0.09);
+  /* 圆角刻度：卡片 20px、控件 14px、输入 10px，药丸 999px。 */
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-card: var(--radius-lg);
   --radius-pill: 999px;
-  /* 中文标题 = Noto Sans SC 黑体；Cormorant Garamond 只作拉丁字母/数字的展示点缀。不引入中文衬线字体。 */
-  --font-display: "Cormorant Garamond Custom", "Times New Roman", "Noto Sans SC Custom", serif;
+  /* 壳层底栏高度（border-box，含内边距）：toast 据此让出底边，避免盖住版本号。 */
+  --statusbar-height: 38px;
+  /* 全应用统一无衬线：IBM Plex Sans 拉丁/数字 + Noto Sans SC 中文黑体。 */
   --font-body: "IBM Plex Sans Custom", "Noto Sans SC Custom", "Segoe UI", sans-serif;
   --fs-xs: 0.75rem;
   --fs-sm: 0.82rem;
@@ -127,13 +136,60 @@
   --space-10: 10px;
   --space-14: 14px;
   --space-3xl: 28px;
-  --tab-active-shadow: 0 10px 18px rgba(148, 151, 171, 0.18);
-  /* 浅色纯色角色色（不要 90° 渐变）；对 --track 非文本对比实测：
-     ok 4.12:1，warn 3.95:1，high 4.09:1，full 4.35:1（均 ≥ 3:1）。 */
-  --tone-ok: #1a7f37;
-  --tone-warn: #9a6700;
-  --tone-high: #bc4c00;
-  --tone-full: #cf222e;
+  --tab-active-shadow: 0 10px 22px rgba(37, 104, 246, 0.28);
+  /* 四档状态色纯色（不要 90° 渐变）；对 --track 非文本对比实测：
+     ok 3.81:1，warn 4.23:1，high 4.45:1，full 4.15:1（均 ≥ 3:1）。 */
+  --tone-ok: #128a3e;
+  --tone-warn: #a16207;
+  --tone-high: #c2410c;
+  --tone-full: #dc2626;
+  /* 总览 hero 专用色（issue #133）：统计卡图标为纯色描边 + 同族浅底，
+     底与描边都放 :root，规则里不写死颜色。 */
+  --tone-ok-tint: #e2f6e9;
+  --tone-total-tint: #e4edfe;
+  /* 告急图标橙：对同族浅底 ≥ 3:1（实测 3.61），参考图取色再压暗一档。 */
+  --tone-urgent: #c2620a;
+  --tone-urgent-tint: #fdedd2;
+  /* 「账号状态」汇总条（issue #134）：浅底横幅 + 同族文字，状态语义复用四档色
+     （正常=ok / 凭证待续期=warn / 额度告急=high / 查询失败=full）。
+     正常态底色取自参考图绿；每档标题 / 说明对各自底色 ≥ 4.5:1（contrast.test.ts 守卫）。 */
+  --status-ok-bg: #e2f5ee;
+  --status-ok-title: #0f6b34;
+  --status-ok-detail: #2f7357;
+  --status-warn-bg: #fdf3d7;
+  --status-warn-title: #854d0e;
+  --status-warn-detail: #8a5a17;
+  --status-high-bg: #fdebd8;
+  --status-high-title: #9a3412;
+  --status-high-detail: #a04a1d;
+  --status-full-bg: #fde4e4;
+  --status-full-title: #b42318;
+  --status-full-detail: #a63a30;
+  /* 会员账号徽章：金底 + 深金文字（对金底 ≥ 4.5:1） */
+  --badge-gold-background: #fdf0cf;
+  --badge-gold-border: #f3d894;
+  --badge-gold-text: #8a6414;
+  /* 头像圆：浅蓝底 + 主色首字符（装饰性，与显示名文字并存） */
+  --avatar-background: #dbe9fd;
+  /* 账号库身份头像：当前账号用蓝，停泊账号用暖橙，保持状态色语义克制。 */
+  --profile-avatar-current-background: #e4edfe;
+  --profile-avatar-current-text: #2568f6;
+  --profile-avatar-parked-background: #fdebd8;
+  --profile-avatar-parked-text: #9a3412;
+  /* 会员行皇冠图标（装饰）：参考图的金色皇冠 */
+  --crown-icon: #f0a128;
+  /* hero 标题装饰块：主色同族浅蓝渐变（非状态色，不违反状态色禁渐变） */
+  --hero-mark-background: linear-gradient(155deg, rgba(96, 165, 250, 0.3), rgba(37, 104, 246, 0.16));
+  /* 当前账号卡内装饰：参考图右上角大而柔的浅蓝斜向扫光（纯装饰，不承载语义）。
+     强度按参考图实测标定：白卡 #f6fafe → 装饰峰值 #dce9fe ≈ delta(26,17,0)。 */
+  --hero-decoration:
+    radial-gradient(112% 86% at 112% -14%, rgba(96, 165, 250, 0.155), rgba(96, 165, 250, 0) 66%),
+    linear-gradient(205deg, rgba(37, 104, 246, 0.07) 0 20%, rgba(37, 104, 246, 0) 42%);
+  /* 「添加账号」主操作按钮：蓝色渐变（参考图），与 --primary-background 同色系。
+     两档 stop 均保证白字 ≥ 4.5:1（实测 4.66 / 5.84），副说明也为实心白。 */
+  --control-primary-background: linear-gradient(180deg, #286eea, #1f5ae0);
+  --control-primary-hover-background: linear-gradient(180deg, #2364d8, #1a4fca);
+  --control-primary-shadow: 0 16px 30px rgba(37, 104, 246, 0.28);
 }
 
 * {
@@ -192,7 +248,8 @@ p {
   display: flex;
   flex-direction: column;
   height: 100%;
-  background: var(--shell-background);
+  /* 波浪层叠在壳底色之上；状态栏半透明釉面透出条内的弧形明暗（issue #132）。 */
+  background: var(--shell-bottom-wave), var(--shell-background);
 }
 
 .window-titlebar {
@@ -215,17 +272,37 @@ p {
   padding: 0 var(--space-10);
 }
 
+/* 标题栏徽标：蓝色圆角方块 + 白色 K + 右上角星芒（内联 SVG，issue #132）。 */
 .window-app-mark {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: linear-gradient(180deg, var(--blue-fill), var(--monitor-dot));
-  box-shadow: var(--monitor-ring);
+  flex-shrink: 0;
+  /* 参考图比例：方块约 1.8 倍标题字号（标题 --fs-lg）。 */
+  width: 38px;
+  height: 38px;
+}
+
+.window-app-mark-start {
+  stop-color: var(--blue-fill);
+}
+
+.window-app-mark-end {
+  stop-color: var(--monitor-dot);
+}
+
+.window-app-mark-glyph {
+  fill: none;
+  stroke: var(--text-inverse);
+  stroke-width: 3.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.window-app-mark-spark {
+  fill: var(--text-inverse);
 }
 
 .window-app-title {
-  color: var(--text-body);
-  font-size: var(--fs-sm);
+  color: var(--text-strong);
+  font-size: var(--fs-lg);
   font-weight: 600;
 }
 
@@ -240,7 +317,7 @@ p {
   justify-content: center;
   width: 44px;
   height: 32px;
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   color: var(--text-body);
   cursor: pointer;
 }
@@ -327,7 +404,38 @@ p {
   flex: 1;
   min-height: 0;
   padding: var(--space-md) var(--space-xl) var(--space-xl);
-  overflow: auto;
+  /* 外壳只当固定框：纵向滚动下放到 .page，工具栏常驻视口不随列表卷走。
+     刻意不用 position: sticky，与自绘标题栏保持同一套「滚动区在外、栏不滚」结构。 */
+  overflow: hidden;
+}
+
+/* 壳层固定底栏（issue #132）：不参与收缩、不进 .page 滚动区；对话框层级在其之上。 */
+.app-statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  flex-shrink: 0;
+  min-height: var(--statusbar-height);
+  padding: var(--space-sm) var(--space-xl);
+  border-top: 1px solid var(--border);
+  background: var(--statusbar-background);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.app-statusbar-slogan {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.app-statusbar-sparkle {
+  color: var(--blue-fill);
+}
+
+.app-statusbar-version {
+  font-variant-numeric: tabular-nums;
 }
 
 .app-toolbar {
@@ -335,6 +443,8 @@ p {
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: var(--space-md);
+  /* 工具栏不参与收缩，任何内容高度下都完整留在滚动区之外的视口里。 */
+  flex-shrink: 0;
 }
 
 .app-toolbar .route-tabs {
@@ -349,24 +459,25 @@ p {
 
 .route-tabs {
   display: inline-flex;
-  gap: var(--space-xs);
-  padding: var(--space-xs);
+  gap: var(--space-2xs);
+  padding: var(--space-2xs);
   border: 1px solid var(--border);
   border-radius: var(--radius-pill);
   background: var(--route-tabs-background);
-  box-shadow: var(--highlight-inset);
 }
 
+/* 参考图药丸 tab 明显更高更宽（蓝色 pill 实测 ≈128×50 CSS；
+   窗口徽标 38 CSS 与参考图 38px 同尺度校准）。文案字号随之提到 --fs-md。 */
 .route-tab {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 82px;
-  height: 34px;
-  padding: 0 var(--space-14);
+  min-width: 128px;
+  height: 50px;
+  padding: 0 var(--space-xl);
   border-radius: var(--radius-pill);
   color: var(--text-body);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-md);
   font-weight: 600;
   text-decoration: none;
   transition: background 140ms ease, color 140ms ease, transform 140ms ease;
@@ -385,13 +496,17 @@ p {
 
 .page {
   display: none;
+  /* 占满工具栏之外的剩余高度并自行纵向滚动（issue #129）。 */
+  flex: 1;
   min-height: 0;
   max-width: 1200px;
   /* 父级 .dashboard-shell 是纵向 flex：交叉轴 auto margin 会取代默认 stretch，
      页面按内容 shrink-to-fit，额度轨道（1fr + 绝对定位徽章）会塌成几个像素。
-     width:100% 给定确定宽度后，限宽 1200 与 auto 居中才在宽窗口下同时成立。 */
+     width:100% 给定确定宽度后，限宽 1200 与 auto 居中才在宽窗口下同时成立。
+     该确定宽度同时用于 flex 项：auto margin 存在时 flex:1 只解析主轴高度，不受影响。 */
   width: 100%;
   margin-inline: auto;
+  overflow: auto;
 }
 
 .page.active {
@@ -399,7 +514,7 @@ p {
 }
 
 .section-title {
-  font-family: var(--font-display);
+  font-family: var(--font-body);
   font-size: var(--fs-display);
   line-height: 1.15;
   letter-spacing: 0;
@@ -419,21 +534,78 @@ p {
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
   background: var(--panel-background);
-  box-shadow: var(--shadow-soft), var(--highlight-inset);
+  box-shadow: var(--shadow-soft);
 }
 
 .current-account-card {
+  position: relative;
+  /* isolation 让卡片自成层叠上下文：装饰层才能用 z-index:-1 压在内容之下、
+     卡片底色之上；否则负层级会跑到最近的外层上下文、被卡片底色盖住。 */
+  isolation: isolate;
   display: flex;
   flex-direction: column;
-  gap: var(--space-lg);
-  padding: 18px; /* 批次三再归并 */
+  gap: var(--space-xl);
+  padding: var(--space-2xl);
 }
 
+/* 卡内右上角柔光装饰（issue #133 参考图）：纯装饰层，不参与命中测试，
+   不新增语义 DOM；border-radius: inherit 让装饰自动裁进卡片圆角，
+   因此无需 overflow: hidden，内侧按钮的焦点环不会被裁掉。 */
+.current-account-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: var(--hero-decoration);
+  pointer-events: none;
+}
+
+/* 当前账号卡页眉（issue #133）：浅蓝渐变圆角块 + 中文主标题 + 全大写英文副题。 */
 .current-account-topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-md);
+  gap: var(--space-lg);
+}
+
+.current-account-mark,
+.control-deck-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-lg);
+  background: var(--hero-mark-background);
+  color: var(--primary-background);
+}
+
+.current-account-mark-icon,
+.control-deck-mark svg {
+  width: 26px;
+  height: 26px;
+}
+
+.current-account-heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+.current-account-heading-title {
+  color: var(--text-strong);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+.current-account-heading-kicker {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  letter-spacing: 0.1em;
 }
 
 .quota-monitor-pill {
@@ -468,15 +640,65 @@ p {
   }
 }
 
+/* 身份区（issue #133）：头像圆取显示名首字符，右侧竖排显示名 / 档位 / 会员徽章。 */
+.current-identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+.current-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  background: var(--avatar-background);
+  color: var(--primary-background);
+  font-size: var(--fs-display);
+  font-weight: 600;
+  line-height: 1;
+}
+
+.current-identity-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  min-width: 0;
+}
+
 .current-account-title {
   font-family: var(--font-body);
-  font-size: var(--fs-lg);
+  font-size: var(--fs-xl);
   font-weight: 600;
+  color: var(--text-strong);
 }
 
 .current-plan {
   color: var(--text-body);
   font-size: var(--fs-md);
+}
+
+/* 「会员账号」金徽章：仅会员轨道可画的同一数据门（档位 + 到期日）下出现。 */
+.membership-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  width: fit-content;
+  padding: var(--space-2xs) var(--space-10);
+  border: 1px solid var(--badge-gold-border);
+  border-radius: var(--radius-pill);
+  background: var(--badge-gold-background);
+  color: var(--badge-gold-text);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.membership-badge-icon {
+  width: 14px;
+  height: 14px;
 }
 
 /* 会员到期后缀：弱提示灰（绑定引导），不是错误红。 */
@@ -500,31 +722,165 @@ p {
   gap: var(--space-lg);
 }
 
-.status-grid--three {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--space-md);
-}
-
-.status-card {
+/* 总览额度面板：用量行、更新时间、会员轨道之间留出参考图的呼吸感。 */
+.current-quota-panel {
   display: flex;
-  min-height: 124px;
   flex-direction: column;
-  justify-content: space-between;
-  gap: 18px; /* 批次三再归并 */
-  padding: 18px; /* 批次三再归并 */
+  gap: var(--space-xl);
 }
 
-.status-card span {
-  color: var(--text-body);
-  font-size: var(--fs-xs);
+/* 「账号状态」汇总条（issue #134）：当前账号卡底部横幅，浅底 + 同族文字。
+   四档状态类名由 main.ts 按 view.tone 涂在外层容器上，颜色只引用 :root token。 */
+.account-status-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xl);
+  padding: var(--space-lg) var(--space-xl);
+  border-radius: var(--radius-md);
+}
+
+/* 参考图圆盘直径 ≈26px：viewBox r=10/24，32px 外框即 26.7px。 */
+.account-status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+}
+
+.account-status-icon svg {
+  width: 32px;
+  height: 32px;
+}
+
+/* 圆形底盘取状态色（继承横幅标题色），对勾 / 感叹 / 箭头 / 叉号为白色描边。 */
+.account-status-plate {
+  fill: currentColor;
+}
+
+.account-status-glyph {
+  fill: none;
+  stroke: var(--text-inverse);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.account-status-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.account-status-title {
+  font-size: var(--fs-md);
   font-weight: 600;
 }
 
-.status-card strong {
+.account-status-detail {
+  font-size: var(--fs-sm);
+}
+
+.account-status-banner--ok {
+  background: var(--status-ok-bg);
+  color: var(--status-ok-title);
+}
+
+.account-status-banner--ok .account-status-detail {
+  color: var(--status-ok-detail);
+}
+
+.account-status-banner--warn {
+  background: var(--status-warn-bg);
+  color: var(--status-warn-title);
+}
+
+.account-status-banner--warn .account-status-detail {
+  color: var(--status-warn-detail);
+}
+
+.account-status-banner--high {
+  background: var(--status-high-bg);
+  color: var(--status-high-title);
+}
+
+.account-status-banner--high .account-status-detail {
+  color: var(--status-high-detail);
+}
+
+.account-status-banner--full {
+  background: var(--status-full-bg);
+  color: var(--status-full-title);
+}
+
+.account-status-banner--full .account-status-detail {
+  color: var(--status-full-detail);
+}
+
+.status-grid--three {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-xl);
+}
+
+/* 三统计卡（issue #133）：彩色内联图标 + 标签、大数字、一行说明。 */
+.status-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: start;
+  align-items: center;
+  row-gap: var(--space-md);
+  column-gap: var(--space-lg);
+  min-height: 166px;
+  padding: var(--space-2xl);
+}
+
+.status-card-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-md);
+  background: var(--panel-background);
+  color: var(--text-body);
+}
+
+.status-card-mark svg {
+  width: 28px;
+  height: 28px;
+}
+
+.status-card-mark--switch {
+  background: var(--tone-ok-tint);
+  color: var(--tone-ok);
+}
+
+.status-card-mark--total {
+  background: var(--tone-total-tint);
+  color: var(--primary-background);
+}
+
+.status-card-mark--urgent {
+  background: var(--tone-urgent-tint);
+  color: var(--tone-urgent);
+}
+
+.status-card-label {
+  color: var(--text-body);
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+.status-card-value {
+  grid-column: 1 / -1;
   color: var(--text-strong);
-  font-family: var(--font-display);
-  font-size: var(--fs-xl);
+  font-family: var(--font-body);
+  font-size: var(--fs-display);
+  font-weight: 600;
   line-height: 1.15;
   letter-spacing: 0;
   overflow: hidden;
@@ -532,17 +888,126 @@ p {
   white-space: nowrap;
 }
 
+.status-card-note {
+  grid-column: 1 / -1;
+  align-self: end;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+/* 账号操作卡（issue #133）：题头 + 副标题 + 三个带图标的大按钮。 */
 .control-deck {
   display: flex;
   flex-direction: column;
+  gap: var(--space-xl);
+  padding: var(--space-2xl);
+}
+
+.control-deck-head {
+  display: flex;
+  align-items: center;
   gap: var(--space-lg);
-  padding: 18px; /* 批次三再归并 */
+}
+
+.control-deck-title {
+  min-width: 0;
+}
+
+.control-deck-subtitle {
+  color: var(--text-body);
+  font-size: var(--fs-md);
 }
 
 .control-stack--three {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: var(--space-10);
+  gap: var(--space-xl);
+}
+
+.control-action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-md);
+  min-height: 168px;
+  padding: var(--space-2xl) var(--space-lg);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-card);
+  background: var(--button-background);
+  color: var(--text-strong);
+  cursor: pointer;
+  transition: transform 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.control-action:hover:not(:disabled) {
+  transform: translateY(-2px);
+  background: var(--button-hover-background);
+  box-shadow: var(--shadow-card);
+}
+
+.control-action:active:not(:disabled) {
+  transform: translateY(0);
+  transition-duration: 60ms;
+}
+
+.control-action:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* 图标位：主按钮是实心白圆 + 蓝加号（`--primary` 圆底自带），
+   两个次要按钮是裸描边图标、无底圈（参考图 ops icon）。 */
+.control-action-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 56px;
+  height: 56px;
+  color: var(--primary-background);
+}
+
+.control-action-mark svg {
+  width: 28px;
+  height: 28px;
+}
+
+/* 主按钮图标是整圆占位：按图标位尺寸铺满，白圆直径 = 图标位。 */
+.control-action-mark .control-action-disc {
+  width: 100%;
+  height: 100%;
+}
+
+.control-action--primary .control-action-mark {
+  background: none;
+}
+
+.control-action-title {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+.control-action-note {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+/* 「添加账号」蓝色渐变主按钮（状态色本身禁渐变，此处是主操作色）。 */
+.control-action--primary {
+  border-color: transparent;
+  background: var(--control-primary-background);
+  color: var(--text-inverse);
+  box-shadow: var(--control-primary-shadow);
+}
+
+.control-action--primary:hover:not(:disabled) {
+  background: var(--control-primary-hover-background);
+  color: var(--text-inverse);
+}
+
+.control-action--primary .control-action-note {
+  color: var(--text-inverse);
 }
 
 .action-button,
@@ -625,14 +1090,13 @@ p {
   gap: var(--space-sm);
 }
 
-/* 账号行为面板：与账号卡同级的内嵌分区（细边 + 内高光，不投外阴影，避免卡中卡） */
+/* 账号行为面板：与账号卡同级的白卡分区（细边、无内高光；不投外阴影，避免卡中卡）。 */
 .behavior-panel {
   margin-bottom: 18px;
   padding: var(--space-lg) 18px 18px; /* 批次三再归并 */
   border: 1px solid var(--border-card);
-  border-radius: var(--radius-metric);
+  border-radius: var(--radius-card);
   background: var(--profile-background);
-  box-shadow: var(--highlight-inset);
 }
 
 /* 「账号行为」标题即折叠按钮（issue #120）：h3 保留标题层级，按钮整行可点、
@@ -642,7 +1106,7 @@ p {
 }
 
 .behavior-panel-title .settings-disclosure {
-  font-family: var(--font-display);
+  font-family: var(--font-body);
   font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-strong);
@@ -667,14 +1131,14 @@ p {
   column-gap: 18px; /* 批次三再归并 */
   padding: var(--space-14) 18px; /* 批次三再归并 */
   border: 1px solid var(--border-card);
-  border-radius: var(--radius-metric);
+  border-radius: var(--radius-card);
   background: var(--profile-background);
-  box-shadow: var(--highlight-inset);
 }
 
+/* 当前账号：主色描边 + 同族光晕标识当前态（不加内高光）。 */
 .profile-card.is-current {
   border-color: var(--border-current);
-  box-shadow: var(--highlight-inset), var(--current-card-ring);
+  box-shadow: var(--current-card-ring);
 }
 
 .profile-title-wrap {
@@ -810,6 +1274,133 @@ p {
   background: var(--tone-full);
 }
 
+/* hero 行（总览当前账号卡，issue #133；排布对齐参考图）：图标列 + 左列
+   「窗口名 / 满宽轨道」两行，右列竖排「用量值 / 重置时间」——
+   用量值与窗口名同行，重置时间压在轨道右端（参考图 09-17 09:25 的位置）。 */
+.quota-row--hero {
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  grid-template-areas:
+    "icon label tail"
+    "icon track tail";
+  column-gap: var(--space-md);
+  row-gap: var(--space-sm);
+  margin-top: 0;
+}
+
+/* 会员轨道：图标 + 标签 + 中段条 + 右侧竖排「剩余天数 / 到期日」。 */
+.quota-row--membership {
+  grid-template-columns: 22px auto minmax(0, 1fr) auto;
+  grid-template-areas: "icon label track tail";
+}
+
+.quota-row-icon {
+  grid-area: icon;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: center;
+  /* 参考图：用量与「更新于」行图标为蓝色，会员行图标为金色。 */
+  color: var(--primary-background);
+}
+
+.quota-row--membership .quota-row-icon {
+  color: var(--crown-icon);
+}
+
+.quota-row-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+.quota-row--hero .quota-track {
+  grid-area: track;
+  height: 10px;
+}
+
+.quota-row--hero .quota-label {
+  grid-area: label;
+  align-self: center;
+  color: var(--text-body);
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+/* hero 的用量值离开条面，恢复纯文字（card 变体仍是被主题表面包裹的条上徽章）。 */
+.quota-row--hero .quota-value {
+  position: static;
+  transform: none;
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--text-strong);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.quota-row--hero .quota-reset {
+  text-align: right;
+  color: var(--text-muted);
+  font-size: var(--fs-md);
+}
+
+.quota-row-tail {
+  grid-area: tail;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-3xs);
+  white-space: nowrap;
+}
+
+.quota-row--membership .quota-value {
+  color: var(--text-strong);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.quota-row--membership .quota-reset {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+/* 「更新于」时间行：循环箭头图标 + 灰字时间，压在用量与会员轨道之下。
+   与 `.quota-cached` 同特异度，故叠加自身 class 提高一档，避免被基础规则的
+   `--fs-xs` 压回小字号（参考图该行是 --fs-md）。 */
+.quota-cached.quota-cached--hero {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: var(--space-sm) 0 0;
+  color: var(--text-body);
+  font-size: var(--fs-md);
+}
+
+/* 参考图「更新于 / 09-10 11:35」：标签更重、时间更淡，中间斜杠分隔。
+   三段同处一个 inline 容器，斜杠两侧只留 --space-2xs，不被外层 flex gap 撑开。 */
+.quota-cached--hero .quota-cached-text {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+.quota-cached--hero .quota-cached-label {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+
+.quota-cached--hero .quota-cached-sep {
+  margin: 0 var(--space-2xs);
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.quota-cached--hero .quota-cached-time {
+  color: var(--text-muted);
+}
+
 .quota-error {
   color: var(--danger-text);
   font-size: var(--fs-xs);
@@ -829,7 +1420,7 @@ p {
 
 .empty-state {
   padding: var(--space-3xl);
-  border: 1px dashed var(--empty-border);
+  border: 1px solid var(--empty-border);
   border-radius: var(--radius-card);
   background: var(--empty-background);
   color: var(--text-body);
@@ -985,8 +1576,8 @@ p {
 
 .app-dialog {
   width: min(460px, calc(100vw - 48px));
-  border: 1px solid var(--border);
-  border-radius: 24px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
   padding: 22px; /* 批次三再归并 */
   background: var(--dialog-background);
   color: var(--text-strong);
@@ -999,7 +1590,7 @@ p {
 }
 
 .app-dialog h3 {
-  font-family: var(--font-display);
+  font-family: var(--font-body);
   font-size: var(--fs-xl);
   line-height: 1.15;
   letter-spacing: 0;
@@ -1018,7 +1609,7 @@ p {
   min-height: 36px;
   padding: 0 var(--space-10);
   border: 1px solid var(--field-border);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: var(--field-background);
   color: var(--text-body);
 }
@@ -1044,8 +1635,8 @@ p {
 
 .action-retry {
   padding: var(--space-lg) 18px; /* 批次三再归并 */
-  border: 1px dashed var(--danger-border);
-  border-radius: var(--radius-metric);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-card);
   background: var(--empty-background);
 }
 
@@ -1054,7 +1645,7 @@ p {
 .token-input {
   padding: var(--space-sm) var(--space-10);
   border: 1px solid var(--field-border);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: var(--field-background);
   color: var(--text-body);
   font-family: ui-monospace, Consolas, monospace;
@@ -1066,7 +1657,7 @@ p {
 .device-code {
   margin: 8px 0 14px;
   padding: var(--space-10);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--code-background);
   font-family: ui-monospace, Consolas, monospace;
   font-size: var(--fs-lg);
@@ -1092,11 +1683,12 @@ p {
   gap: var(--space-md);
   position: fixed;
   right: 20px;
-  bottom: 20px;
+  /* 底边让开壳层状态栏，toast 不盖状态栏版本号。 */
+  bottom: calc(var(--statusbar-height) + var(--space-xl));
   max-width: 360px;
   padding: var(--space-md) var(--space-lg);
   border: 1px solid var(--border);
-  border-radius: 16px;
+  border-radius: var(--radius-md);
   background: var(--toast-background);
   box-shadow: var(--toast-shadow);
   color: var(--text-body);
@@ -1135,15 +1727,18 @@ p {
 
   .route-tab,
   .action-button,
-  .profile-pill {
+  .profile-pill,
+  .control-action {
     transition: background 140ms ease, color 140ms ease;
   }
 
   .route-tab:hover,
   .action-button:hover:not(:disabled),
   .profile-pill:hover:not(:disabled),
+  .control-action:hover:not(:disabled),
   .action-button:active:not(:disabled),
-  .profile-pill:active:not(:disabled) {
+  .profile-pill:active:not(:disabled),
+  .control-action:active:not(:disabled) {
     transform: none;
   }
 

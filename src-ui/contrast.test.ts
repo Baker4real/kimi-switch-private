@@ -87,10 +87,13 @@ function contrastRatio(fg: Rgba, bg: Rgba): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-/** CSS 变量可能是纯色、rgba，或 linear-gradient 的若干 stop。 */
+/** CSS 变量可能是纯色、rgba，或 linear-gradient 的若干 stop。
+ * 渐变 stop 既可能是 rgba() 也可能是十六进制（如 #286eea），两者都按出现顺序取出。 */
 function tokenLayers(value: string): string[] {
   if (value.startsWith("linear-gradient")) {
-    const layers = [...value.matchAll(/rgba?\([^)]+\)/gi)].map((match) => match[0]);
+    const layers = [
+      ...value.matchAll(/(rgba?\([^)]+\)|#[0-9a-fA-F]{3,8})/g),
+    ].map((match) => match[0]);
     if (layers.length === 0) {
       throw new Error(`无法解析渐变: ${value}`);
     }
@@ -116,10 +119,10 @@ function opaqueSurfaces(vars: ThemeVars, token: string): { bg: Rgba; label: stri
   });
 }
 
-/** 纸色是唯一主题（issue #119）：token 只在 `:root` 一处。 */
-const paper = blockVars(":root {");
+/** 浅蓝白卡片是唯一主题（issue #119 / #131）：token 只在 `:root` 一处。 */
+const tokens = blockVars(":root {");
 
-describe("纸色对比度守卫", () => {
+describe("浅蓝白主题对比度守卫", () => {
   it("不再有深色主题选择器", () => {
     expect(css).not.toMatch(/data-theme/);
   });
@@ -133,9 +136,9 @@ describe("纸色对比度守卫", () => {
     ];
     const report: string[] = [];
     for (const pair of pairs) {
-      const canvas = parseColor(paper["canvas-bg"]);
-      const fg = parseColor(paper[pair.fg]);
-      const bgToken = parseColor(paper[pair.bg]);
+      const canvas = parseColor(tokens["canvas-bg"]);
+      const fg = parseColor(tokens[pair.fg]);
+      const bgToken = parseColor(tokens[pair.bg]);
       const bg = bgToken.a < 1 ? composite(bgToken, canvas) : bgToken;
       const ratio = contrastRatio(fg, bg);
       report.push(`${pair.label}: ${ratio.toFixed(2)}:1`);
@@ -157,9 +160,9 @@ const mutedSurfaceTokens = [
 describe("muted 在实际面板表面", () => {
   it("muted 对 canvas / 表单底 / 面板 / 账号卡叠底均 ≥ 4.5:1", () => {
     const report: string[] = [];
-    const muted = parseColor(paper["text-muted"]);
+    const muted = parseColor(tokens["text-muted"]);
     for (const token of mutedSurfaceTokens) {
-      for (const surface of opaqueSurfaces(paper, token)) {
+      for (const surface of opaqueSurfaces(tokens, token)) {
         const ratio = contrastRatio(muted, surface.bg);
         report.push(`muted / ${surface.label}: ${ratio.toFixed(2)}:1`);
         expect(
@@ -175,7 +178,7 @@ describe("muted 在实际面板表面", () => {
 describe("danger / body 在实际表面", () => {
   it("danger-text 对 panel / empty / button / toast 均 ≥ 4.5:1", () => {
     const report: string[] = [];
-    const danger = parseColor(paper["danger-text"]);
+    const danger = parseColor(tokens["danger-text"]);
     const surfaces = [
       "panel-background",
       "empty-background",
@@ -183,7 +186,7 @@ describe("danger / body 在实际表面", () => {
       "toast-background",
     ] as const;
     for (const token of surfaces) {
-      for (const surface of opaqueSurfaces(paper, token)) {
+      for (const surface of opaqueSurfaces(tokens, token)) {
         const ratio = contrastRatio(danger, surface.bg);
         report.push(`danger-text / ${surface.label}: ${ratio.toFixed(2)}:1`);
         expect(
@@ -197,10 +200,10 @@ describe("danger / body 在实际表面", () => {
 
   it("text-body 对 field / profile 均 ≥ 4.5:1", () => {
     const report: string[] = [];
-    const body = parseColor(paper["text-body"]);
+    const body = parseColor(tokens["text-body"]);
     const surfaces = ["field-background", "profile-background"] as const;
     for (const token of surfaces) {
-      for (const surface of opaqueSurfaces(paper, token)) {
+      for (const surface of opaqueSurfaces(tokens, token)) {
         const ratio = contrastRatio(body, surface.bg);
         report.push(`text-body / ${surface.label}: ${ratio.toFixed(2)}:1`);
         expect(
@@ -215,9 +218,9 @@ describe("danger / body 在实际表面", () => {
 
 describe("非文本边界对比度（issue #126）", () => {
   it("输入框边框对 field-background ≥ 3:1", () => {
-    const canvas = parseColor(paper["canvas-bg"]);
-    const [field] = opaqueSurfaces(paper, "field-background");
-    const border = parseColor(paper["field-border"]);
+    const canvas = parseColor(tokens["canvas-bg"]);
+    const [field] = opaqueSurfaces(tokens, "field-background");
+    const border = parseColor(tokens["field-border"]);
     const painted = border.a < 1 ? composite(border, field.bg) : border;
     const ratio = contrastRatio(painted, field.bg);
     expect(
@@ -228,9 +231,9 @@ describe("非文本边界对比度（issue #126）", () => {
   });
 
   it("未选中开关边框对轨道与纸面 ≥ 3:1", () => {
-    const canvas = parseColor(paper["canvas-bg"]);
-    const track = parseColor(paper["track"]);
-    const border = parseColor(paper["switch-border"]);
+    const canvas = parseColor(tokens["canvas-bg"]);
+    const track = parseColor(tokens["track"]);
+    const border = parseColor(tokens["switch-border"]);
     const pairs: { bg: Rgba; label: string }[] = [
       { bg: track, label: "track" },
       { bg: canvas, label: "canvas-bg" },
@@ -247,17 +250,17 @@ describe("非文本边界对比度（issue #126）", () => {
 
 describe("状态色非文本对比度（issue #128）", () => {
   const expectedTones = {
-    "tone-ok": "#1a7f37",
-    "tone-warn": "#9a6700",
-    "tone-high": "#bc4c00",
-    "tone-full": "#cf222e",
+    "tone-ok": "#128a3e",
+    "tone-warn": "#a16207",
+    "tone-high": "#c2410c",
+    "tone-full": "#dc2626",
   } as const;
 
   it("四档 tone 为指定纯色且对轨道 ≥ 3:1", () => {
-    const track = parseColor(paper.track);
+    const track = parseColor(tokens.track);
     const report: string[] = [];
     for (const [token, hex] of Object.entries(expectedTones)) {
-      const raw = paper[token];
+      const raw = tokens[token];
       expect(raw, `--${token} 须为指定纯色`).toBe(hex);
       expect(raw, `--${token} 不得使用渐变`).not.toMatch(/linear-gradient/i);
       const ratio = contrastRatio(parseColor(raw), track);
@@ -271,11 +274,11 @@ describe("状态色非文本对比度（issue #128）", () => {
   });
 
   it("body / muted 为指定层次且对 canvas ≥ 4.5:1", () => {
-    expect(paper["text-body"]).toBe("#5b5d6e");
-    expect(paper["text-muted"]).toBe("#686a7e");
-    const canvas = parseColor(paper["canvas-bg"]);
-    const bodyRatio = contrastRatio(parseColor(paper["text-body"]), canvas);
-    const mutedRatio = contrastRatio(parseColor(paper["text-muted"]), canvas);
+    expect(tokens["text-body"]).toBe("#5f6884");
+    expect(tokens["text-muted"]).toBe("#666e8c");
+    const canvas = parseColor(tokens["canvas-bg"]);
+    const bodyRatio = contrastRatio(parseColor(tokens["text-body"]), canvas);
+    const mutedRatio = contrastRatio(parseColor(tokens["text-muted"]), canvas);
     expect(bodyRatio, `body / canvas 实际 ${bodyRatio.toFixed(2)}:1`).toBeGreaterThanOrEqual(
       4.5,
     );
@@ -286,14 +289,88 @@ describe("状态色非文本对比度（issue #128）", () => {
   });
 });
 
+describe("账号状态汇总条对比度（issue #134）", () => {
+  // 每条横幅：浅底 + 同族标题 + 同族说明；标题 / 说明对底色都须 ≥ 4.5:1。
+  const banners = ["ok", "warn", "high", "full"] as const;
+
+  it("四态标题与说明对各自浅底 ≥ 4.5:1", () => {
+    const report: string[] = [];
+    for (const tone of banners) {
+      const bg = parseColor(tokens[`status-${tone}-bg`]);
+      for (const layer of ["title", "detail"] as const) {
+        const fg = parseColor(tokens[`status-${tone}-${layer}`]);
+        const ratio = contrastRatio(fg, bg);
+        report.push(`status-${tone}-${layer} / status-${tone}-bg: ${ratio.toFixed(2)}:1`);
+        expect(
+          ratio,
+          `status-${tone}-${layer} 对 status-${tone}-bg 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+    expect(report).toHaveLength(8);
+  });
+
+  it("正常态说明弱于标题但仍可读（参考图的浅一点说明）", () => {
+    const bg = parseColor(tokens["status-ok-bg"]);
+    const title = contrastRatio(parseColor(tokens["status-ok-title"]), bg);
+    const detail = contrastRatio(parseColor(tokens["status-ok-detail"]), bg);
+    expect(title).toBeGreaterThan(detail);
+    expect(detail).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("状态图标白色图形对状态色圆盘 ≥ 4.5:1（四态）", () => {
+    const glyph = parseColor(tokens["text-inverse"]);
+    const report: string[] = [];
+    for (const tone of banners) {
+      const plate = parseColor(tokens[`status-${tone}-title`]);
+      const ratio = contrastRatio(glyph, plate);
+      report.push(`glyph / status-${tone}-title: ${ratio.toFixed(2)}:1`);
+      expect(
+        ratio,
+        `白色图形对 status-${tone}-title 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(report).toHaveLength(4);
+  });
+});
+
+describe("总览新按钮与金徽章对比度（issue #133）", () => {
+  it("蓝色渐变主按钮的每一档 stop 上白字均 ≥ 4.5:1", () => {
+    const surfaces = opaqueSurfaces(tokens, "control-primary-background");
+    // 两档 stop 才拆得出生效的守卫；stop 被删到一档说明渐变被静默改回纯色。
+    expect(surfaces).toHaveLength(2);
+    const inverse = parseColor(tokens["text-inverse"]);
+    const report: string[] = [];
+    for (const surface of surfaces) {
+      const ratio = contrastRatio(inverse, surface.bg);
+      report.push(`白字 / --${surface.label}: ${ratio.toFixed(2)}:1`);
+      expect(
+        ratio,
+        `白字对 ${surface.label} 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(report).toHaveLength(surfaces.length);
+  });
+
+  it("「会员账号」金徽章文字对金底 ≥ 4.5:1", () => {
+    const fg = parseColor(tokens["badge-gold-text"]);
+    const bg = parseColor(tokens["badge-gold-background"]);
+    const ratio = contrastRatio(fg, bg);
+    expect(
+      ratio,
+      `badge-gold-text 对 badge-gold-background 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+    ).toBeGreaterThanOrEqual(4.5);
+  });
+});
+
 describe("焦点环对比度", () => {
   it("focus-ring 对 canvas/面板表面均 ≥ 3:1", () => {
     const report: string[] = [];
     const surfaces = ["canvas-bg", "field-background"] as const;
     for (const token of surfaces) {
-      const canvas = parseColor(paper["canvas-bg"]);
-      const ring = parseColor(paper["focus-ring"]);
-      const bgToken = parseColor(paper[token]);
+      const canvas = parseColor(tokens["canvas-bg"]);
+      const ring = parseColor(tokens["focus-ring"]);
+      const bgToken = parseColor(tokens[token]);
       const bg = bgToken.a < 1 ? composite(bgToken, canvas) : bgToken;
       const ratio = contrastRatio(ring, bg);
       report.push(`焦点环 / ${token}: ${ratio.toFixed(2)}:1`);

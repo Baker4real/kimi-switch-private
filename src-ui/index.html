@@ -9,7 +9,24 @@
     <div class="window-shell">
       <header id="window-titlebar-drag-surface" class="window-titlebar">
         <div class="window-drag-region">
-          <span class="window-app-mark" aria-hidden="true"></span>
+          <!-- 蓝色圆角方块 K 徽标：内联 SVG，无新依赖；纯装饰，读屏只播报 h1 标题。 -->
+          <svg class="window-app-mark" viewBox="0 0 40 40" aria-hidden="true" focusable="false">
+            <defs>
+              <linearGradient id="app-mark-gradient" x1="0" y1="0" x2="0" y2="1">
+                <stop class="window-app-mark-start" offset="0" />
+                <stop class="window-app-mark-end" offset="1" />
+              </linearGradient>
+            </defs>
+            <rect class="window-app-mark-plate" width="40" height="40" rx="12" fill="url(#app-mark-gradient)" />
+            <path
+              class="window-app-mark-glyph"
+              d="M13 11 V29 M25.5 11 L13.9 20.6 L25.5 29"
+            />
+            <path
+              class="window-app-mark-spark"
+              d="M31.2 5.7 Q31.98 8.82 35.1 9.6 Q31.98 10.38 31.2 13.5 Q30.42 10.38 27.3 9.6 Q30.42 8.82 31.2 5.7 Z"
+            />
+          </svg>
           <h1 class="window-app-title">Kimi 换号器</h1>
         </div>
         <div class="window-controls" role="group" aria-label="窗口控制">
@@ -47,38 +64,126 @@
           <div class="dashboard-grid" id="overview-dashboard">
             <article class="rail-card current-account-card current-account-card--hero">
               <div class="current-account-topbar">
-                <h2 class="section-title">当前账号</h2>
+                <span class="current-account-mark" aria-hidden="true">
+                  <svg class="current-account-mark-icon" viewBox="0 0 24 24" focusable="false">
+                    <path d="M12 2.6 21.4 12 12 21.4 2.6 12Z" fill="currentColor" opacity="0.42" />
+                    <path d="M2.6 12 12 2.6 21.4 12Z" fill="currentColor" opacity="0.62" />
+                    <path d="M4.9 14.6 12 21.4 19.1 14.6Z" fill="currentColor" />
+                  </svg>
+                </span>
+                <h2 class="current-account-heading">
+                  <span class="current-account-heading-title">当前账号</span>
+                  <span class="current-account-heading-kicker">CURRENT ACCOUNT</span>
+                </h2>
               </div>
               <div class="current-identity">
-                <h3 id="current-title" class="current-account-title">--</h3>
-                <p id="current-plan" class="current-plan">--</p>
+                <span id="current-avatar" class="current-avatar" aria-hidden="true"></span>
+                <div class="current-identity-copy">
+                  <h3 id="current-title" class="current-account-title">--</h3>
+                  <p id="current-plan" class="current-plan">--</p>
+                  <span id="current-membership-badge" class="membership-badge hidden">
+                    <svg class="membership-badge-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false">
+                      <path d="M2.9 6.9 7 11l5-7 5 7 4.1-4.1-2 12.1H4.9z" />
+                      <path d="M6.2 19.6h11.6v2.2H6.2z" />
+                    </svg>会员账号
+                  </span>
+                </div>
               </div>
               <div id="current-quota-panel" class="current-quota-panel"></div>
+              <!-- 账号状态汇总条（issue #134）：只读当前账号快照派生；无当前账号时整条隐藏。 -->
+              <div id="current-status-banner" class="account-status-banner hidden"></div>
             </article>
 
             <section class="overview-panel">
               <div class="status-grid status-grid--three">
                 <article class="status-card">
-                  <span>可切换</span>
-                  <strong id="metric-current">--</strong>
+                  <span class="status-card-mark status-card-mark--switch" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                      <path d="M4.2 9.4h11.6" />
+                      <path d="M15.9 6.1 19.6 9.4 15.9 12.7Z" fill="currentColor" stroke="none" />
+                      <path d="M19.8 14.6H8.2" />
+                      <path d="M8.1 11.3 4.4 14.6 8.1 17.9Z" fill="currentColor" stroke="none" />
+                    </svg>
+                  </span>
+                  <span class="status-card-label">可切换账号</span>
+                  <strong id="metric-current" class="status-card-value">--</strong>
+                  <span class="status-card-note">可立即切换使用</span>
                 </article>
                 <article class="status-card">
-                  <span>账号总数</span>
-                  <strong id="metric-total">0</strong>
+                  <span class="status-card-mark status-card-mark--total" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                      <ellipse cx="12" cy="6.4" rx="7.2" ry="3" />
+                      <path d="M4.8 6.4v5.4c0 1.66 3.22 3 7.2 3s7.2-1.34 7.2-3V6.4" />
+                      <path d="M4.8 11.8v5.4c0 1.66 3.22 3 7.2 3s7.2-1.34 7.2-3v-5.4" />
+                    </svg>
+                  </span>
+                  <span class="status-card-label">账号总数</span>
+                  <strong id="metric-total" class="status-card-value">0</strong>
+                  <span class="status-card-note">已配置的账号数量</span>
                 </article>
                 <article class="status-card">
-                  <span>额度告急</span>
-                  <strong id="metric-urgent">0</strong>
+                  <span class="status-card-mark status-card-mark--urgent" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" focusable="false">
+                      <circle cx="12" cy="12" r="9.9" fill="currentColor" />
+                      <path
+                        d="M6.6 15.4A8.2 8.2 0 0 1 15.4 6.6"
+                        fill="none"
+                        style="stroke: var(--tone-urgent-tint)"
+                        stroke-width="4"
+                        stroke-linecap="round"
+                      />
+                    </svg>
+                  </span>
+                  <span class="status-card-label">额度告急</span>
+                  <strong id="metric-urgent" class="status-card-value">0</strong>
+                  <span class="status-card-note">需要关注的账号</span>
                 </article>
               </div>
               <article class="rail-card control-deck">
-                <h2 class="section-title">账号操作</h2>
+                <div class="control-deck-head">
+                  <span class="control-deck-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" focusable="false">
+                      <path fill="currentColor" d="M10.15 5.56L9.16 2.1L14.84 2.1L13.85 5.56L15.25 6.14L16.99 2.99L21.01 7.01L17.86 8.75L18.44 10.15L21.9 9.16L21.9 14.84L18.44 13.85L17.86 15.25L21.01 16.99L16.99 21.01L15.25 17.86L13.85 18.44L14.84 21.9L9.16 21.9L10.15 18.44L8.75 17.86L7.01 21.01L2.99 16.99L6.14 15.25L5.56 13.85L2.1 14.84L2.1 9.16L5.56 10.15L6.14 8.75L2.99 7.01L7.01 2.99L8.75 6.14Z" />
+                      <circle cx="12" cy="12" r="3.7" style="fill: var(--tone-total-tint)" />
+                    </svg>
+                  </span>
+                  <h2 class="section-title control-deck-title">账号操作</h2>
+                </div>
+                <p class="control-deck-subtitle">管理你的 Kimi 账号，轻松切换，提升效率</p>
                 <div class="control-stack control-stack--three">
-                  <button id="add-account-button" class="action-button action-button-primary" type="button">
-                    添加账号
+                  <button id="add-account-button" class="control-action control-action--primary" type="button">
+                    <span class="control-action-mark" aria-hidden="true">
+                      <svg class="control-action-disc" viewBox="0 0 24 24" focusable="false">
+                        <circle cx="12" cy="12" r="11" style="fill: var(--text-inverse)" />
+                        <path d="M10.7 6.4h2.6v4.3h4.3v2.6h-4.3v4.3h-2.6v-4.3H6.4v-2.6h4.3z" style="fill: var(--primary-background)" />
+                      </svg>
+                    </span>
+                    <span class="control-action-title">添加账号</span>
+                    <span class="control-action-note">添加新的 Kimi 账号</span>
                   </button>
-                  <button id="import-button" class="action-button" type="button">导入当前账号</button>
-                  <button id="refresh-button" class="action-button" type="button">刷新</button>
+                  <button id="import-button" class="control-action" type="button">
+                    <span class="control-action-mark" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                        <path d="M12.6 3.8H7.2A3 3 0 0 0 4.2 6.8v10.4a3 3 0 0 0 3 3h9.6a3 3 0 0 0 3-3V9.8" />
+                        <path d="M4.2 12.4h9.4M10.6 9.4l3 3-3 3" />
+                        <path d="M15.6 3.8h4.2v4.2" />
+                      </svg>
+                    </span>
+                    <span class="control-action-title">导入当前账号</span>
+                    <span class="control-action-note">快速导入当前登录的账号</span>
+                  </button>
+                  <button id="refresh-button" class="control-action" type="button">
+                    <span class="control-action-mark" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                        <path d="M19.6 12a7.6 7.6 0 1 1-2.2-5.4" />
+                        <path d="M19.9 4.4v4.4h-4.4" />
+                        <path d="M4.4 12a7.6 7.6 0 0 1 2.2-5.4" />
+                        <path d="M4.1 19.6v-4.4h4.4" />
+                      </svg>
+                    </span>
+                    <span class="control-action-title">刷新</span>
+                    <span class="control-action-note">获取最新账号状态</span>
+                  </button>
                 </div>
               </article>
             </section>
@@ -158,6 +263,14 @@
           </div>
         </section>
       </main>
+
+      <!-- 壳层固定底栏（issue #132）：不进入 .page 滚动区，也不盖住对话框。 -->
+      <footer class="app-statusbar">
+        <span class="app-statusbar-slogan">
+          <span class="app-statusbar-sparkle" aria-hidden="true">✦</span>更智能的账号管理体验
+        </span>
+        <span class="app-statusbar-version" id="app-version"></span>
+      </footer>
     </div>
 
     <dialog id="auth-dialog" class="app-dialog" aria-labelledby="auth-dialog-title">

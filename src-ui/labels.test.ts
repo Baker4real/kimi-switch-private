@@ -4,10 +4,28 @@ import {
   accountCardTitle,
   accountDisplayName,
   deviceAuthBusyLabel,
+  displayInitial,
   parseAliasInput,
   renameButtonHtml,
   showRenameButton,
 } from "./labels";
+
+describe("displayInitial（issue #133 总览头像圆）", () => {
+  it("取显示名首字符，中文与英文一致", () => {
+    expect(displayInitial("Forever4real")).toBe("F");
+    expect(displayInitial("张三")).toBe("张");
+  });
+
+  it("代理对按整字取，不截断成半个码位", () => {
+    expect(displayInitial("𝓐bc")).toBe("𝓐");
+  });
+
+  it("去掉首尾空白后取字符；空串回退 --", () => {
+    expect(displayInitial("  Kimi  ")).toBe("K");
+    expect(displayInitial("")).toBe("--");
+    expect(displayInitial("   ")).toBe("--");
+  });
+});
 
 describe("accountDisplayName", () => {
   it("使用后端下发的显示名", () => {

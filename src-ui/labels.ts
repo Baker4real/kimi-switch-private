@@ -14,6 +14,13 @@ export function accountCardTitle(row: { display_name: string; active: boolean })
   return row.active ? `${row.display_name} · 当前` : row.display_name;
 }
 
+/** 总览当前账号卡头像圆的首字符（issue #133）。
+ * 直接用 display_name 单一出处，不在前端重算昵称优先级；代理对按整字取。 */
+export function displayInitial(displayName: string): string {
+  const chars = Array.from(displayName.trim());
+  return chars.length === 0 ? "--" : chars[0];
+}
+
 /** 官方昵称已知则隐藏重命名入口。 */
 export function showRenameButton(officialNicknameKnown: boolean): boolean {
   return !officialNicknameKnown;

@@ -299,3 +299,54 @@ describe("quotaStackHtml", () => {
     expect(html).toContain("quota-fill--ok");
   });
 });
+
+describe("quotaStackHtml hero 变体（issue #133）", () => {
+  const heroRow = {
+    ...trackFields(),
+    quotas: [quota()],
+    error: null,
+    cached_at: "更新于 09-10 11:35",
+    credential_expired: false,
+  };
+
+  it("额度行、更新时间、会员轨道都走 hero 结构", () => {
+    const html = quotaStackHtml(heroRow, "hero");
+    expect(html).toContain(`class="quota-row quota-row--hero"`);
+    expect(html).toContain(`class="quota-cached quota-cached--hero"`);
+    expect(html).toContain(`class="quota-row quota-row--hero quota-row--membership"`);
+  });
+
+  it("会员轨道：皇冠图标 + 会员标签 + 中段轨道 + 右侧竖排天数与到期日", () => {
+    const html = membershipTrackHtml(trackFields(), "hero");
+    expect(html).toContain(`class="quota-row-icon"`);
+    expect(html).toContain("<svg");
+    expect(html).toContain(`<span class="quota-label">会员</span>`);
+    expect(html).toContain(`<div class="quota-row-tail">`);
+    expect(html).toContain(`<span class="quota-value">剩余 360 天</span>`);
+    expect(html).toContain(`<span class="quota-reset">2027-08-27</span>`);
+    // 剩余天数不再压在轨道里。
+    const trackStart = html.indexOf(`class="quota-track"`);
+    const track = html.slice(trackStart, html.indexOf("</div>", trackStart));
+    expect(track).not.toContain("quota-value");
+  });
+
+  it("hero 会员轨道与 card 变体同语义：填充比例、tone、title 句", () => {
+    const hero = membershipTrackHtml(trackFields(), "hero");
+    const card = membershipTrackHtml(trackFields());
+    for (const attrs of [
+      `role="progressbar"`,
+      `aria-valuenow="1"`,
+      `style="width:1.4%"`,
+      `quota-fill--ok`,
+      `title="会员 剩余 360 天 有效期至 2027-08-27"`,
+    ]) {
+      expect(hero, attrs).toContain(attrs);
+      expect(card, attrs).toContain(attrs);
+    }
+  });
+
+  it("hero 变体无会员数据时同样不画轨道", () => {
+    expect(membershipTrackHtml(trackFields({ membership: null }), "hero")).toBe("");
+    expect(membershipTrackHtml(trackFields({ membership_expiry: null }), "hero")).toBe("");
+  });
+});

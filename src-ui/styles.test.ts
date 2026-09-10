@@ -100,10 +100,15 @@ function mediaMaxWidthBlocks(): { maxWidth: number; body: string }[] {
 }
 
 describe("中文标题排印", () => {
-  it("展示字体链在 Cormorant 失败后先 Times New Roman，再 Noto Sans SC", () => {
+  it("全应用统一无衬线链：IBM Plex Sans → Noto Sans SC，无展示字体 token", () => {
     expect(css).toMatch(
-      /--font-display:\s*"Cormorant Garamond Custom",\s*"Times New Roman",\s*"Noto Sans SC Custom",\s*serif/,
+      /--font-body:\s*"IBM Plex Sans Custom",\s*"Noto Sans SC Custom",\s*"Segoe UI",\s*sans-serif/,
     );
+    // 衬线展示字体已整体移除（issue #131）。
+    expect(css).not.toMatch(/--font-display\s*:/);
+    // 只允许 sans-serif 回退；不得再出现裸 serif 衬线回退。
+    expect(css).not.toMatch(/(?<!sans-)serif/);
+    expect(css).not.toMatch(/Cormorant|Times New Roman/);
   });
 
   it("标题行高 ≥ 1.15 且字距不小于 0，并合并近似标题规则", () => {
@@ -192,15 +197,15 @@ describe("中西文字重对齐（issue #125）", () => {
     expect(statSync(fontPath).size).toBeGreaterThan(10 * 1024);
   });
 
-  it("注释标明中文标题用黑体，Cormorant 只作拉丁/数字点缀", () => {
+  it("注释标明中文用 Noto Sans SC 黑体，字体目录不再含衬线文件", () => {
     expect(css).toMatch(/黑体/);
-    expect(css).toMatch(/点缀/);
+    expect(css).toMatch(/统一无衬线/);
+    // 衬线展示字体文件已删除，构建产物不再打包（issue #131）。
+    expect(existsSync(join(dir, "fonts", "CormorantGaramond-SemiBold.ttf"))).toBe(false);
   });
 
-  it("展示字体链仍是 Cormorant → Times New Roman → Noto，body 回退不退化", () => {
-    expect(css).toMatch(
-      /--font-display:\s*"Cormorant Garamond Custom",\s*"Times New Roman",\s*"Noto Sans SC Custom",\s*serif/,
-    );
+  it("字体链收敛为无衬线，body 回退不退化", () => {
+    expect(css).not.toMatch(/--font-display/);
     expect(css).toMatch(
       /--font-body:\s*"IBM Plex Sans Custom",\s*"Noto Sans SC Custom",\s*"Segoe UI",\s*sans-serif/,
     );
@@ -342,11 +347,16 @@ describe("交互状态与可达性（issue #126）", () => {
     );
     expect(body).toMatch(/transform:\s*translateY\(/);
     expect(body).toMatch(/60ms/);
+    // 总览「账号操作」大按钮与次级按钮同一按压语言（issue #133）。
+    const control = ruleBody(".control-action:active:not(:disabled)");
+    expect(control).toMatch(/transform:\s*translateY\(/);
+    expect(control).toMatch(/60ms/);
   });
 
   it("减弱动效时按钮按压也不位移", () => {
     const reduce = reducedMotionBlock();
     expect(reduce).toMatch(/\.action-button:active:not\(:disabled\)/);
+    expect(reduce).toMatch(/\.control-action:active:not\(:disabled\)/);
     expect(reduce).toMatch(/transform:\s*none/);
   });
 
@@ -401,10 +411,10 @@ function reducedMotionBlock(): string {
 describe("状态色与视觉层次（issue #128）", () => {
   it("四档 tone 为指定浅色纯色，不含 90° 渐变", () => {
     const root = ruleBody(":root");
-    expect(root).toMatch(/--tone-ok:\s*#1a7f37\s*;/);
-    expect(root).toMatch(/--tone-warn:\s*#9a6700\s*;/);
-    expect(root).toMatch(/--tone-high:\s*#bc4c00\s*;/);
-    expect(root).toMatch(/--tone-full:\s*#cf222e\s*;/);
+    expect(root).toMatch(/--tone-ok:\s*#128a3e\s*;/);
+    expect(root).toMatch(/--tone-warn:\s*#a16207\s*;/);
+    expect(root).toMatch(/--tone-high:\s*#c2410c\s*;/);
+    expect(root).toMatch(/--tone-full:\s*#dc2626\s*;/);
     expect(root).not.toMatch(/--tone-(?:ok|warn|high|full):\s*linear-gradient/i);
   });
 
@@ -414,9 +424,9 @@ describe("状态色与视觉层次（issue #128）", () => {
 
   it("body / muted 文字层次为指定值，且强于彼此可辨", () => {
     const root = ruleBody(":root");
-    expect(root).toMatch(/--text-body:\s*#5b5d6e\s*;/);
-    expect(root).toMatch(/--text-muted:\s*#686a7e\s*;/);
-    expect(root).toMatch(/--text-strong:\s*#565867\s*;/);
+    expect(root).toMatch(/--text-body:\s*#5f6884\s*;/);
+    expect(root).toMatch(/--text-muted:\s*#666e8c\s*;/);
+    expect(root).toMatch(/--text-strong:\s*#1b2545\s*;/);
   });
 
   it("账号卡与行为面板用 slate 发丝边，不用 cyan accent", () => {
@@ -460,11 +470,258 @@ describe("状态色与视觉层次（issue #128）", () => {
     expect(ruleBody(".page")).toMatch(/width:\s*100%\s*;/);
   });
 
-  it("cyan 点缀仍留在窗口徽标与监控脉冲点", () => {
-    expect(ruleBody(".window-app-mark")).toMatch(/var\(--blue-fill\)/);
-    expect(ruleBody(".window-app-mark")).toMatch(/var\(--monitor-dot\)/);
+  it("蓝色点缀仍留在窗口徽标渐变与监控脉冲点", () => {
+    // issue #132 后徽标是内联 SVG 渐变：起止色分别落在两个 stop 规则上。
+    expect(ruleBody(".window-app-mark-start")).toMatch(/stop-color:\s*var\(--blue-fill\)/);
+    expect(ruleBody(".window-app-mark-end")).toMatch(/stop-color:\s*var\(--monitor-dot\)/);
     expect(ruleBody(".quota-monitor-dot")).toMatch(/var\(--monitor-dot\)/);
     expect(ruleBody(":root")).toMatch(/--border-accent:/);
+  });
+});
+
+describe("浅蓝白卡片 token 体系（issue #131）", () => {
+  it("底色与主色按参考图重取：浅蓝白底、亮蓝主色、白色卡片", () => {
+    const root = ruleBody(":root");
+    expect(root).toMatch(/--canvas-bg:\s*#eef4fd\s*;/);
+    expect(root).toMatch(/--surface-pressed:\s*#2568f6\s*;/);
+    expect(root).toMatch(/--primary-background:\s*#2568f6\s*;/);
+    expect(root).toMatch(/--field-background:\s*#ffffff\s*;/);
+    expect(root).toMatch(/--text-inverse:\s*#ffffff\s*;/);
+    expect(root).toMatch(/--focus-ring:\s*#2568f6\s*;/);
+  });
+
+  it("圆角刻度：卡片 20、控件 14、输入 10，语义 token 引用刻度", () => {
+    const root = ruleBody(":root");
+    expect(root).toMatch(/--radius-lg:\s*20px\s*;/);
+    expect(root).toMatch(/--radius-md:\s*14px\s*;/);
+    expect(root).toMatch(/--radius-sm:\s*10px\s*;/);
+    expect(root).toMatch(/--radius-card:\s*var\(--radius-lg\)\s*;/);
+  });
+
+  it("对话框 / 输入框 / 提示条圆角走刻度 token，不再硬编码 24/16px", () => {
+    expect(ruleBody(".app-dialog")).toMatch(/border-radius:\s*var\(--radius-lg\)/);
+    expect(ruleBody(".toast")).toMatch(/border-radius:\s*var\(--radius-md\)/);
+    expect(ruleBody(".field input")).toMatch(/border-radius:\s*var\(--radius-sm\)/);
+  });
+});
+
+describe("总览额度行与药丸 tab 排布（issue #136 验收回归）", () => {
+  it("hero 额度行：重置时间与用量值同处右列，不再单独占第三行", () => {
+    const row = ruleBody(".quota-row--hero");
+    // 参考图排布：图标列 + 左列「窗口名 / 轨道」两行，右列竖排「用量值 / 重置时间」。
+    expect(row).toMatch(/grid-template-areas:\s*"icon label tail"\s*"icon track tail"/);
+    expect(row).not.toMatch(/"icon head"/);
+    expect(row).not.toMatch(/"icon reset"/);
+    // 右列容器承接用量值 + 重置时间。
+    const tail = ruleBody(".quota-row-tail");
+    expect(tail).toMatch(/flex-direction:\s*column/);
+    expect(tail).toMatch(/align-items:\s*flex-end/);
+  });
+
+  it("「更新于」hero 行字号压过 `.quota-cached` 基础规则（同特异度顺序陷阱）", () => {
+    // 基础 `.quota-cached` 与 hero 同特异度时，后者靠后的位置不再保证生效；
+    // 必须用复合选择器提高一档，否则字号被静默压回 --fs-xs（issue #136 偏差 2/3）。
+    const hero = ruleBody(".quota-cached.quota-cached--hero");
+    expect(hero).toMatch(/font-size:\s*var\(--fs-md\)/);
+  });
+
+  it("「更新于」标签与时间之间的斜杠由紧邻容器控制，不被 flex gap 撑开", () => {
+    expect(ruleBody(".quota-cached--hero .quota-cached-text")).toMatch(
+      /display:\s*inline-flex/,
+    );
+    const sep = ruleBody(".quota-cached--hero .quota-cached-sep");
+    expect(sep).toMatch(/margin:\s*0 var\(--space-2xs\)/);
+  });
+
+  it("hero 标签随参考图用 --fs-md，重置时间不再是 --fs-xs", () => {
+    expect(ruleBody(".quota-row--hero .quota-label")).toMatch(/font-size:\s*var\(--fs-md\)/);
+    expect(ruleBody(".quota-row--hero .quota-reset")).toMatch(/font-size:\s*var\(--fs-md\)/);
+  });
+
+  it("药丸 tab 按参考图比例：更高更宽，字号上提一档", () => {
+    const tab = ruleBody(".route-tab");
+    expect(tab).toMatch(/min-width:\s*128px\s*;/);
+    expect(tab).toMatch(/height:\s*50px\s*;/);
+    expect(tab).toMatch(/font-size:\s*var\(--fs-md\)/);
+    // 容器内边距同步收敛，pill 与外壳比例与参考图一致。
+    // 注意 `.route-tabs {` 会先命中 `.app-toolbar .route-tabs {`，故按行首定位独立规则。
+    const standalone = css.slice(css.indexOf("\n.route-tabs {"));
+    const wrap = standalone.slice(standalone.indexOf("{") + 1, standalone.indexOf("}"));
+    expect(wrap).toMatch(/padding:\s*var\(--space-2xs\)/);
+    expect(wrap).toMatch(/gap:\s*var\(--space-2xs\)/);
+  });
+
+  it("账号操作图标：次要按钮无底圈，主按钮白圆铺满图标位", () => {
+    // 底圈与浅蓝底已从图标位移除（参考图次按钮是裸描边图标）。
+    const mark = ruleBody(".control-action-mark");
+    expect(mark).not.toMatch(/background\s*:/);
+    expect(mark).not.toMatch(/border-radius\s*:/);
+    expect(ruleBody(".control-action-mark .control-action-disc")).toMatch(/width:\s*100%/);
+  });
+});
+
+describe("工具栏常驻可见（issue #129）", () => {
+  it("滚动容器不是工具栏的父壳：纵向滚动下放到 .page", () => {
+    // 工具栏是 .dashboard-shell 的直接子元素；若外壳仍是纵向滚动容器，
+    // 列表一长工具栏就会被一起卷走。外壳只保留裁剪，滚动交给 .page。
+    const shell = ruleBody(".dashboard-shell");
+    expect(shell).toMatch(/overflow:\s*hidden\s*;/);
+    expect(shell).not.toMatch(/overflow(?:-y)?:\s*(?:auto|scroll)/);
+
+    const page = ruleBody(".page");
+    expect(page).toMatch(/overflow:\s*(?:auto|scroll)\s*;/);
+    expect(page).toMatch(/(?:^|\n)\s*flex:\s*1\s*;/);
+    expect(page).toMatch(/min-height:\s*0\s*;/);
+  });
+
+  it("工具栏不收缩，且不依赖 position: sticky", () => {
+    expect(ruleBody(".app-toolbar")).toMatch(/flex-shrink:\s*0\s*;/);
+    // 注释里提到 sticky 不算实现（本文件注释正说明刻意不用它）。
+    expect(stripCssComments(css)).not.toMatch(/position:\s*sticky/);
+  });
+
+  it("index.html 中工具栏是页面滚动区的兄弟，不是 .page 的后代", () => {
+    const toolbarIdx = html.indexOf('<section class="app-toolbar">');
+    const pageIdx = html.indexOf('<section class="page active"');
+    expect(toolbarIdx).toBeGreaterThanOrEqual(0);
+    expect(pageIdx).toBeGreaterThanOrEqual(0);
+    expect(toolbarIdx).toBeLessThan(pageIdx);
+    // 工具栏 section 在页面 section 之前闭合，二者同级。
+    expect(html.slice(toolbarIdx, pageIdx)).toContain("</section>");
+  });
+});
+
+describe("壳层底栏与窗口默认尺寸（issue #132）", () => {
+  it("状态栏是壳层固定底栏：不收缩、不进滚动区、横向可达", () => {
+    const bar = ruleBody(".app-statusbar");
+    expect(bar).toMatch(/flex-shrink:\s*0\s*;/);
+    expect(bar).not.toMatch(/position:\s*(?:absolute|fixed|sticky)/);
+    // 滚动仍由 .dashboard-shell 裁剪、.page 负责，底栏不进入滚动区。
+    expect(ruleBody(".dashboard-shell")).toMatch(/overflow:\s*hidden\s*;/);
+    // 纵向滚动仍留在 .page：视口缩小时不把底栏挤出去。
+    expect(ruleBody(".page")).toMatch(/overflow:\s*(?:auto|scroll)\s*;/);
+    expect(ruleBody(".app-statusbar")).toMatch(/justify-content:\s*space-between\s*;/);
+  });
+
+  it("toast 让位高度与底栏高度绑定同一 token（单一出处，跨票契约）", () => {
+    // 底栏实际渲染高度取 --statusbar-height，toast 的 bottom 必须引用同一 token；
+    // 任一改动未同步时，toast 会盖住或远离底栏版本号。
+    expect(ruleBody(":root")).toMatch(/--statusbar-height:\s*\d+px\s*;/);
+    expect(ruleBody(".app-statusbar")).toMatch(/min-height:\s*var\(--statusbar-height\)\s*;/);
+    expect(ruleBody(".toast")).toMatch(
+      /bottom:\s*calc\(var\(--statusbar-height\)\s*\+\s*var\(/,
+    );
+    // 底栏高度不得在规则里另写一套 px 字面量（否则与 token 漂移）。
+    expect(ruleBody(".app-statusbar")).not.toMatch(/min-height:\s*\d+px/);
+  });
+
+  it("底栏波浪是 token 化的多层径向弧，且挂在壳层底色上", () => {
+    // 参考图底缘有肉眼可辨的丘形起伏；旧实现把多层弧塞进 --statusbar-background，
+    // 横向半径远大于条宽导致起伏不可辨，且弧被整条不透明底盖平。
+    const root = ruleBody(":root");
+    expect(root, "缺少 --shell-bottom-wave token").toMatch(/--shell-bottom-wave:/);
+    const wave = /--shell-bottom-wave:([\s\S]*?);/.exec(root)?.[1] ?? "";
+    const arcs = wave.match(/radial-gradient\(/g) ?? [];
+    expect(arcs.length, "波浪至少 4 层错位径向弧").toBeGreaterThanOrEqual(4);
+    // 弧必须落在壳层底缘（y=100%），横向半径量级与纵向相当才能有横向起伏。
+    expect(wave).toMatch(/at\s+\d+%\s+100%/);
+    expect(wave).not.toMatch(/at\s+[\d.]+%\s+(?:1[2-9]\d|[2-9]\d\d)%/);
+    // 波浪叠在 .window-shell 底色之上；底栏是半透明釉面，透出条内弧形明暗。
+    expect(ruleBody(".window-shell")).toMatch(
+      /background:\s*var\(--shell-bottom-wave\),\s*var\(--shell-background\)\s*;/,
+    );
+    expect(ruleBody(".app-statusbar")).toMatch(/background:\s*var\(--statusbar-background\)\s*;/);
+    expect(root).toMatch(/--statusbar-background:\s*linear-gradient\(/);
+  });
+
+  it("状态栏在 index.html 里是 main 的兄弟、位于 window-shell 内", () => {
+    const mainClose = html.indexOf("</main>");
+    const barIdx = html.indexOf('class="app-statusbar"');
+    expect(mainClose).toBeGreaterThanOrEqual(0);
+    expect(barIdx).toBeGreaterThan(mainClose);
+    expect(html.indexOf("</footer>")).toBeGreaterThan(barIdx);
+    // 底栏仍是 .window-shell 的子元素（在对话框之前闭合）。
+    const shellClose = html.indexOf('<dialog id="auth-dialog"');
+    expect(barIdx).toBeLessThan(shellClose);
+  });
+
+  it("底栏文案：slogan 静态，「✦」为 aria-hidden 装饰", () => {
+    const bar = html.slice(
+      html.indexOf('class="app-statusbar"'),
+      html.indexOf("</footer>"),
+    );
+    expect(bar).toContain("更智能的账号管理体验");
+    expect(bar).toMatch(/aria-hidden="true">✦/);
+    expect(bar).toContain('id="app-version"');
+  });
+
+  it("默认窗口尺寸约 1280×880，且不越过 minWidth / minHeight", () => {
+    const confPath = join(dir, "..", "src-tauri", "tauri.conf.json");
+    const conf = JSON.parse(readFileSync(confPath, "utf8")) as {
+      app: { windows: { label?: string; width?: number; height?: number; minWidth?: number; minHeight?: number }[] };
+    };
+    const main =
+      conf.app.windows.find((window) => window.label === "main") ?? conf.app.windows[0];
+    expect(main.width).toBe(1280);
+    expect(main.height).toBe(880);
+    expect(main.width).toBeGreaterThanOrEqual(main.minWidth!);
+    expect(main.height).toBeGreaterThanOrEqual(main.minHeight!);
+  });
+});
+
+describe("账号状态汇总条（issue #134）", () => {
+  it("横幅是圆角浅底条，四档 tone 类名对应四档底色 token", () => {
+    const banner = ruleBody(".account-status-banner");
+    expect(banner).toMatch(/display:\s*flex\s*;/);
+    expect(banner).toMatch(/border-radius:\s*var\(--radius-md\)\s*;/);
+    for (const tone of ["ok", "warn", "high", "full"] as const) {
+      const rule = ruleBody(`.account-status-banner--${tone}`);
+      expect(rule, `${tone} 底色须引用 :root token`).toMatch(
+        new RegExp(`background:\\s*var\\(--status-${tone}-bg\\)`),
+      );
+      expect(rule).toMatch(new RegExp(`color:\\s*var\\(--status-${tone}-title\\)`));
+    }
+    // 状态色语义复用四档 token：标题 / 说明底色都在 :root 声明，规则里不写死颜色。
+    expect(ruleBody(":root")).toMatch(/--status-ok-bg:\s*#e2f5ee\s*;/);
+    expect(ruleBody(":root")).toMatch(/--status-ok-title:\s*#0f6b34\s*;/);
+  });
+
+  it("容器是当前账号卡内槽位，默认隐藏并只在有当前账号时由 main.ts 填充", () => {
+    const bannerIdx = html.indexOf('id="current-status-banner"');
+    expect(bannerIdx).toBeGreaterThan(html.indexOf('id="current-quota-panel"'));
+    expect(html.slice(bannerIdx, bannerIdx + 120)).toContain("hidden");
+    const main = readFileSync(join(dir, "main.ts"), "utf8");
+    expect(main).toContain("paintCurrentStatus(");
+    expect(main).toContain("accountStatusView(");
+  });
+
+  it("汇总条不进 live region（每次快照重涂，避免盖住用户操作公告）", () => {
+    const bannerIdx = html.indexOf('id="current-status-banner"');
+    expect(html.slice(bannerIdx, bannerIdx + 120)).not.toContain("aria-live");
+  });
+
+  it("状态图标颜色只在 styles.css 决定：圆盘 currentColor、图形 --text-inverse", () => {
+    expect(ruleBody(".account-status-plate")).toMatch(/fill:\s*currentColor\s*;/);
+    const glyph = ruleBody(".account-status-glyph");
+    expect(glyph).toMatch(/stroke:\s*var\(--text-inverse\)\s*;/);
+    expect(glyph).toMatch(/fill:\s*none\s*;/);
+    // 图标源不写死颜色 / 不引图标库；四个状态各一个圆盘，差异只在内联 path。
+    const icons = readFileSync(join(dir, "icons.ts"), "utf8");
+    const statusSource = icons.slice(icons.indexOf("statusBadgeIcon"));
+    expect(statusSource).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
+    expect(statusSource).not.toMatch(/\brgba?\(/i);
+    // 不写死 stroke/fill 颜色属性（颜色全交给上面两条 CSS 规则）。
+    expect(statusSource).not.toMatch(/stroke="(?!none)/);
+    expect(statusSource).not.toMatch(/fill="#/);
+    // 圆盘 class 只在共享模板里出现一次（注释里另有一处引用不算），四态复用同一外层。
+    const plateCount = (icons.match(/class="account-status-plate"/g) ?? []).length;
+    expect(plateCount).toBe(1);
+    for (const state of ["STATUS_OK_ICON", "STATUS_URGENT_ICON", "STATUS_RENEWAL_ICON", "STATUS_FAILED_ICON"]) {
+      expect(icons).toContain(`export const ${state} = statusBadgeIcon(`);
+    }
+    // 四态图形互不相同：每个导出各带独立 path。
+    const paths = (statusSource.match(/d="M/g) ?? []).length;
+    expect(paths).toBeGreaterThanOrEqual(5);
   });
 });
 

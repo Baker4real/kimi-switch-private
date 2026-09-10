@@ -1,5 +1,6 @@
 import { escapeHtml } from "./escape";
-import { quotaHtml, type QuotaView, type Tone } from "./quota";
+import { CROWN_ICON } from "./icons";
+import { quotaHtml, type QuotaVariant, type QuotaView, type Tone } from "./quota";
 
 export interface MembershipFields {
   membership: string | null;
@@ -111,7 +112,10 @@ function fallbackPeriodDays(membership: string): number | null {
 /** 额度 stack 底部的会员轨道：有档位且有到期日（含剩余天数，0 与负数也算）才画。
  * 填充=已度过比例（朝到期日推进：真实周期来自 currentStartTime 的日历天数，
  * 缺失时按档位近似回退），最后一天走满；不是用量压力，四档 tone 仍按剩余天数。 */
-export function membershipTrackHtml(row: MembershipTrackFields): string {
+export function membershipTrackHtml(
+  row: MembershipTrackFields,
+  variant: QuotaVariant = "card",
+): string {
   if (
     row.membership == null ||
     row.membership_expiry == null ||
@@ -138,6 +142,21 @@ export function membershipTrackHtml(row: MembershipTrackFields): string {
     width == null
       ? ""
       : ` role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(width)}" aria-valuetext="${escapeHtml(sentence)}"`;
+  // hero 变体（总览 #133）：皇冠图标 + 「会员」标签 + 中段进度条，剩余天数与
+  // 到期日在右侧竖排；数值不再压在条上。
+  if (variant === "hero") {
+    return `<div class="quota-row quota-row--hero quota-row--membership">
+        <span class="quota-row-icon" aria-hidden="true">${CROWN_ICON}</span>
+        <span class="quota-label">会员</span>
+        <div class="quota-track"${progressAttrs} title="${escapeHtml(sentence)}" aria-label="${escapeHtml(sentence)}">
+          ${fill}
+        </div>
+        <div class="quota-row-tail">
+          <span class="quota-value">${escapeHtml(badge)}</span>
+          <span class="quota-reset">${escapeHtml(date)}</span>
+        </div>
+      </div>`;
+  }
   return `<div class="quota-row">
         <span class="quota-label">会员</span>
         <div class="quota-track"${progressAttrs} title="${escapeHtml(sentence)}" aria-label="${escapeHtml(sentence)}">
@@ -155,6 +174,7 @@ export function quotaStackHtml(
     cached_at: string | null;
     credential_expired: boolean;
   },
+  variant: QuotaVariant = "card",
 ): string {
-  return `${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired)}${membershipTrackHtml(row)}`;
+  return `${quotaHtml(row.quotas, row.error, row.cached_at, row.credential_expired, variant)}${membershipTrackHtml(row, variant)}`;
 }
