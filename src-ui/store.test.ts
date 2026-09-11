@@ -57,6 +57,27 @@ describe("列表保焦", () => {
     expect(found).toBe("reauth-btn");
   });
 
+  it("从「…」开关读出账号 id（issue #143）", () => {
+    expect(listFocusKey({ overflow: "bob" })).toEqual({
+      action: "overflow",
+      accountId: "bob",
+    });
+  });
+
+  it("重建后优先同一 data-overflow 控件，缺失时回落同卡按钮（issue #143）", () => {
+    const key = listFocusKey({ overflow: "bob" });
+    expect(key).not.toBeNull();
+    const found = pickRestoredFocus(key!, (selector) =>
+      selector.includes('data-overflow="bob"') ? "overflow-btn" : null,
+    );
+    expect(found).toBe("overflow-btn");
+    // 官方昵称补全后「…」整颗消失，焦点仍能回到这张卡的等价控件。
+    const fallback = pickRestoredFocus(key!, (selector) =>
+      selector.includes('data-account="bob"') && selector.includes("button") ? "card-btn" : null,
+    );
+    expect(fallback).toBe("card-btn");
+  });
+
   it("忙碌选择器把每个 data-* 都限定在列表根下", () => {
     const selector = listedActionSelector(["#accounts-list", "#current-plan"]);
     const parts = selector.split(",").map((part) => part.trim());
@@ -65,6 +86,7 @@ describe("列表保焦", () => {
     );
     expect(parts.some((part) => part === "#accounts-list [data-swap]")).toBe(true);
     expect(parts.some((part) => part === "#accounts-list [data-optout]")).toBe(true);
+    expect(parts.some((part) => part === "#accounts-list [data-overflow]")).toBe(true);
     expect(parts.some((part) => part === "#current-plan [data-bind]")).toBe(true);
   });
 

@@ -20,8 +20,10 @@ const productionFiles = [
   "quota.ts",
   "icons.ts",
   "account-status.ts",
+  "auto-swap.ts",
   "store.ts",
   "app-version.ts",
+  "library-card.ts",
   "index.html",
 ] as const;
 
@@ -44,7 +46,7 @@ describe("CONTEXT 术语（issue #86）", () => {
 
   it("账号卡按钮写「重新授权」，不是单独的「授权」", () => {
     const corpus = loadCorpus();
-    expect(corpus).toContain(">重新授权</button>");
+    expect(corpus).toContain("重新授权</button>");
     expect(corpus).not.toContain(">授权</button>");
   });
 
@@ -87,6 +89,17 @@ describe("文案与空态（issue #127）", () => {
     expect(empty).not.toContain("或先在 Kimi Code 登录后点「导入当前账号」");
   });
 
+  it("账号库页眉副标题写收纳与授权，不用效果图营销句", () => {
+    const html = readFileSync(join(dir, "index.html"), "utf8");
+    const library = html.slice(
+      html.indexOf('id="page-library"'),
+      html.indexOf('id="auth-dialog"'),
+    );
+    expect(library).toContain("管理本机收纳的账号，切换与授权都在这里");
+    expect(library).not.toContain("畅享无限可能");
+    expect(html).not.toContain("简单 · 高效");
+  });
+
   it("总览空态按账号数分支，不再写「请先切换」", () => {
     const corpus = loadCorpus();
     expect(corpus).toContain("请先添加或导入");
@@ -98,6 +111,12 @@ describe("文案与空态（issue #127）", () => {
     const corpus = loadCorpus();
     expect(corpus).toContain("凭证已恢复");
     expect(corpus).not.toContain("额度已恢复");
+  });
+
+  it("账号卡开关是「摘出自动切换」，不用效果图的「输出」", () => {
+    const corpus = loadCorpus();
+    expect(corpus).toContain("摘出自动切换");
+    expect(corpus).not.toContain("输出自动切换");
   });
 
   it("授权对话框两个复制按钮语义可区分", () => {

@@ -9,9 +9,9 @@ export function accountDisplayName(
   return trimmed === "" ? id : trimmed;
 }
 
-/** 账号库卡片标题：显示名，当前账号加「 · 当前」。 */
-export function accountCardTitle(row: { display_name: string; active: boolean }): string {
-  return row.active ? `${row.display_name} · 当前` : row.display_name;
+/** 当前账号色片；停泊账号不渲染。 */
+export function currentAccountChipHtml(active: boolean): string {
+  return active ? `<span class="profile-current-chip">当前</span>` : "";
 }
 
 /** 总览当前账号卡头像圆的首字符（issue #133）。
@@ -34,7 +34,30 @@ export function renameButtonHtml(
     return "";
   }
   const disabled = busy ? " disabled" : "";
-  return `<button class="profile-pill" data-rename="${escapeHtml(row.id)}" type="button"${disabled}>重命名</button>`;
+  return `<button class="profile-overflow-item" data-rename="${escapeHtml(row.id)}" type="button"${disabled}>重命名</button>`;
+}
+
+/** 账号卡右上角「…」：只收重命名；官方昵称已知时整颗隐藏。
+ * disclosure 语义：aria-expanded 表开合、aria-label 给名称，
+ * 菜单项是普通按钮留在 Tab 序里，不声明 menu 键盘契约。 */
+export function renameOverflowHtml(
+  row: { id: string; official_nickname_known: boolean },
+  busy: boolean,
+): string {
+  const item = renameButtonHtml(row, busy);
+  if (item === "") {
+    return "";
+  }
+  const id = escapeHtml(row.id);
+  const disabled = busy ? " disabled" : "";
+  return `<div class="profile-overflow">
+    <button class="profile-overflow-toggle" type="button" data-overflow="${id}" aria-expanded="false" aria-label="更多操作"${disabled}>
+      <span class="profile-overflow-dots" aria-hidden="true"></span>
+    </button>
+    <div class="profile-overflow-menu" hidden>
+      ${item}
+    </div>
+  </div>`;
 }
 
 export type DeviceAuthPhase = "fetching-link" | "waiting-browser";

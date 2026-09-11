@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  accountCardTitle,
   accountDisplayName,
+  currentAccountChipHtml,
   deviceAuthBusyLabel,
   displayInitial,
   parseAliasInput,
   renameButtonHtml,
+  renameOverflowHtml,
   showRenameButton,
 } from "./labels";
 
@@ -40,10 +41,11 @@ describe("accountDisplayName", () => {
   });
 });
 
-describe("accountCardTitle", () => {
-  it("卡片标题用显示名，当前账号加标记", () => {
-    expect(accountCardTitle({ display_name: "Forever", active: false })).toBe("Forever");
-    expect(accountCardTitle({ display_name: "Forever", active: true })).toBe("Forever · 当前");
+describe("currentAccountChipHtml", () => {
+  it("当前账号渲染色片，停泊账号不渲染", () => {
+    expect(currentAccountChipHtml(true)).toContain("profile-current-chip");
+    expect(currentAccountChipHtml(true)).toContain("当前");
+    expect(currentAccountChipHtml(false)).toBe("");
   });
 });
 
@@ -63,6 +65,39 @@ describe("rename button visibility", () => {
     expect(
       renameButtonHtml({ id: "acc-1", official_nickname_known: false }, false),
     ).toContain(">重命名</button>");
+    // disclosure 语义：菜单项是普通按钮，不挂 menu 角色。
+    expect(
+      renameButtonHtml({ id: "acc-1", official_nickname_known: false }, false),
+    ).not.toContain('role="menuitem"');
+  });
+});
+
+describe("renameOverflowHtml", () => {
+  it("官方昵称已知时整颗「…」隐藏", () => {
+    expect(renameOverflowHtml({ id: "acc-1", official_nickname_known: true }, false)).toBe("");
+  });
+
+  it("官方昵称未知时「…」只收重命名", () => {
+    const html = renameOverflowHtml({ id: "acc-1", official_nickname_known: false }, false);
+    expect(html).toContain('data-overflow="acc-1"');
+    expect(html).toContain('aria-label="更多操作"');
+    expect(html).toContain('data-rename="acc-1"');
+    expect(html).toContain("重命名");
+    // disclosure 语义：只有开合状态与名称，不声明 menu 键盘契约。
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).not.toContain('role="menu"');
+    expect(html).not.toContain('aria-haspopup="menu"');
+    // 切换 / 重新授权 / 删除 / 绑定都不进菜单。
+    expect(html).not.toContain("data-swap");
+    expect(html).not.toContain("data-reauth");
+    expect(html).not.toContain("data-delete");
+    expect(html).not.toContain("data-bind");
+  });
+
+  it("忙碌时「…」开关与菜单项一并禁用", () => {
+    const html = renameOverflowHtml({ id: "acc-1", official_nickname_known: false }, true);
+    expect(html).toMatch(/data-overflow="acc-1"[^>]* disabled/);
+    expect(html).toMatch(/data-rename="acc-1"[^>]* disabled/);
   });
 });
 

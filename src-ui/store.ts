@@ -47,7 +47,7 @@ export function overviewCurrentEmptyCopy(accountCount: number): string {
 }
 
 /** 账号库卡片上的操作 data-*，忙碌时只改这些按钮的 disabled。 */
-export type ListActionAttr = "swap" | "reauth" | "rename" | "delete" | "bind" | "optout";
+export type ListActionAttr = "swap" | "reauth" | "rename" | "delete" | "bind" | "optout" | "overflow";
 
 export interface ListFocusKey {
   action: ListActionAttr | null;
@@ -61,6 +61,7 @@ const LIST_ACTION_ATTRS: ListActionAttr[] = [
   "delete",
   "bind",
   "optout",
+  "overflow",
 ];
 
 /** 把 data-* 选择器限定在给定根下，避免逗号选择器漏出作用域。 */
@@ -83,6 +84,7 @@ export function listFocusKey(
     delete?: string;
     bind?: string;
     optout?: string;
+    overflow?: string;
   },
   accountId?: string,
 ): ListFocusKey | null {

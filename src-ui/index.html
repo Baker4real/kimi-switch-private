@@ -193,24 +193,53 @@
         <section class="page" id="page-library">
           <div class="profiles-stage">
             <div class="profiles-header">
-              <h2 class="section-title">账号库</h2>
+              <div class="profiles-header-copy">
+                <span class="profiles-header-mark" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                    <ellipse cx="12" cy="6.4" rx="7.2" ry="3" />
+                    <path d="M4.8 6.4v5.4c0 1.66 3.22 3 7.2 3s7.2-1.34 7.2-3V6.4" />
+                    <path d="M4.8 11.8v5.4c0 1.66 3.22 3 7.2 3s7.2-1.34 7.2-3v-5.4" />
+                  </svg>
+                </span>
+                <div class="profiles-header-text">
+                  <h2 class="section-title">账号库</h2>
+                  <p class="profiles-header-subtitle">管理本机收纳的账号，切换与授权都在这里</p>
+                </div>
+              </div>
               <div class="profiles-header-actions">
                 <button id="library-refresh-button" class="action-button" type="button" title="重新拉取全部账号的额度">
+                  <svg class="action-button-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                    <path d="M19.6 12a7.6 7.6 0 1 1-2.2-5.4" />
+                    <path d="M19.9 4.4v4.4h-4.4" />
+                    <path d="M4.4 12a7.6 7.6 0 0 1 2.2-5.4" />
+                    <path d="M4.1 19.6v-4.4h4.4" />
+                  </svg>
                   刷新
                 </button>
                 <button id="library-add-button" class="action-button action-button-primary" type="button">
+                  <svg class="action-button-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true" focusable="false">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
                   添加账号
                 </button>
               </div>
             </div>
             <section class="behavior-panel" aria-labelledby="behavior-panel-title">
               <div class="settings-disclosure-block">
-                <h3 class="behavior-panel-title" id="behavior-panel-title">
-                  <button id="behavior-panel-toggle" class="settings-disclosure" type="button" aria-expanded="false" aria-controls="behavior-panel-body">
-                    <span>账号行为</span>
-                    <span class="settings-disclosure-caret" aria-hidden="true"></span>
-                  </button>
-                </h3>
+                <div class="behavior-panel-head">
+                  <span class="behavior-panel-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" focusable="false">
+                      <path fill="currentColor" d="M10.15 5.56L9.16 2.1L14.84 2.1L13.85 5.56L15.25 6.14L16.99 2.99L21.01 7.01L17.86 8.75L18.44 10.15L21.9 9.16L21.9 14.84L18.44 13.85L17.86 15.25L21.01 16.99L16.99 21.01L15.25 17.86L13.85 18.44L14.84 21.9L9.16 21.9L10.15 18.44L8.75 17.86L7.01 21.01L2.99 16.99L6.14 15.25L5.56 13.85L2.1 14.84L2.1 9.16L5.56 10.15L6.14 8.75L2.99 7.01L7.01 2.99L8.75 6.14Z" />
+                      <circle cx="12" cy="12" r="3.7" style="fill: var(--tone-total-tint)" />
+                    </svg>
+                  </span>
+                  <h3 class="behavior-panel-title" id="behavior-panel-title">
+                    <button id="behavior-panel-toggle" class="settings-disclosure" type="button" aria-expanded="false" aria-controls="behavior-panel-body">
+                      <span>账号行为</span>
+                      <span class="settings-disclosure-caret" aria-hidden="true"></span>
+                    </button>
+                  </h3>
+                </div>
                 <p id="behavior-panel-status" class="settings-note settings-disclosure-status hidden"></p>
               </div>
               <div id="behavior-panel-body" class="hidden">

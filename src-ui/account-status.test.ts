@@ -8,6 +8,7 @@ import {
   accountStatusBodyHtml,
   accountStatusView,
   isQuotaUrgent,
+  libraryCredentialRenewalHtml,
   URGENT_USED_RATIO,
   type AccountStatusFields,
 } from "./account-status";
@@ -243,5 +244,15 @@ describe("accountStatusBodyHtml", () => {
     expect(html).toContain(`&lt;b&gt;x&lt;/b&gt;`);
     expect(html).toContain(`a&amp;b`);
     expect(html).not.toContain(`<b>x</b>`);
+  });
+});
+
+describe("libraryCredentialRenewalHtml", () => {
+  it("复用凭证待续期文案，外层不是总览「账号状态」横幅", () => {
+    const html = libraryCredentialRenewalHtml();
+    expect(html).toContain("profile-renewal-banner");
+    expect(html).toContain("凭证待续期");
+    expect(html).toContain("在 Kimi CLI 里发条消息即可恢复，或重新授权");
+    expect(html).not.toContain("account-status-banner");
   });
 });

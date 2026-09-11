@@ -3,13 +3,13 @@ import "./styles.css";
 import { api, commandError, type Snapshot } from "./api";
 import { accountStatusBodyHtml, accountStatusView } from "./account-status";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
-import { escapeHtml } from "./escape";
-import { accountCardTitle, accountDisplayName, displayInitial, parseAliasInput, renameButtonHtml } from "./labels";
+import { accountDisplayName, displayInitial, parseAliasInput } from "./labels";
+import { accountCardHtml } from "./library-card";
+import { applyOverflowMenuState, nextOverflowOpenId } from "./overflow-menu";
 import { credentialRecoveredToast } from "./credentialToast";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
 import {
-  autoSwapOptOutSwitchHtml,
   autoSwapPreferLowerTierSwitchView,
   autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
@@ -18,7 +18,6 @@ import {
 import { createSilentQuotaScheduler } from "./silent-quota";
 import { renewalSwitchView } from "./renewal";
 import {
-  accountFocusAttr,
   controlDisabledByBusy,
   createAppStore,
   listedActionSelector,
@@ -423,47 +422,11 @@ function setOverviewLoadError(visible: boolean): void {
   required<HTMLElement>("overview-dashboard").classList.toggle("hidden", visible);
 }
 
-function cardActionButtons(row: Snapshot["accounts"][number], busy: boolean): string {
-  const disabled = busy ? " disabled" : "";
-  const reauth = `<button class="profile-pill" data-reauth="${escapeHtml(row.id)}" type="button" title="给这张卡重新走浏览器授权"${disabled}>重新授权</button>`;
-  const rename = renameButtonHtml(row, busy);
-  const remove = `<button class="profile-pill profile-pill--danger" data-delete="${escapeHtml(row.id)}" type="button"${disabled}>删除</button>`;
-  const renameGap = rename ? `\n           ${rename}` : "";
-  if (row.active) {
-    return `${reauth}${renameGap}
-           ${remove}`;
-  }
-  return `<button class="profile-pill" data-swap="${escapeHtml(row.id)}" type="button"${disabled}>切换</button>
-           ${reauth}${renameGap}
-           ${remove}`;
-}
-
 function paintAccountCards(next: Snapshot): void {
   const list = required<HTMLDivElement>("accounts-list");
   const empty = required<HTMLDivElement>("accounts-empty");
   empty.classList.toggle("hidden", next.accounts.length > 0);
-  list.innerHTML = next.accounts
-    .map((row) => {
-      return `<article class="profile-card${row.active ? " is-current" : ""}" ${accountFocusAttr(row.id)}>
-        <div class="profile-identity">
-          <span class="profile-avatar" aria-hidden="true">${escapeHtml(displayInitial(row.display_name))}</span>
-          <div class="profile-identity-copy">
-            <div class="profile-title-wrap">
-              <span class="profile-title">${escapeHtml(accountCardTitle(row))}</span>
-              <span class="profile-plan">${membershipPlanHtml(row) ?? ""}${bindWebButtonHtml(row, false)}</span>
-            </div>
-            <span class="profile-updated">${row.credential_expired ? "凭证待续期" : row.active ? "当前使用中" : "已加入账号库"}</span>
-            ${autoSwapOptOutSwitchHtml(row, false)}
-          </div>
-        </div>
-        <div class="profile-quota-block">
-          <span class="profile-quota-heading">额度使用情况</span>
-          <div class="profile-quota-stack">${quotaStackHtml(row)}</div>
-        </div>
-        <div class="profile-card-actions">${cardActionButtons(row, false)}</div>
-      </article>`;
-    })
-    .join("");
+  list.innerHTML = next.accounts.map((row) => accountCardHtml(row, false)).join("");
 }
 
 /** 总览当前账号档位行：绑定入口与账号卡同一规则（issue #51），busy 时同样
@@ -559,6 +522,10 @@ function syncBusyChrome(): void {
 }
 
 function setBusy(next: boolean, label?: string): void {
+  // 忙碌开始的瞬间收起已展开的「…」菜单：开关与菜单项随即禁用，展开态不再有意义。
+  if (next && store.get().busy !== next) {
+    closeOverflowMenus();
+  }
   if (next) {
     rememberListFocus();
   }
@@ -922,10 +889,66 @@ function wireDialogs(): void {
   });
 }
 
+function overflowToggles(): NodeListOf<HTMLButtonElement> {
+  return document.querySelectorAll<HTMLButtonElement>("[data-overflow]");
+}
+
+/** 当前展开的「…」开关账号 id；aria-expanded 是唯一事实来源。 */
+function currentOverflowOpenId(): string | null {
+  const open = document.querySelector<HTMLButtonElement>(
+    "[data-overflow][aria-expanded='true']",
+  );
+  return open?.dataset.overflow ?? null;
+}
+
+/** 全收起：aria-expanded 归 false、菜单 hidden；Escape / 外点 / 菜单项触发共用。 */
+function closeOverflowMenus(): void {
+  for (const toggle of overflowToggles()) {
+    applyOverflowMenuState(toggle, false);
+  }
+}
+
+/** 点「…」开关：开合与互斥由状态机裁决，这里只做 DOM 应用。 */
+function toggleOverflowMenu(toggle: HTMLButtonElement): void {
+  const id = toggle.dataset.overflow;
+  if (!id) {
+    return;
+  }
+  const next = nextOverflowOpenId("toggle", id, currentOverflowOpenId());
+  closeOverflowMenus();
+  if (next !== null) {
+    applyOverflowMenuState(toggle, true);
+  }
+}
+
+function wireOverflowDismiss(): void {
+  document.addEventListener("click", (event) => {
+    const target = event.target;
+    if (target instanceof Element && target.closest(".profile-overflow")) {
+      return;
+    }
+    // 外点等价状态机的 dismiss 事件：归 null，全收起。
+    closeOverflowMenus();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      // Escape 等价状态机的 dismiss 事件：归 null，全收起。
+      closeOverflowMenus();
+    }
+  });
+}
+
 function wireList(): void {
   required<HTMLDivElement>("accounts-list").addEventListener("click", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const overflow = target.closest<HTMLButtonElement>("[data-overflow]");
+    if (overflow) {
+      // 菜单项是开关的兄弟节点，走到这里必然是点开关本身。
+      event.stopPropagation();
+      toggleOverflowMenu(overflow);
       return;
     }
     const swap = target.closest<HTMLElement>("[data-swap]");
@@ -965,6 +988,7 @@ function wireList(): void {
       return;
     }
     if (rename?.dataset.rename) {
+      closeOverflowMenus();
       renameId = rename.dataset.rename;
       const row = store.get().snapshot?.accounts.find((item) => item.id === renameId);
       const display = accountDisplayName(row, renameId);
@@ -1098,6 +1122,7 @@ async function init(): Promise<void> {
 
   wireDialogs();
   wireList();
+  wireOverflowDismiss();
   // 总览当前账号档位行的绑定入口（issue #51）：与账号卡同一对话框。
   required<HTMLParagraphElement>("current-plan").addEventListener("click", (event) => {
     const target = event.target;

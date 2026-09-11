@@ -334,6 +334,39 @@ describe("账号状态汇总条对比度（issue #134）", () => {
   });
 });
 
+describe("账号库凭证待续期奶油提示条对比度（issue #142）", () => {
+  it("提示条绑定总览续期态同一组 status-warn token，不另立色值", () => {
+    // 与 #141 同一测法：直接从规则块提取引用，防止条底被改成未测比值的颜色。
+    const banner = /(^|\n)\.profile-renewal-banner\s*\{[^}]*\}/.exec(css)?.[0] ?? "";
+    expect(banner).toContain("background: var(--status-warn-bg)");
+    expect(banner).toContain("color: var(--status-warn-title)");
+    const detail =
+      /\.profile-renewal-banner \.account-status-detail\s*\{[^}]*\}/.exec(css)?.[0] ?? "";
+    expect(detail).toContain("color: var(--status-warn-detail)");
+  });
+
+  it("标题与说明对奶油底 ≥ 4.5:1，白色图形对状态色圆盘 ≥ 4.5:1", () => {
+    const bg = parseColor(tokens["status-warn-bg"]);
+    const plate = parseColor(tokens["status-warn-title"]);
+    const glyph = parseColor(tokens["text-inverse"]);
+    const pairs = [
+      { fg: parseColor(tokens["status-warn-title"]), bg, label: "标题 / 奶油底" },
+      { fg: parseColor(tokens["status-warn-detail"]), bg, label: "说明 / 奶油底" },
+      { fg: glyph, bg: plate, label: "白色图形 / 状态色圆盘" },
+    ];
+    const report: string[] = [];
+    for (const pair of pairs) {
+      const ratio = contrastRatio(pair.fg, pair.bg);
+      report.push(`${pair.label}: ${ratio.toFixed(2)}:1`);
+      expect(
+        ratio,
+        `${pair.label} 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(report).toHaveLength(pairs.length);
+  });
+});
+
 describe("总览新按钮与金徽章对比度（issue #133）", () => {
   it("蓝色渐变主按钮的每一档 stop 上白字均 ≥ 4.5:1", () => {
     const surfaces = opaqueSurfaces(tokens, "control-primary-background");
@@ -360,6 +393,63 @@ describe("总览新按钮与金徽章对比度（issue #133）", () => {
       ratio,
       `badge-gold-text 对 badge-gold-background 应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
     ).toBeGreaterThanOrEqual(4.5);
+  });
+});
+
+describe("账号卡身份区头像与色片对比度（issue #141）", () => {
+  it("头像字对头像底 ≥ 4.5:1：当前蓝 / 停泊暖橙的指定纯色，不用绿", () => {
+    // 指定纯色：当前=主色系蓝（字用主色渐变深档）、停泊=暖橙，沿用 #128 的指定色测法。
+    expect(tokens["profile-avatar-current-background"]).toBe("#e4edfe");
+    expect(tokens["profile-avatar-current-text"]).toBe("#1f5ae0");
+    expect(tokens["profile-avatar-parked-background"]).toBe("#fdebd8");
+    expect(tokens["profile-avatar-parked-text"]).toBe("#9a3412");
+    const pairs = [
+      {
+        fg: "profile-avatar-current-text",
+        bg: "profile-avatar-current-background",
+        label: "当前头像字",
+      },
+      {
+        fg: "profile-avatar-parked-text",
+        bg: "profile-avatar-parked-background",
+        label: "停泊头像字",
+      },
+    ] as const;
+    const report: string[] = [];
+    for (const pair of pairs) {
+      const ratio = contrastRatio(parseColor(tokens[pair.fg]), parseColor(tokens[pair.bg]));
+      report.push(`${pair.label}: ${ratio.toFixed(2)}:1`);
+      expect(
+        ratio,
+        `${pair.label} 对头像底应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(report).toHaveLength(pairs.length);
+  });
+
+  it("「当前」色片字对色片底 ≥ 4.5:1，且与当前头像共用同一对 token 不漂移", () => {
+    const ratio = contrastRatio(
+      parseColor(tokens["profile-avatar-current-text"]),
+      parseColor(tokens["profile-avatar-current-background"]),
+    );
+    expect(
+      ratio,
+      `色片字对色片底应为 ≥ 4.5:1，实际 ${ratio.toFixed(2)}:1`,
+    ).toBeGreaterThanOrEqual(4.5);
+    // 色片与当前头像引用同一对 token：一方调色时另一方不会掉出守卫。
+    const chip = /(^|\n)\.profile-current-chip\s*\{[^}]*\}/.exec(css)?.[0] ?? "";
+    expect(chip).toContain("var(--profile-avatar-current-background)");
+    expect(chip).toContain("var(--profile-avatar-current-text)");
+  });
+
+  it("头像圆默认停泊暖橙对，当前卡变体切蓝对", () => {
+    const avatar = /(^|\n)\.profile-avatar\s*\{[^}]*\}/.exec(css)?.[0] ?? "";
+    expect(avatar).toContain("var(--profile-avatar-parked-background)");
+    expect(avatar).toContain("var(--profile-avatar-parked-text)");
+    const currentAvatar =
+      /(^|\n)\.profile-card\.is-current \.profile-avatar\s*\{[^}]*\}/.exec(css)?.[0] ?? "";
+    expect(currentAvatar).toContain("var(--profile-avatar-current-background)");
+    expect(currentAvatar).toContain("var(--profile-avatar-current-text)");
   });
 });
 

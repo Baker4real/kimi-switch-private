@@ -2,7 +2,7 @@
  *
  * 行图标统一 24×24 viewBox、`currentColor` 描边，颜色由使用处的 CSS 决定；
  * 静态卡片的图标（徽标、统计卡、操作卡）直接写在 index.html 里，此处只放
- * 需要按数据动态选择的图标（用量窗口、会员轨道、更新时间）。 */
+ * 需要按数据动态选择的图标（用量窗口、会员轨道、更新时间、账号库卡片操作）。 */
 /** 额度行图标统一描边；`currentColor` 由使用处的 CSS 决定颜色。 */
 const STROKE_ATTRS =
   'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"';
@@ -21,7 +21,22 @@ export const CLOCK_ICON = svg(`<circle cx="12" cy="12" r="8.6"/><path d="M12 7.2
 
 /** 循环箭头：额度快照「更新于」时间行；操作卡的「刷新」按钮另有同形图标。 */
 export const REFRESH_ICON = svg(
-  `<path d="M20.2 12a8.2 8.2 0 0 1-14 5.8"/><path d="M3.8 12a8.2 8.2 0 0 1 14-5.8"/><path d="M20.2 4.4V9.4h-5M3.8 19.6v-5h5"/>`,
+  `<path d="M20.2 12a8.2 8.2 0 1 1-14 5.8"/><path d="M3.8 12a8.2 8.2 0 0 1 14-5.8"/><path d="M20.2 4.4V9.4h-5M3.8 19.6v-5h5"/>`,
+);
+
+/** 账号库卡片「切换」：双向箭头。 */
+export const SWAP_ICON = svg(
+  `<path d="M4.2 9.4h11.6"/><path d="M15.9 6.1 19.6 9.4 15.9 12.7"/><path d="M19.8 14.6H8.2"/><path d="M8.1 11.3 4.4 14.6 8.1 17.9"/>`,
+);
+
+/** 账号库卡片「重新授权」：钥匙。 */
+export const KEY_ICON = svg(
+  `<circle cx="8.4" cy="12" r="4.2"/><path d="M12.2 12h8.2v3.2"/><path d="M17.4 12v2.2"/>`,
+);
+
+/** 账号库卡片「删除」：垃圾桶。 */
+export const TRASH_ICON = svg(
+  `<path d="M5.2 7.2h13.6"/><path d="M9.2 7.2V5.4h5.6v1.8"/><path d="M7.4 7.2 8.2 19.2h7.6L16.6 7.2"/>`,
 );
 
 /** 仪表盘：未知窗口的兜底图标。 */

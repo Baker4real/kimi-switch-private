@@ -117,3 +117,8 @@ export function accountStatusBodyHtml(view: AccountStatusView): string {
           <span class="account-status-detail">${escapeHtml(view.detail)}</span>
         </p>`;
 }
+
+/** 账号库卡片上的凭证待续期提示条：复用同一文案与图标，不把「账号状态」扩到账号库。 */
+export function libraryCredentialRenewalHtml(): string {
+  return `<div class="profile-renewal-banner">${accountStatusBodyHtml(VIEWS.renewal)}</div>`;
+}
