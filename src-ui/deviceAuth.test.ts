@@ -19,6 +19,7 @@ function sampleSnapshot(): Snapshot {
     auto_swap: false,
     auto_swap_prefer_lower_tier: false,
     auto_swap_resident_lower_tier: false,
+    auto_swap_pre_reset_burn: false,
     message: { text: "授权成功，已添加账号 u1", tone: "ok", kind: "generic" },
   };
 }

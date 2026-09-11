@@ -1,4 +1,4 @@
-//! 额度耗尽自动切换、pace 预切换与回驻：纯决策 + 上次切换时刻 / 手动保持期 / 回驻确认计数的可丢弃状态。
+//! 额度耗尽自动切换、pace 预切换、重置前抢用与回驻：纯决策 + 上次切换时刻 / 手动保持期 / 回驻确认计数 / 抢用往返记忆的可丢弃状态。
 //!
 //! 决策函数无 IO、无网络；状态文件读写失败静默忽略。
 
@@ -43,6 +43,10 @@ pub enum AutoSwapKind {
     Exhausted,
     /// pace 预切换（issue #114）：未达耗尽阈值，但预测撑不到 reset。
     Pace,
+    /// 重置前抢用（issue #147）：未达耗尽、pace 未命中，切到临近重置且该窗口已用超水位的停泊账号。
+    Burn,
+    /// 抢用回程（issue #148）：往返记忆命中后切回原账号。
+    BurnReturn,
 }
 
 /// 切到哪个账号，以及触发判定用的窗口。
@@ -50,12 +54,26 @@ pub enum AutoSwapKind {
 pub struct AutoSwapTarget {
     pub from: AccountId,
     pub to: AccountId,
-    /// 当前账号达到阈值的窗口中，已用比例最高者；pace 路径则为 pace>1 中最高者。
+    /// 当前账号达到阈值的窗口中，已用比例最高者；pace 路径则为 pace>1 中最高者；
+    /// 抢用路径则为目标停泊账号上触发抢用的临近窗口；回程则为耗尽窗口或记忆中的目标窗口。
     pub trigger_window: QuotaWindow,
     /// 该窗口已用比例 0.0~1.0。
     pub usage_ratio: f64,
-    /// 耗尽或 pace。审计 / JSON 用此区分路径。
+    /// 耗尽、pace、抢用或抢用回程。审计 / JSON 用此区分路径。
     pub kind: AutoSwapKind,
+}
+
+/// 重置前抢用的往返记忆（issue #148）：抢用成功后写入，回程或用户接管后清除。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BurnTrip {
+    /// 抢用前的原账号。
+    pub origin: AccountId,
+    /// 燃烧目标账号。
+    pub target: AccountId,
+    /// 触发抢用的目标窗口。
+    pub window: QuotaWindow,
+    /// 写入记忆时该窗口的 `reset_at`。
+    pub reset_at: DateTime<Utc>,
 }
 
 /// 自动切换判定结果。
@@ -71,12 +89,41 @@ pub enum AutoSwapDecision {
 /// 已达 `threshold` 走耗尽路径（[`AutoSwapKind::Exhausted`]）。未达阈值时，若开启
 /// [`AutoSwap::pace_pre_swap`] 且当前账号预测撑不到 reset、候选更健康，则返回
 /// `Swap` 且 [`AutoSwapTarget::kind`] 为 [`AutoSwapKind::Pace`]。pace 不抢占耗尽。
+/// 耗尽与 pace 都未命中时，若开启 [`AutoSwap::pre_reset_burn`]，合格停泊账号临近重置
+/// 且该窗口已用超过水位，则返回 `Swap` 且 kind 为 [`AutoSwapKind::Burn`]。
+/// 抢用候选不适用防抖边际。
+///
+/// 往返记忆存在且当前账号就是燃烧目标时，先评估回程（issue #148）：目标窗口
+/// `reset_at` 翻过记录值，或当前任一窗口达耗尽阈值，则尝试切回原账号，kind 为
+/// [`AutoSwapKind::BurnReturn`]。目的地锁定原账号，不重新排序。原账号不合格时
+/// 清掉 `trip` 并 Stay。冷却与安顿宽限仍挡住回程。
+/// 记忆存续期间不评估 pace（issue #149），只留耗尽与回程；无记忆时行为与原先一致。
 pub fn decide_auto_swap(
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
+) -> AutoSwapDecision {
+    let mut trip = None;
+    decide_auto_swap_with_trip(
+        accounts,
+        snapshots,
+        settings,
+        now,
+        last_auto_swap_at,
+        &mut trip,
+    )
+}
+
+/// 带往返记忆的自动切换判定。回程命中但原账号不合格时把 `trip` 置 `None`。
+fn decide_auto_swap_with_trip(
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+    last_auto_swap_at: Option<DateTime<Utc>>,
+    trip: &mut Option<BurnTrip>,
 ) -> AutoSwapDecision {
     if !settings.enabled {
         return stay(AutoSwapSkipReason::Disabled);
@@ -100,15 +147,28 @@ pub fn decide_auto_swap(
     let Some(current_quotas) = usable_quotas(current_snap) else {
         return stay(AutoSwapSkipReason::CurrentUnavailable);
     };
+
+    if let Some(decision) =
+        decide_burn_return(current, current_quotas, accounts, snapshots, settings, trip)
+    {
+        return decision;
+    }
+
     let Some((trigger_window, usage_ratio)) = trigger_window(current_quotas, settings.threshold)
     else {
         if known_ratios(current_quotas).is_empty() {
             return stay(AutoSwapSkipReason::CurrentUnknown);
         }
-        if let Some(target) =
-            decide_pace_swap(current, current_quotas, accounts, snapshots, settings, now)
-        {
-            return AutoSwapDecision::Swap(target);
+        // issue #149：往返记忆存续期间不评估 pace 与新抢用，只留耗尽与回程。
+        if trip.is_none() {
+            if let Some(target) =
+                decide_pace_swap(current, current_quotas, accounts, snapshots, settings, now)
+            {
+                return AutoSwapDecision::Swap(target);
+            }
+            if let Some(target) = decide_burn_swap(current, accounts, snapshots, settings, now) {
+                return AutoSwapDecision::Swap(target);
+            }
         }
         return stay(AutoSwapSkipReason::BelowThreshold);
     };
@@ -151,6 +211,162 @@ fn decide_pace_swap(
         usage_ratio,
         kind: AutoSwapKind::Pace,
     })
+}
+
+/// 未达耗尽、pace 未命中时的重置前抢用。子开关关、无临近超水位窗口、或没有合格
+/// 停泊候选时返回 `None`（调用方仍报 [`AutoSwapSkipReason::BelowThreshold`]）。
+/// 候选过既有合格线，但不走 [`beats_current_by_margin`]。
+fn decide_burn_swap(
+    current: &Account,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+) -> Option<AutoSwapTarget> {
+    if !settings.pre_reset_burn {
+        return None;
+    }
+    let (best, trigger_window, usage_ratio) =
+        pick_best_burn_candidate(accounts, snapshots, current, settings, now)?;
+    Some(AutoSwapTarget {
+        from: current.id.clone(),
+        to: best.id.clone(),
+        trigger_window,
+        usage_ratio,
+        kind: AutoSwapKind::Burn,
+    })
+}
+
+/// 记忆存在且当前账号是燃烧目标时评估回程。未到期返回 `None`（继续耗尽；
+/// pace 与新抢用由调用方在记忆存续时跳过，issue #149）。到期但原账号不合格则清 `trip` 并 Stay。
+fn decide_burn_return(
+    current: &Account,
+    current_quotas: &[Quota],
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    trip: &mut Option<BurnTrip>,
+) -> Option<AutoSwapDecision> {
+    let existing = trip.as_ref()?;
+    if current.id != existing.target {
+        return None;
+    }
+    if !burn_return_due(current_quotas, existing, settings.threshold) {
+        return None;
+    }
+    match burn_return_swap(
+        current,
+        current_quotas,
+        accounts,
+        snapshots,
+        settings,
+        existing,
+    ) {
+        Some(target) => Some(AutoSwapDecision::Swap(target)),
+        None => {
+            *trip = None;
+            Some(stay(AutoSwapSkipReason::BelowThreshold))
+        }
+    }
+}
+
+/// 目标窗口 `reset_at` 比记忆值更晚，或当前任一已知窗口已达耗尽阈值。缺 `reset_at` 不当作翻过。
+fn burn_return_due(quotas: &[Quota], trip: &BurnTrip, threshold: f64) -> bool {
+    let flipped = quotas
+        .iter()
+        .find(|quota| quota.window == trip.window)
+        .and_then(|quota| quota.reset_at)
+        .is_some_and(|reset_at| reset_at > trip.reset_at);
+    flipped || trigger_window(quotas, threshold).is_some()
+}
+
+/// 原账号按停泊候选合格线（快照可用、未摘出、所有已知窗口 < threshold）。不适用防抖边际。
+fn burn_return_swap(
+    current: &Account,
+    current_quotas: &[Quota],
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    trip: &BurnTrip,
+) -> Option<AutoSwapTarget> {
+    let origin = eligible_return_origin(
+        accounts,
+        snapshots,
+        &trip.origin,
+        &current.id,
+        settings.threshold,
+    )?;
+    let (trigger_window, usage_ratio) = trigger_window(current_quotas, settings.threshold)
+        .unwrap_or_else(|| {
+            let usage = current_quotas
+                .iter()
+                .find(|quota| quota.window == trip.window)
+                .and_then(|quota| quota.usage_ratio())
+                .unwrap_or(0.0);
+            (trip.window, usage)
+        });
+    Some(AutoSwapTarget {
+        from: current.id.clone(),
+        to: origin.id.clone(),
+        trigger_window,
+        usage_ratio,
+        kind: AutoSwapKind::BurnReturn,
+    })
+}
+
+fn eligible_return_origin<'a>(
+    accounts: &'a [Account],
+    snapshots: &'a [QuotaSnapshot],
+    origin_id: &AccountId,
+    current_id: &AccountId,
+    threshold: f64,
+) -> Option<&'a Account> {
+    if origin_id == current_id {
+        return None;
+    }
+    let account = accounts.iter().find(|account| account.id == *origin_id)?;
+    if account_auto_swap_opt_out(account) {
+        return None;
+    }
+    let snap = snapshot_of(snapshots, &account.id)?;
+    let quotas = usable_quotas(snap)?;
+    if !is_eligible_candidate(quotas, threshold) {
+        return None;
+    }
+    Some(account)
+}
+
+fn pick_best_burn_candidate<'a>(
+    accounts: &'a [Account],
+    snapshots: &'a [QuotaSnapshot],
+    current: &Account,
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+) -> Option<(&'a Account, QuotaWindow, f64)> {
+    let mut eligible: Vec<(&Account, &[Quota], QuotaWindow, f64)> = accounts
+        .iter()
+        .filter(|account| account.id != current.id)
+        .filter(|account| !account_auto_swap_opt_out(account))
+        .filter_map(|account| {
+            let snap = snapshot_of(snapshots, &account.id)?;
+            let quotas = usable_quotas(snap)?;
+            if !is_eligible_candidate(quotas, settings.threshold) {
+                return None;
+            }
+            let (window, usage) = burn_trigger(quotas, settings, now)?;
+            Some((account, quotas, window, usage))
+        })
+        .collect();
+
+    if eligible.is_empty() {
+        return None;
+    }
+
+    eligible.sort_by(|(a, aq, _, _), (b, bq, _, _)| {
+        compare_candidates(a, aq, None, b, bq, None, false, true)
+    });
+    let (account, _, window, usage) = eligible[0];
+    Some((account, window, usage))
 }
 
 fn pick_best_eligible<'a>(
@@ -379,6 +595,62 @@ fn candidate_max_ratio(quotas: &[Quota]) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
+/// 仅 5h / 7d 有临近窗口；`Month` / `Custom` 等不参与抢用。
+fn burn_near_ms(window: QuotaWindow, settings: &AutoSwap) -> Option<i64> {
+    match window {
+        QuotaWindow::FiveHour => Some(settings.pre_reset_burn_near_5h_ms),
+        QuotaWindow::SevenDay => Some(settings.pre_reset_burn_near_7d_ms),
+        QuotaWindow::Month
+        | QuotaWindow::FirstPartyModels
+        | QuotaWindow::Api
+        | QuotaWindow::Custom => None,
+    }
+}
+
+/// 该窗口是否临近重置且已用超过抢用水位。只用 `reset_at − now`，不推窗口起点。
+fn burn_window(
+    quota: &Quota,
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+) -> Option<(QuotaWindow, f64, DateTime<Utc>)> {
+    let near_ms = burn_near_ms(quota.window, settings)?;
+    let reset_at = quota.reset_at?;
+    let usage = quota.usage_ratio()?;
+    if usage <= settings.pre_reset_burn_min_ratio {
+        return None;
+    }
+    if now >= reset_at {
+        return None;
+    }
+    let remaining = reset_at - now;
+    if remaining > chrono::Duration::milliseconds(near_ms) {
+        return None;
+    }
+    Some((quota.window, usage, reset_at))
+}
+
+/// 参与抢用的窗口中取最早 `reset_at` 者；并列保留先见到的。
+fn burn_trigger(
+    quotas: &[Quota],
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+) -> Option<(QuotaWindow, f64)> {
+    let mut best: Option<(QuotaWindow, f64, DateTime<Utc>)> = None;
+    for quota in quotas {
+        let Some((window, usage, reset_at)) = burn_window(quota, settings, now) else {
+            continue;
+        };
+        match best {
+            None => best = Some((window, usage, reset_at)),
+            Some((_, _, best_reset)) if reset_at < best_reset => {
+                best = Some((window, usage, reset_at));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(window, usage, _)| (window, usage))
+}
+
 /// 仅 5h / 7d 有已知窗口时长；`Month` / `Custom` 等不参与 pace。
 fn known_window_duration(window: QuotaWindow) -> Option<chrono::Duration> {
     match window {
@@ -550,6 +822,9 @@ struct AutoSwapStateFile {
     /// 缺字段 / 空表视为全 0；空表序列化时跳过。
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     resident_confirm: HashMap<String, u32>,
+    /// 重置前抢用往返记忆（issue #148）。缺字段视为无记忆；空值序列化时跳过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    burn_trip: Option<BurnTrip>,
 }
 
 /// 整份状态文件；文件缺失或损坏返回 `None`（既有语义：视为从未自动切换）。
@@ -566,6 +841,11 @@ pub fn read_last_auto_swap_at(path: &Path) -> Option<DateTime<Utc>> {
 /// 读取手动保持期截止。文件缺失、损坏或无该字段视为无保持期。
 pub fn read_manual_hold_until(path: &Path) -> Option<DateTime<Utc>> {
     read_state(path).and_then(|state| state.manual_hold_until)
+}
+
+/// 读取抢用往返记忆。文件缺失、损坏或无该字段视为无记忆。
+pub fn read_burn_trip(path: &Path) -> Option<BurnTrip> {
+    read_state(path).and_then(|state| state.burn_trip)
 }
 
 /// 读取回驻确认计数。文件缺失、损坏或无该字段视为全 0。
@@ -607,6 +887,7 @@ pub fn write_resident_confirm_counts(path: &Path, counts: &HashMap<AccountId, u3
 }
 
 /// 读状态文件中的回驻确认计数、判定、写回。调用方不必自己搬 HashMap。
+/// 往返记忆存续时整段跳过（issue #149），不读改写确认计数。
 pub fn decide_resident_return_from_state(
     path: &Path,
     accounts: &[Account],
@@ -616,6 +897,10 @@ pub fn decide_resident_return_from_state(
     last_auto_swap_at: Option<DateTime<Utc>>,
     manual_hold_until: Option<DateTime<Utc>>,
 ) -> Option<AutoSwapReturn> {
+    // issue #149：燃烧期不评估回驻，避免无目标时清零、有目标时推进确认计数。
+    if read_burn_trip(path).is_some() {
+        return None;
+    }
     let mut confirm_counts = read_resident_confirm_counts(path);
     let target = decide_resident_return(
         accounts,
@@ -630,23 +915,120 @@ pub fn decide_resident_return_from_state(
     target
 }
 
+/// 读往返记忆、判定、不合格时写回清除。调用方不必自己搬 [`BurnTrip`]。
+pub fn decide_auto_swap_from_state(
+    path: &Path,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+    last_auto_swap_at: Option<DateTime<Utc>>,
+) -> AutoSwapDecision {
+    let mut trip = read_burn_trip(path);
+    let before = trip.clone();
+    let decision = decide_auto_swap_with_trip(
+        accounts,
+        snapshots,
+        settings,
+        now,
+        last_auto_swap_at,
+        &mut trip,
+    );
+    if trip != before {
+        persist_burn_trip(path, trip);
+    }
+    decision
+}
+
+/// 从抢用判定与当时快照取出往返记忆。缺目标窗口 `reset_at` 则不写。
+pub fn burn_trip_from_target(
+    target: &AutoSwapTarget,
+    snapshots: &[QuotaSnapshot],
+) -> Option<BurnTrip> {
+    if target.kind != AutoSwapKind::Burn {
+        return None;
+    }
+    let snap = snapshot_of(snapshots, &target.to)?;
+    let quotas = usable_quotas(snap)?;
+    let reset_at = quotas
+        .iter()
+        .find(|quota| quota.window == target.trigger_window)
+        .and_then(|quota| quota.reset_at)?;
+    Some(BurnTrip {
+        origin: target.from.clone(),
+        target: target.to.clone(),
+        window: target.trigger_window,
+        reset_at,
+    })
+}
+
+/// 抢用成功：写冷却时刻与往返记忆，清掉回驻确认计数。读改写保留手动保持期。
+pub fn write_burn_trip_and_last_auto_swap_at(path: &Path, at: DateTime<Utc>, trip: &BurnTrip) {
+    let mut state = read_state(path).unwrap_or_default();
+    state.last_auto_swap_at = Some(at);
+    state.resident_confirm.clear();
+    state.burn_trip = Some(trip.clone());
+    write_state_or_warn(path, &state);
+}
+
+/// 自动切换 activate 成功后写冷却时刻。抢用同时写入往返记忆；回程与其它路径清掉既有记忆。
+pub fn record_auto_swap_success(
+    path: &Path,
+    at: DateTime<Utc>,
+    target: &AutoSwapTarget,
+    snapshots: &[QuotaSnapshot],
+) {
+    if target.kind == AutoSwapKind::Burn {
+        if let Some(trip) = burn_trip_from_target(target, snapshots) {
+            write_burn_trip_and_last_auto_swap_at(path, at, &trip);
+            return;
+        }
+    }
+    write_last_auto_swap_at(path, at);
+}
+
+fn persist_burn_trip(path: &Path, trip: Option<BurnTrip>) {
+    match read_state(path) {
+        None if trip.is_none() => {}
+        None => {
+            write_state_or_warn(
+                path,
+                &AutoSwapStateFile {
+                    burn_trip: trip,
+                    ..AutoSwapStateFile::default()
+                },
+            );
+        }
+        Some(mut state) => {
+            if state.burn_trip == trip {
+                return;
+            }
+            state.burn_trip = trip;
+            write_state_or_warn(path, &state);
+        }
+    }
+}
+
 /// 写入上次自动切换成功时刻，读改写保留手动保持期，清掉回驻确认计数
-/// （账号角色已变，确认期从头计）。失败只 warn，不回传错误。
+/// （账号角色已变，确认期从头计）与往返记忆（非抢用写入路径）。失败只 warn，不回传错误。
 pub fn write_last_auto_swap_at(path: &Path, at: DateTime<Utc>) {
     let mut state = read_state(path).unwrap_or_default();
     state.last_auto_swap_at = Some(at);
     state.resident_confirm.clear();
+    state.burn_trip = None;
     write_state_or_warn(path, &state);
 }
 
 /// 写入手动保持期截止，读改写不动上次自动切换时刻（没有切换史保持 None），
-/// 并清掉回驻确认计数（手动决定作废未完成的确认）。失败只 warn，不回传错误。
+/// 并清掉回驻确认计数与往返记忆（手动决定作废未完成的确认 / 用户接管）。
+/// 失败只 warn，不回传错误。
 pub fn set_manual_hold_until(path: &Path, until: DateTime<Utc>) {
     // 文件缺失或损坏时重建：没有切换史就不伪造任何时刻（issue #96）。保持期
     // 只约束回驻，不得借 last_auto_swap_at 把耗尽切换也锁进冷却（ADR-0008 第 4 条）。
     let mut state = read_state(path).unwrap_or_default();
     state.manual_hold_until = Some(until);
     state.resident_confirm.clear();
+    state.burn_trip = None;
     write_state_or_warn(path, &state);
 }
 
@@ -747,6 +1129,20 @@ mod tests {
         AutoSwap {
             candidate_margin: margin,
             ..pace_on()
+        }
+    }
+
+    fn burn_on() -> AutoSwap {
+        AutoSwap {
+            pre_reset_burn: true,
+            ..on()
+        }
+    }
+
+    fn burn_with_margin(margin: f64) -> AutoSwap {
+        AutoSwap {
+            candidate_margin: margin,
+            ..burn_on()
         }
     }
 
@@ -885,6 +1281,8 @@ mod tests {
         Stay(AutoSwapSkipReason),
         Swap(&'static str, &'static str, QuotaWindow),
         Pace(&'static str, &'static str, QuotaWindow),
+        Burn(&'static str, &'static str, QuotaWindow),
+        BurnReturn(&'static str, &'static str, QuotaWindow),
     }
 
     struct Case {
@@ -925,6 +1323,25 @@ mod tests {
                 assert_eq!(target.to.0, *to_id, "{}", case.name);
                 assert_eq!(target.trigger_window, *window, "{}", case.name);
                 assert_eq!(target.kind, AutoSwapKind::Pace, "{}", case.name);
+            }
+            (AutoSwapDecision::Swap(target), Expect::Burn(from_id, to_id, window)) => {
+                assert_eq!(target.from.0, *from_id, "{}", case.name);
+                assert_eq!(target.to.0, *to_id, "{}", case.name);
+                assert_eq!(target.trigger_window, *window, "{}", case.name);
+                assert_eq!(target.kind, AutoSwapKind::Burn, "{}", case.name);
+                assert!(
+                    target.usage_ratio > case.settings.pre_reset_burn_min_ratio,
+                    "{}: usage_ratio {} 须 > min_ratio {}",
+                    case.name,
+                    target.usage_ratio,
+                    case.settings.pre_reset_burn_min_ratio
+                );
+            }
+            (AutoSwapDecision::Swap(target), Expect::BurnReturn(from_id, to_id, window)) => {
+                assert_eq!(target.from.0, *from_id, "{}", case.name);
+                assert_eq!(target.to.0, *to_id, "{}", case.name);
+                assert_eq!(target.trigger_window, *window, "{}", case.name);
+                assert_eq!(target.kind, AutoSwapKind::BurnReturn, "{}", case.name);
             }
             (got, expected) => panic!("{}: got {got:?}, expect {expected:?}", case.name),
         }
@@ -1922,6 +2339,882 @@ mod tests {
         for case in &cases {
             check(case);
         }
+    }
+
+    /// issue #147：重置前抢用。临近 = `reset_at − now ≤` 对应窗口的 near_ms，且该窗口已用 > min_ratio。
+    #[test]
+    fn decide_auto_swap_burn_table() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let month = QuotaWindow::Month;
+        let w10 = &[(five, 10, 100)];
+        let w50 = &[(five, 50, 100)];
+        let w70 = &[(five, 70, 100)];
+        let w71 = &[(five, 71, 100)];
+        let w80 = &[(five, 80, 100)];
+        let w85 = &[(five, 85, 100)];
+        let w99 = &[(five, 99, 100)];
+        let tick = chrono::Duration::milliseconds(1);
+        let near_5h = chrono::Duration::milliseconds(burn_on().pre_reset_burn_near_5h_ms);
+        let near_7d = chrono::Duration::milliseconds(burn_on().pre_reset_burn_near_7d_ms);
+        let half = now() + chrono::Duration::minutes(150);
+        let at_5h = now() + near_5h;
+        let past_5h = at_5h + tick;
+        let at_7d = now() + near_7d;
+        let past_7d = at_7d + tick;
+        let soon = now() + chrono::Duration::minutes(30);
+        let later = now() + chrono::Duration::minutes(50);
+
+        let cases = [
+            Case {
+                name: "5h 恰好等于临近窗口 → 抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w80, at_5h)],
+                expect: Expect::Burn("alice", "bob", five),
+            },
+            Case {
+                name: "5h 超出临近窗口 1ms → 不抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w80, past_5h)],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "7d 恰好等于临近窗口 → 抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", w10),
+                    ready_reset("bob", &[(seven, 80, 100)], at_7d),
+                ],
+                expect: Expect::Burn("alice", "bob", seven),
+            },
+            Case {
+                name: "7d 超出临近窗口 1ms → 不抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", w10),
+                    ready_reset("bob", &[(seven, 80, 100)], past_7d),
+                ],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "水位恰好等于 min_ratio 不触发",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w70, at_5h)],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "水位刚过 min_ratio → 抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w71, at_5h)],
+                expect: Expect::Burn("alice", "bob", five),
+            },
+            Case {
+                name: "缺 reset_at 不参与抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w10), ready("bob", w80)],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "Custom 窗口不参与抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", w10),
+                    ready_reset("bob", &[(QuotaWindow::Custom, 80, 100)], at_5h),
+                ],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "Month 窗口不参与抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", w10),
+                    ready_reset("bob", &[(month, 80, 100)], at_5h),
+                ],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "多候选按最早 reset_at，不按已用比例",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w10),
+                    ready_reset("bob", w80, soon),
+                    ready_reset("carol", &[(five, 75, 100)], later),
+                ],
+                expect: Expect::Burn("alice", "bob", five),
+            },
+            Case {
+                name: "抢用排序：最早 reset 优先于低档偏好",
+                settings: AutoSwap {
+                    prefer_lower_tier: true,
+                    ..burn_on()
+                },
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w10),
+                    membered_reset("bob", w80, "LEVEL_ADVANCED", soon),
+                    membered_reset("carol", w80, "LEVEL_ANDANTE", later),
+                ],
+                expect: Expect::Burn("alice", "bob", five),
+            },
+            Case {
+                name: "边际豁免：候选已用更高仍抢用",
+                settings: burn_with_margin(0.1),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w50), ready_reset("bob", w80, at_5h)],
+                expect: Expect::Burn("alice", "bob", five),
+            },
+            Case {
+                name: "已达耗尽走 Exhausted 不走 Burn",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w99), ready_reset("bob", w80, at_5h)],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "pace 命中走 Pace 不走 Burn",
+                settings: AutoSwap {
+                    pace_pre_swap: true,
+                    pre_reset_burn: true,
+                    ..on()
+                },
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready_reset("alice", w85, half), ready_reset("bob", w80, at_5h)],
+                expect: Expect::Pace("alice", "bob", five),
+            },
+            Case {
+                name: "开关关闭不抢用",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w80, at_5h)],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "无合格抢用候选静默 Stay BelowThreshold",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w99, at_5h)],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "摘出账号不当燃烧目标",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), opted_out_acc("bob", false)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w80, at_5h)],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+        ];
+
+        for case in &cases {
+            check(case);
+        }
+    }
+
+    fn trip(origin: &str, target: &str, window: QuotaWindow, reset_at: DateTime<Utc>) -> BurnTrip {
+        BurnTrip {
+            origin: AccountId(origin.into()),
+            target: AccountId(target.into()),
+            window,
+            reset_at,
+        }
+    }
+
+    fn seed_trip(path: &Path, memory: &BurnTrip) {
+        write_burn_trip_and_last_auto_swap_at(
+            path,
+            now() - chrono::Duration::hours(1),
+            memory,
+        );
+    }
+
+    #[derive(Debug)]
+    enum TripExpect {
+        Keep,
+        Cleared,
+    }
+
+    struct BurnReturnCase {
+        name: &'static str,
+        settings: AutoSwap,
+        last_auto_swap_at: Option<DateTime<Utc>>,
+        accounts: Vec<Account>,
+        snapshots: Vec<QuotaSnapshot>,
+        trip: Option<BurnTrip>,
+        expect: Expect,
+        expect_trip: TripExpect,
+    }
+
+    /// issue #148：往返记忆回程。目的地锁定原账号，kind 为 BurnReturn。
+    #[test]
+    fn decide_auto_swap_burn_return_table() {
+        let five = QuotaWindow::FiveHour;
+        let w10 = &[(five, 10, 100)];
+        let w99 = &[(five, 99, 100)];
+        let w1 = &[(five, 1, 100)];
+        let recorded = now() + chrono::Duration::hours(1);
+        let flipped = recorded + chrono::Duration::hours(5);
+        let memory = trip("alice", "bob", five, recorded);
+
+        let cases = [
+            BurnReturnCase {
+                name: "reset_at 翻过 → 回程原账号",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::BurnReturn("bob", "alice", five),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "目标耗尽 → 回程原账号，kind 不是 Exhausted",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w10), ready("bob", w99)],
+                trip: Some(memory.clone()),
+                expect: Expect::BurnReturn("bob", "alice", five),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "耗尽回程目的地锁定原账号，不重新排序",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", false),
+                    settled("bob", true),
+                    acc("carol", false, None),
+                ],
+                snapshots: vec![ready("alice", w10), ready("bob", w99), ready("carol", w1)],
+                trip: Some(memory.clone()),
+                expect: Expect::BurnReturn("bob", "alice", five),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "原账号已达阈值 → 留在目标并清记忆",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w99), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Cleared,
+            },
+            BurnReturnCase {
+                name: "原账号已删除 → 留在目标并清记忆",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("bob", true)],
+                snapshots: vec![ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Cleared,
+            },
+            BurnReturnCase {
+                name: "原账号摘出 → 留在目标并清记忆",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![opted_out_acc("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Cleared,
+            },
+            BurnReturnCase {
+                name: "原账号快照不可用 → 留在目标并清记忆",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![failed_other("alice"), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Cleared,
+            },
+            BurnReturnCase {
+                name: "冷却期内不回程、记忆保留",
+                settings: on(),
+                last_auto_swap_at: Some(now() - chrono::Duration::minutes(1)),
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::Cooldown),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "安顿宽限期内不回程、记忆保留",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", false),
+                    acc("bob", true, Some(now() - chrono::Duration::seconds(10))),
+                ],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::SettleGrace),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "缺 reset_at 不当作翻过",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w10), ready("bob", w10)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "reset_at 相等不当作翻过",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w10, recorded)],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "抢用开关关闭仍回程",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", false), settled("bob", true)],
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::BurnReturn("bob", "alice", five),
+                expect_trip: TripExpect::Keep,
+            },
+        ];
+
+        for case in &cases {
+            let mut memory = case.trip.clone();
+            let got = decide_auto_swap_with_trip(
+                &case.accounts,
+                &case.snapshots,
+                &case.settings,
+                now(),
+                case.last_auto_swap_at,
+                &mut memory,
+            );
+            match (got, &case.expect) {
+                (AutoSwapDecision::Stay { reason }, Expect::Stay(expected)) => {
+                    assert_eq!(reason, *expected, "{}", case.name);
+                }
+                (AutoSwapDecision::Swap(target), Expect::BurnReturn(from_id, to_id, window)) => {
+                    assert_eq!(target.from.0, *from_id, "{}", case.name);
+                    assert_eq!(target.to.0, *to_id, "{}", case.name);
+                    assert_eq!(target.trigger_window, *window, "{}", case.name);
+                    assert_eq!(target.kind, AutoSwapKind::BurnReturn, "{}", case.name);
+                }
+                (got, expected) => panic!("{}: got {got:?}, expect {expected:?}", case.name),
+            }
+            match case.expect_trip {
+                TripExpect::Keep => assert_eq!(memory, case.trip, "{}", case.name),
+                TripExpect::Cleared => {
+                    assert!(memory.is_none(), "{}: 应清掉往返记忆", case.name)
+                }
+            }
+        }
+    }
+
+    /// issue #148：往返记忆写入后重新读取仍在。
+    #[test]
+    fn burn_trip_roundtrip_survives_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let recorded = now() + chrono::Duration::hours(1);
+        let memory = trip("alice", "bob", QuotaWindow::FiveHour, recorded);
+        seed_trip(&path, &memory);
+        assert_eq!(read_burn_trip(&path).as_ref(), Some(&memory));
+        assert_eq!(read_burn_trip(&path).as_ref(), Some(&memory));
+        assert_eq!(
+            read_last_auto_swap_at(&path),
+            Some(now() - chrono::Duration::hours(1))
+        );
+    }
+
+    /// issue #148：旧状态文件无记忆字段仍可读。
+    #[test]
+    fn burn_trip_missing_field_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        std::fs::write(&path, r#"{"last_auto_swap_at":"2026-09-03T12:00:00Z"}"#).unwrap();
+        assert_eq!(read_last_auto_swap_at(&path), Some(now()));
+        assert!(read_burn_trip(&path).is_none());
+        assert_eq!(read_manual_hold_until(&path), None);
+    }
+
+    /// issue #148：Burn 成功后记忆含窗口与 reset_at。
+    #[test]
+    fn burn_success_writes_trip_with_window_and_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let recorded = now() + chrono::Duration::hours(1);
+        let target = AutoSwapTarget {
+            from: AccountId("alice".into()),
+            to: AccountId("bob".into()),
+            trigger_window: QuotaWindow::FiveHour,
+            usage_ratio: 0.8,
+            kind: AutoSwapKind::Burn,
+        };
+        let snapshots = vec![
+            ready("alice", &[(QuotaWindow::FiveHour, 10, 100)]),
+            ready_reset("bob", &[(QuotaWindow::FiveHour, 80, 100)], recorded),
+        ];
+        record_auto_swap_success(&path, now(), &target, &snapshots);
+        let got = read_burn_trip(&path).expect("抢用成功应写入记忆");
+        assert_eq!(got.origin.0, "alice");
+        assert_eq!(got.target.0, "bob");
+        assert_eq!(got.window, QuotaWindow::FiveHour);
+        assert_eq!(got.reset_at, recorded);
+        assert_eq!(read_last_auto_swap_at(&path), Some(now()));
+    }
+
+    /// issue #148：非回程自动切换清记忆。
+    #[test]
+    fn non_return_auto_swap_clears_burn_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let recorded = now() + chrono::Duration::hours(1);
+        let memory = trip("alice", "bob", QuotaWindow::FiveHour, recorded);
+        seed_trip(&path, &memory);
+        assert!(read_burn_trip(&path).is_some());
+
+        write_last_auto_swap_at(&path, now());
+        assert!(read_burn_trip(&path).is_none());
+        assert_eq!(read_last_auto_swap_at(&path), Some(now()));
+
+        seed_trip(&path, &memory);
+        let exhausted = AutoSwapTarget {
+            from: AccountId("bob".into()),
+            to: AccountId("carol".into()),
+            trigger_window: QuotaWindow::FiveHour,
+            usage_ratio: 0.99,
+            kind: AutoSwapKind::Exhausted,
+        };
+        record_auto_swap_success(&path, now(), &exhausted, &[]);
+        assert!(read_burn_trip(&path).is_none());
+    }
+
+    /// issue #148：手动切换清记忆。
+    #[test]
+    fn set_manual_hold_until_clears_burn_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let recorded = now() + chrono::Duration::hours(1);
+        let memory = trip("alice", "bob", QuotaWindow::FiveHour, recorded);
+        seed_trip(&path, &memory);
+        let last = read_last_auto_swap_at(&path);
+        let hold = now() + chrono::Duration::hours(8);
+        set_manual_hold_until(&path, hold);
+        assert!(read_burn_trip(&path).is_none());
+        assert_eq!(read_manual_hold_until(&path), Some(hold));
+        assert_eq!(read_last_auto_swap_at(&path), last);
+    }
+
+    /// issue #148：from_state 门面在原账号不合格时清文件里的记忆。
+    #[test]
+    fn decide_auto_swap_from_state_clears_ineligible_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let five = QuotaWindow::FiveHour;
+        let recorded = now() + chrono::Duration::hours(1);
+        let flipped = recorded + chrono::Duration::hours(5);
+        let memory = trip("alice", "bob", five, recorded);
+        seed_trip(&path, &memory);
+
+        let accounts = vec![settled("alice", false), settled("bob", true)];
+        let snapshots = vec![
+            ready("alice", &[(five, 99, 100)]),
+            ready_reset("bob", &[(five, 10, 100)], flipped),
+        ];
+        let last = read_last_auto_swap_at(&path);
+        let got = decide_auto_swap_from_state(&path, &accounts, &snapshots, &on(), now(), last);
+        match got {
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::BelowThreshold,
+            } => {}
+            other => panic!("原账号不合格应 Stay，got {other:?}"),
+        }
+        assert!(read_burn_trip(&path).is_none());
+        assert_eq!(read_last_auto_swap_at(&path), last);
+    }
+
+    /// issue #148：回程成功路径不在判定阶段清记忆（activate 成功后再清）。
+    #[test]
+    fn decide_auto_swap_from_state_keeps_trip_on_return_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let five = QuotaWindow::FiveHour;
+        let recorded = now() + chrono::Duration::hours(1);
+        let flipped = recorded + chrono::Duration::hours(5);
+        let memory = trip("alice", "bob", five, recorded);
+        seed_trip(&path, &memory);
+
+        let accounts = vec![settled("alice", false), settled("bob", true)];
+        let snapshots = vec![
+            ready("alice", &[(five, 10, 100)]),
+            ready_reset("bob", &[(five, 10, 100)], flipped),
+        ];
+        let last = read_last_auto_swap_at(&path);
+        let got = decide_auto_swap_from_state(&path, &accounts, &snapshots, &on(), now(), last);
+        match got {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::BurnReturn);
+                assert_eq!(target.to.0, "alice");
+            }
+            other => panic!("应 Swap BurnReturn，got {other:?}"),
+        }
+        assert_eq!(read_burn_trip(&path).as_ref(), Some(&memory));
+    }
+
+    /// issue #151：同一状态文件上先抢用写入往返记忆，再 reset 翻过得到回程。
+    #[test]
+    fn burn_then_reset_flip_returns_on_same_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let five = QuotaWindow::FiveHour;
+        let w10 = &[(five, 10, 100)];
+        let w80 = &[(five, 80, 100)];
+        let recorded = now() + chrono::Duration::hours(1);
+        let flipped = recorded + chrono::Duration::hours(5);
+        let later = now() + chrono::Duration::minutes(6);
+
+        assert!(read_burn_trip(&path).is_none());
+
+        let burn_accounts = vec![settled("alice", true), settled("bob", false)];
+        let burn_snaps = vec![ready("alice", w10), ready_reset("bob", w80, recorded)];
+        let burn = decide_auto_swap_from_state(
+            &path,
+            &burn_accounts,
+            &burn_snaps,
+            &burn_on(),
+            now(),
+            None,
+        );
+        let burn_target = match burn {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::Burn);
+                assert_eq!(target.from.0, "alice");
+                assert_eq!(target.to.0, "bob");
+                assert_eq!(target.trigger_window, five);
+                target
+            }
+            other => panic!("应 Swap Burn，got {other:?}"),
+        };
+        record_auto_swap_success(&path, now(), &burn_target, &burn_snaps);
+        let trip = read_burn_trip(&path).expect("抢用成功应写入往返记忆");
+        assert_eq!(trip.origin.0, "alice");
+        assert_eq!(trip.target.0, "bob");
+        assert_eq!(trip.window, five);
+        assert_eq!(trip.reset_at, recorded);
+
+        let return_accounts = vec![settled("alice", false), settled("bob", true)];
+        let return_snaps = vec![ready("alice", w10), ready_reset("bob", w10, flipped)];
+        let last = read_last_auto_swap_at(&path);
+        let ret = decide_auto_swap_from_state(
+            &path,
+            &return_accounts,
+            &return_snaps,
+            &burn_on(),
+            later,
+            last,
+        );
+        let return_target = match ret {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::BurnReturn);
+                assert_eq!(target.from.0, "bob");
+                assert_eq!(target.to.0, "alice");
+                assert_eq!(target.trigger_window, five);
+                target
+            }
+            other => panic!("应 Swap BurnReturn，got {other:?}"),
+        };
+        assert_eq!(
+            read_burn_trip(&path).as_ref(),
+            Some(&trip),
+            "判定阶段不清记忆"
+        );
+        record_auto_swap_success(&path, later, &return_target, &return_snaps);
+        assert!(read_burn_trip(&path).is_none());
+    }
+
+    /// issue #149：往返记忆存续期间不 Pace；耗尽回程与 reset 翻过仍走 BurnReturn；
+    /// 记忆清除后同样夹具 Pace 恢复。
+    #[test]
+    fn decide_auto_swap_burn_period_suspends_pace() {
+        let five = QuotaWindow::FiveHour;
+        let w10 = &[(five, 10, 100)];
+        let w85 = &[(five, 85, 100)];
+        let w99 = &[(five, 99, 100)];
+        // 5h 窗已流逝 50%：reset=14:30。已用 85% → pace>1 且低于耗尽阈值。
+        let half = now() + chrono::Duration::minutes(150);
+        let recorded = half;
+        let flipped = recorded + chrono::Duration::hours(5);
+        let memory = trip("alice", "bob", five, recorded);
+        let accounts = vec![settled("alice", false), settled("bob", true)];
+        let pace_snaps = vec![ready("alice", w10), ready_reset("bob", w85, half)];
+
+        let cases = [
+            BurnReturnCase {
+                name: "记忆存续 + pace 条件满足 → 不 Pace、不切",
+                settings: pace_on(),
+                last_auto_swap_at: None,
+                accounts: accounts.clone(),
+                snapshots: pace_snaps.clone(),
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "记忆存续 + 目标耗尽 → BurnReturn，不是 Exhausted",
+                settings: pace_on(),
+                last_auto_swap_at: None,
+                accounts: accounts.clone(),
+                snapshots: vec![ready("alice", w10), ready("bob", w99)],
+                trip: Some(memory.clone()),
+                expect: Expect::BurnReturn("bob", "alice", five),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "记忆存续 + reset_at 翻过 → BurnReturn",
+                settings: pace_on(),
+                last_auto_swap_at: None,
+                accounts: accounts.clone(),
+                snapshots: vec![ready("alice", w10), ready_reset("bob", w10, flipped)],
+                trip: Some(memory.clone()),
+                expect: Expect::BurnReturn("bob", "alice", five),
+                expect_trip: TripExpect::Keep,
+            },
+            BurnReturnCase {
+                name: "记忆清除后同样夹具 pace 能触发",
+                settings: pace_on(),
+                last_auto_swap_at: None,
+                accounts: accounts.clone(),
+                snapshots: pace_snaps.clone(),
+                trip: None,
+                expect: Expect::Pace("bob", "alice", five),
+                expect_trip: TripExpect::Cleared,
+            },
+            BurnReturnCase {
+                name: "记忆存续不新开抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", false),
+                    settled("bob", true),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", w10),
+                    ready("bob", w10),
+                    ready_reset("carol", w85, now() + chrono::Duration::minutes(30)),
+                ],
+                trip: Some(memory.clone()),
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+                expect_trip: TripExpect::Keep,
+            },
+        ];
+
+        for case in &cases {
+            let mut memory = case.trip.clone();
+            let got = decide_auto_swap_with_trip(
+                &case.accounts,
+                &case.snapshots,
+                &case.settings,
+                now(),
+                case.last_auto_swap_at,
+                &mut memory,
+            );
+            match (got, &case.expect) {
+                (AutoSwapDecision::Stay { reason }, Expect::Stay(expected)) => {
+                    assert_eq!(reason, *expected, "{}", case.name);
+                }
+                (AutoSwapDecision::Swap(target), Expect::Pace(from_id, to_id, window)) => {
+                    assert_eq!(target.from.0, *from_id, "{}", case.name);
+                    assert_eq!(target.to.0, *to_id, "{}", case.name);
+                    assert_eq!(target.trigger_window, *window, "{}", case.name);
+                    assert_eq!(target.kind, AutoSwapKind::Pace, "{}", case.name);
+                }
+                (AutoSwapDecision::Swap(target), Expect::BurnReturn(from_id, to_id, window)) => {
+                    assert_eq!(target.from.0, *from_id, "{}", case.name);
+                    assert_eq!(target.to.0, *to_id, "{}", case.name);
+                    assert_eq!(target.trigger_window, *window, "{}", case.name);
+                    assert_eq!(target.kind, AutoSwapKind::BurnReturn, "{}", case.name);
+                }
+                (got, expected) => panic!("{}: got {got:?}, expect {expected:?}", case.name),
+            }
+            match case.expect_trip {
+                TripExpect::Keep => assert_eq!(memory, case.trip, "{}", case.name),
+                TripExpect::Cleared => {
+                    assert!(memory.is_none(), "{}: 记忆应为空", case.name)
+                }
+            }
+        }
+    }
+
+    /// issue #149：from_state 读到往返记忆时不 Pace；`write_last_auto_swap_at` 清记忆后恢复。
+    #[test]
+    fn decide_auto_swap_from_state_burn_period_skips_pace_until_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let five = QuotaWindow::FiveHour;
+        let half = now() + chrono::Duration::minutes(150);
+        let memory = trip("alice", "bob", five, half);
+        seed_trip(&path, &memory);
+
+        let accounts = vec![settled("alice", false), settled("bob", true)];
+        let snapshots = vec![
+            ready("alice", &[(five, 10, 100)]),
+            ready_reset("bob", &[(five, 85, 100)], half),
+        ];
+        let last = read_last_auto_swap_at(&path);
+        let got =
+            decide_auto_swap_from_state(&path, &accounts, &snapshots, &pace_on(), now(), last);
+        match got {
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::BelowThreshold,
+            } => {}
+            other => panic!("燃烧期不应 Pace，got {other:?}"),
+        }
+        assert_eq!(read_burn_trip(&path).as_ref(), Some(&memory));
+
+        write_last_auto_swap_at(&path, now() - chrono::Duration::hours(1));
+        assert!(read_burn_trip(&path).is_none());
+        let last = read_last_auto_swap_at(&path);
+        let got =
+            decide_auto_swap_from_state(&path, &accounts, &snapshots, &pace_on(), now(), last);
+        match got {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::Pace);
+                assert_eq!(target.from.0, "bob");
+                assert_eq!(target.to.0, "alice");
+            }
+            other => panic!("记忆清除后应 Pace，got {other:?}"),
+        }
+    }
+
+    /// issue #149：燃烧期整段跳过回驻判定；合格目标不切、计数不 +1；
+    /// 无合格目标也不清零。记忆清除后同样夹具能推进并回驻。
+    #[test]
+    fn decide_resident_return_from_state_burn_period_holds_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let five = QuotaWindow::FiveHour;
+        let w_low = &[(five, 10, 100)];
+        let recorded = now() + chrono::Duration::hours(1);
+        let memory = trip("alice", "bob", five, recorded);
+        let settings = AutoSwap {
+            resident_lower_tier: true,
+            resident_confirm_n: 2,
+            ..on()
+        };
+        let accounts = vec![settled("alice", false), settled("bob", true)];
+        let eligible = vec![
+            membered("alice", w_low, "LEVEL_INTERMEDIATE"),
+            membered("bob", w_low, "LEVEL_ADVANCED"),
+        ];
+        let same_tier = vec![
+            membered("alice", w_low, "LEVEL_ADVANCED"),
+            membered("bob", w_low, "LEVEL_ADVANCED"),
+        ];
+
+        seed_trip(&path, &memory);
+        let mut seeded = HashMap::new();
+        seeded.insert(AccountId("alice".into()), 1);
+        write_resident_confirm_counts(&path, &seeded);
+        assert_eq!(read_burn_trip(&path).as_ref(), Some(&memory));
+
+        let got = decide_resident_return_from_state(
+            &path,
+            &accounts,
+            &eligible,
+            &settings,
+            now(),
+            None,
+            None,
+        );
+        assert!(got.is_none(), "燃烧期存在合格回驻目标也不回驻");
+        assert_eq!(
+            read_resident_confirm_counts(&path),
+            seeded,
+            "燃烧期确认计数不推进"
+        );
+        assert_eq!(read_burn_trip(&path).as_ref(), Some(&memory));
+
+        let got = decide_resident_return_from_state(
+            &path,
+            &accounts,
+            &same_tier,
+            &settings,
+            now(),
+            None,
+            None,
+        );
+        assert!(got.is_none(), "燃烧期无合格回驻目标仍不回驻");
+        assert_eq!(
+            read_resident_confirm_counts(&path),
+            seeded,
+            "燃烧期确认计数不清零"
+        );
+
+        write_last_auto_swap_at(&path, now() - chrono::Duration::hours(1));
+        assert!(read_burn_trip(&path).is_none());
+        write_resident_confirm_counts(&path, &seeded);
+        let got = decide_resident_return_from_state(
+            &path,
+            &accounts,
+            &eligible,
+            &settings,
+            now(),
+            None,
+            None,
+        );
+        assert_eq!(
+            got.as_ref().map(|t| (t.from.0.as_str(), t.to.0.as_str())),
+            Some(("bob", "alice")),
+            "记忆清除后回驻应触发"
+        );
+        assert_eq!(
+            read_resident_confirm_counts(&path)
+                .get(&AccountId("alice".into()))
+                .copied(),
+            Some(2),
+            "记忆清除后确认计数应推进"
+        );
     }
 
     #[test]

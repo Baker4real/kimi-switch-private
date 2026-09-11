@@ -9,15 +9,15 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    auto_swap_opt_out_from_extra, decide_auto_swap, decide_resident_return_from_state,
+    auto_swap_opt_out_from_extra, decide_auto_swap_from_state, decide_resident_return_from_state,
     display_name, earliest_reset_at, membership_expiry_from_extra, membership_period_days,
     membership_remaining_days, membership_start_from_extra, official_nickname_known,
     persist_auto_swap_opt_out, prettify_membership, read_last_auto_swap_at, read_manual_hold_until,
-    set_manual_hold_until, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
-    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason,
-    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
-    QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
-    WEB_STORE_FIELD,
+    record_auto_swap_success, set_manual_hold_until, write_last_auto_swap_at, Account, AccountId,
+    AccountRegistry, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn,
+    AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota,
+    QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState,
+    QuotaWindow, RemovedAccounts, WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
@@ -174,6 +174,24 @@ impl Backend {
         Ok(settings.auto_swap.resident_lower_tier)
     }
 
+    /// 直读 config.toml 里的「重置前抢用」子开关；文件缺失/损坏都回落默认关。
+    pub fn load_auto_swap_pre_reset_burn() -> bool {
+        AppPaths::resolve()
+            .and_then(|p| {
+                Ok(kimi_switch_core::settings::load_from(&p.config_file())?
+                    .auto_swap
+                    .pre_reset_burn)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 持久化子开关到 config.toml（保注释原子写），返回落盘后的生效值。
+    pub fn save_auto_swap_pre_reset_burn(enabled: bool) -> Result<bool> {
+        let settings = kimi_switch_core::settings::set_auto_swap_pre_reset_burn(enabled)
+            .context("写入设置失败")?;
+        Ok(settings.auto_swap.pre_reset_burn)
+    }
+
     fn has_pending_auth(&self) -> bool {
         has_live_pending(
             self.pending_auth
@@ -303,6 +321,7 @@ impl Backend {
             auto_swap: Self::load_auto_swap(),
             auto_swap_prefer_lower_tier: Self::load_auto_swap_prefer_lower_tier(),
             auto_swap_resident_lower_tier: Self::load_auto_swap_resident_lower_tier(),
+            auto_swap_pre_reset_burn: Self::load_auto_swap_pre_reset_burn(),
             message: attach_auto_swap_message(message, reason, &stats, effect.message),
         }
     }
@@ -982,7 +1001,14 @@ where
     if pending_auth() || !auto_swap.enabled {
         return AutoSwapSnapshotEffect::none();
     }
-    match decide_auto_swap(accounts, snapshots, auto_swap, now, last_auto_swap_at) {
+    match decide_auto_swap_from_state(
+        state_path,
+        accounts,
+        snapshots,
+        auto_swap,
+        now,
+        last_auto_swap_at,
+    ) {
         AutoSwapDecision::Stay {
             reason: AutoSwapSkipReason::NoEligibleCandidate,
         } => {
@@ -1054,16 +1080,24 @@ where
             }
             match activate(target.to.clone()).await {
                 Ok(()) => {
-                    write_last_auto_swap_at(state_path, Utc::now());
+                    record_auto_swap_success(state_path, Utc::now(), &target, snapshots);
                     audit.append(
                         AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
                             .with_detail(auto_swap_audit_detail(&target)),
                     );
-                    let text = accounts
-                        .iter()
-                        .find(|account| account.id == target.to)
-                        .map(auto_swap_success_message)
-                        .unwrap_or_else(|| format!("已自动切换到 {}", target.to));
+                    let found = accounts.iter().find(|account| account.id == target.to);
+                    // issue #150：抢用 / 回程 toast 与普通耗尽、pace 区分开，仍走 AutoSwapSuccess。
+                    let text = match target.kind {
+                        AutoSwapKind::Burn => found
+                            .map(pre_reset_burn_message)
+                            .unwrap_or_else(|| format!("已抢用 {}", target.to)),
+                        AutoSwapKind::BurnReturn => found
+                            .map(pre_reset_burn_return_message)
+                            .unwrap_or_else(|| format!("已回程 {}", target.to)),
+                        AutoSwapKind::Pace | AutoSwapKind::Exhausted => found
+                            .map(auto_swap_success_message)
+                            .unwrap_or_else(|| format!("已自动切换到 {}", target.to)),
+                    };
                     AutoSwapSnapshotEffect {
                         message: Some(UiMessage::auto_swap_success(text)),
                         swapped: true,
@@ -1108,6 +1142,8 @@ fn auto_swap_audit_detail(target: &AutoSwapTarget) -> String {
     );
     match target.kind {
         AutoSwapKind::Pace => format!("kind=pace {body}"),
+        AutoSwapKind::Burn => format!("kind=burn {body}"),
+        AutoSwapKind::BurnReturn => format!("kind=burn_return from={}", target.from),
         AutoSwapKind::Exhausted => body,
     }
 }
@@ -1120,6 +1156,16 @@ fn resident_return_audit_detail(target: &AutoSwapReturn) -> String {
 /// 回驻成功 toast 文案，与自动切换成功共用同一消息通道（静默周期白名单沿用）。
 pub(crate) fn resident_return_message(account: &Account) -> String {
     format!("已回驻 {}", display_name(account))
+}
+
+/// 重置前抢用成功 toast 文案（issue #150），与自动切换成功共用同一消息通道。
+pub(crate) fn pre_reset_burn_message(account: &Account) -> String {
+    format!("已抢用 {}", display_name(account))
+}
+
+/// 抢用回程成功 toast 文案（issue #150），与自动切换成功共用同一消息通道。
+pub(crate) fn pre_reset_burn_return_message(account: &Account) -> String {
+    format!("已回程 {}", display_name(account))
 }
 
 /// 绑定成功的 toast 文案（issue #51）。订阅无到期瞬间时到期展示回退弱提示，

@@ -31,7 +31,8 @@ mod tests {
         attach_auto_swap_message, attach_skip_message, auth_success_message,
         auto_swap_opt_out_message, auto_swap_success_message, bind_web_success_message,
         bind_web_user_message, cached_membership_plan, collect_account_rows,
-        delete_success_message, import_success_message, reauth_success_message,
+        delete_success_message, import_success_message, pre_reset_burn_message,
+        pre_reset_burn_return_message, reauth_success_message,
         rename_success_message, swap_failure_message, swap_success_message, AutoSwapSnapshotEffect,
         WebMembershipRefresh,
     };
@@ -153,6 +154,7 @@ mod tests {
             auto_swap: false,
             auto_swap_prefer_lower_tier: false,
             auto_swap_resident_lower_tier: false,
+            auto_swap_pre_reset_burn: false,
             message: Some(message),
         };
         assert_eq!(
@@ -1057,6 +1059,7 @@ mod tests {
             auto_swap: false,
             auto_swap_prefer_lower_tier: false,
             auto_swap_resident_lower_tier: false,
+            auto_swap_pre_reset_burn: false,
             message: attach_skip_message(None, reason, stats),
         }
     }
@@ -1325,6 +1328,16 @@ mod tests {
         assert_eq!(
             auto_swap_success_message(&sample_account("acc-3")),
             "已自动切换到 acc-3"
+        );
+        assert_eq!(pre_reset_burn_message(&named), "已抢用 Forever");
+        assert_eq!(pre_reset_burn_message(&aliased), "已抢用 工作机");
+        assert_eq!(
+            pre_reset_burn_return_message(&named),
+            "已回程 Forever"
+        );
+        assert_eq!(
+            pre_reset_burn_return_message(&aliased),
+            "已回程 工作机"
         );
     }
 
@@ -1715,6 +1728,204 @@ mod tests {
         assert!(detail.contains("from=alice"), "{detail}");
         assert!(detail.contains("window=5h"), "{detail}");
         assert!(detail.contains("used=85%"), "{detail}");
+    }
+
+    /// issue #147：重置前抢用成功 → 审计 kind=burn；toast 仍走自动切换成功通道。
+    #[tokio::test]
+    async fn snapshot_auto_swap_burn_activates_and_audits_kind_burn() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.pre_reset_burn = true;
+        let mut bob = auto_swap_acc("bob", false);
+        bob.label = "工作机".into();
+        let near = auto_swap_now() + chrono::Duration::hours(1);
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &settings,
+            || false,
+            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), bob],
+            &[
+                auto_swap_ready("alice", 10, 100),
+                auto_swap_ready_at("bob", 80, 100, Some(near)),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("burn toast");
+        assert_eq!(message.text, "已抢用 工作机");
+        assert_eq!(message.tone, MessageTone::Ok);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapSuccess);
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob")
+        );
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "ok");
+        let detail = event.detail.expect("burn audit has detail");
+        assert!(detail.contains("kind=burn"), "{detail}");
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("window=5h"), "{detail}");
+        assert!(detail.contains("used=80%"), "{detail}");
+        let trip = kimi_switch_core::read_burn_trip(&state).expect("抢用成功应写入往返记忆");
+        assert_eq!(trip.origin.0, "alice");
+        assert_eq!(trip.target.0, "bob");
+        assert_eq!(trip.window, QuotaWindow::FiveHour);
+        assert_eq!(trip.reset_at, near);
+    }
+
+    /// issue #148：reset_at 翻过 → 回程原账号；审计 kind=burn_return；toast 走自动切换成功通道。
+    #[tokio::test]
+    async fn snapshot_auto_swap_burn_return_on_reset_flip_audits_kind_burn_return() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let recorded = auto_swap_now() + chrono::Duration::hours(1);
+        let flipped = recorded + chrono::Duration::hours(5);
+        kimi_switch_core::write_burn_trip_and_last_auto_swap_at(
+            &state,
+            auto_swap_now() - chrono::Duration::hours(1),
+            &kimi_switch_core::BurnTrip {
+                origin: AccountId("alice".into()),
+                target: AccountId("bob".into()),
+                window: QuotaWindow::FiveHour,
+                reset_at: recorded,
+            },
+        );
+        let mut alice = auto_swap_acc("alice", false);
+        alice.label = "原号".into();
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("bob".into())),
+            &[alice, auto_swap_acc("bob", true)],
+            &[
+                auto_swap_ready("alice", 10, 100),
+                auto_swap_ready_at("bob", 10, 100, Some(flipped)),
+            ],
+            auto_swap_now(),
+            kimi_switch_core::read_last_auto_swap_at(&state),
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("burn_return toast");
+        assert_eq!(message.text, "已回程 原号");
+        assert_eq!(message.tone, MessageTone::Ok);
+        assert_eq!(message.kind, UiMessageKind::AutoSwapSuccess);
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("alice")
+        );
+        assert!(kimi_switch_core::read_burn_trip(&state).is_none());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "ok");
+        let detail = event.detail.expect("burn_return audit has detail");
+        assert!(detail.contains("kind=burn_return"), "{detail}");
+        assert!(detail.contains("from=bob"), "{detail}");
+        assert!(
+            !detail.contains("window="),
+            "回程审计不强制 window: {detail}"
+        );
+    }
+
+    /// issue #148：目标耗尽回程锁定原账号，不重新排序。
+    #[tokio::test]
+    async fn snapshot_auto_swap_burn_return_on_exhaust_locks_origin() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let recorded = auto_swap_now() + chrono::Duration::hours(1);
+        kimi_switch_core::write_burn_trip_and_last_auto_swap_at(
+            &state,
+            auto_swap_now() - chrono::Duration::hours(1),
+            &kimi_switch_core::BurnTrip {
+                origin: AccountId("alice".into()),
+                target: AccountId("bob".into()),
+                window: QuotaWindow::FiveHour,
+                reset_at: recorded,
+            },
+        );
+        let mut alice = auto_swap_acc("alice", false);
+        alice.label = "原号".into();
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("bob".into())),
+            &[
+                alice,
+                auto_swap_acc("bob", true),
+                auto_swap_acc("carol", false),
+            ],
+            &[
+                auto_swap_ready("alice", 10, 100),
+                auto_swap_ready("bob", 99, 100),
+                auto_swap_ready("carol", 1, 100),
+            ],
+            auto_swap_now(),
+            kimi_switch_core::read_last_auto_swap_at(&state),
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("burn_return toast");
+        assert_eq!(message.text, "已回程 原号");
+        assert_eq!(message.kind, UiMessageKind::AutoSwapSuccess);
+        assert!(effect.swapped);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("alice"),
+            "耗尽回程须锁定原账号，不得改选 carol"
+        );
+        let detail = last_audit(audit.path())
+            .detail
+            .expect("burn_return audit has detail");
+        assert!(detail.contains("kind=burn_return"), "{detail}");
+        assert!(kimi_switch_core::read_burn_trip(&state).is_none());
     }
 
     /// issue #112：摘出停泊账号不是候选；效应层 activate 下一合格账号。

@@ -5,6 +5,7 @@
 //!   `[auto_swap] enabled = true` 时，额度收集完成后若达阈值则自动切换并追加一行英文结果；
 //!   `resident_lower_tier` 子开关开启时，未达阈值也可能因档位更低而回驻（ADR-0008）。
 //!   `pace_pre_swap` 开启时，未达阈值但预测撑不到 reset 也可能提前切（ADR-0013）。
+//!   `pre_reset_burn` 开启时，未达阈值且 pace 未命中，也可能切到临近重置的停泊账号烧尾巴（ADR-0014）。
 //!   退出码只作用于该默认路径：0 已切换 / 1 错误 / 2 无事 / 3 已达阈值但无合格候选。
 //!   `--json` 向 stdout 写行式事件流（每条带 `schemaVersion`，契约 additive：字段只增不改、
 //!   事件类型可新增，脚本须忽略未知字段）；人类可读提示走 stderr。非 `--json` 时 stdout 不变。
@@ -33,12 +34,13 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    decide_auto_swap, decide_resident_return_from_state, earliest_reset_at,
+    decide_auto_swap_from_state, decide_resident_return_from_state, earliest_reset_at,
     membership_expiry_from_extra, prettify_membership, read_last_auto_swap_at,
-    read_manual_hold_until, set_manual_hold_until, settings, write_last_auto_swap_at, Account,
-    AccountId, AccountRegistry, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind,
-    AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore,
-    Provider, Quota, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
+    read_manual_hold_until, record_auto_swap_success, set_manual_hold_until, settings,
+    write_last_auto_swap_at, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
+    AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget,
+    CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaSnapshot, QuotaState,
+    QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 use serde::Serialize;
@@ -55,7 +57,7 @@ Default status path (no subcommand) exit codes:
 
 `--json` writes a line-oriented JSON event stream to stdout. Each event has \
 schemaVersion (starts at 1). Event types: swap, stay, no_candidate, error. \
-Event fields (omitted when N/A): from, to, kind (exhausted|resident|pace), \
+Event fields (omitted when N/A): from, to, kind (exhausted|resident|pace|burn|burn_return), \
 window, usagePct, reason, earliestReset, message. \
 The contract is additive: fields are only added, never changed; new event types \
 may appear; scripts must ignore unknown fields and unknown event types. \
@@ -394,6 +396,14 @@ impl StatusJsonEvent {
         Self::swap_target(target, "pace")
     }
 
+    fn swap_burn(target: &AutoSwapTarget) -> Self {
+        Self::swap_target(target, "burn")
+    }
+
+    fn swap_burn_return(target: &AutoSwapTarget) -> Self {
+        Self::swap_target(target, "burn_return")
+    }
+
     fn swap_target(target: &AutoSwapTarget, kind: &'static str) -> Self {
         Self {
             from: Some(target.from.to_string()),
@@ -560,7 +570,14 @@ where
     if !auto_swap.enabled {
         return AutoSwapStatusEffect::stay("disabled");
     }
-    match decide_auto_swap(accounts, snapshots, auto_swap, now, last_auto_swap_at) {
+    match decide_auto_swap_from_state(
+        state_path,
+        accounts,
+        snapshots,
+        auto_swap,
+        now,
+        last_auto_swap_at,
+    ) {
         AutoSwapDecision::Stay {
             reason: AutoSwapSkipReason::NoEligibleCandidate,
         } => {
@@ -611,7 +628,7 @@ where
         }
         AutoSwapDecision::Swap(target) => match activate(target.to.clone()).await {
             Ok(()) => {
-                write_last_auto_swap_at(state_path, Utc::now());
+                record_auto_swap_success(state_path, Utc::now(), &target, snapshots);
                 audit.append(
                     AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
                         .with_detail(auto_swap_audit_detail(&target)),
@@ -620,6 +637,8 @@ where
                     auto_swap_success_line(&target),
                     match target.kind {
                         AutoSwapKind::Pace => StatusJsonEvent::swap_pace(&target),
+                        AutoSwapKind::Burn => StatusJsonEvent::swap_burn(&target),
+                        AutoSwapKind::BurnReturn => StatusJsonEvent::swap_burn_return(&target),
                         AutoSwapKind::Exhausted => StatusJsonEvent::swap_exhausted(&target),
                     },
                 )
@@ -656,6 +675,14 @@ fn auto_swap_success_line(target: &AutoSwapTarget) -> String {
     match target.kind {
         AutoSwapKind::Pace => format!(
             "auto_swap kimi/{} → kimi/{} (pace {window} {pct}%)",
+            target.from, target.to
+        ),
+        AutoSwapKind::Burn => format!(
+            "auto_swap kimi/{} → kimi/{} (burn {window} {pct}%)",
+            target.from, target.to
+        ),
+        AutoSwapKind::BurnReturn => format!(
+            "auto_swap kimi/{} → kimi/{} (burn_return {window} {pct}%)",
             target.from, target.to
         ),
         AutoSwapKind::Exhausted => format!(
@@ -701,6 +728,8 @@ fn auto_swap_audit_detail(target: &AutoSwapTarget) -> String {
     );
     match target.kind {
         AutoSwapKind::Pace => format!("kind=pace {body}"),
+        AutoSwapKind::Burn => format!("kind=burn {body}"),
+        AutoSwapKind::BurnReturn => format!("kind=burn_return from={}", target.from),
         AutoSwapKind::Exhausted => body,
     }
 }
@@ -1384,6 +1413,203 @@ mod tests {
         assert_eq!(json["kind"], "pace");
         assert_eq!(json["window"], "5h");
         assert_eq!(json["usagePct"], 85);
+    }
+
+    /// issue #147：重置前抢用成功 → 审计 kind=burn，人类可读行带 burn，退出码 0。
+    #[tokio::test]
+    async fn status_auto_swap_burn_activates_audits_and_json() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.pre_reset_burn = true;
+        let near = now() + chrono::Duration::hours(1);
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = super::apply_status_auto_swap(
+            &settings,
+            &[acc("alice", true), acc("bob", false)],
+            &[ready("alice", 10, 100), ready_reset("bob", 80, 100, Some(near))],
+            now(),
+            None,
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            effect.line.as_deref(),
+            Some("auto_swap kimi/alice → kimi/bob (burn 5h 80%)")
+        );
+        assert!(effect.swapped);
+        assert_eq!(effect.exit_code(), 0);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("bob")
+        );
+        assert!(kimi_switch_core::read_last_auto_swap_at(&state).is_some());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.account.as_deref(), Some("bob"));
+        let detail = event.detail.expect("burn audit has detail");
+        assert!(detail.contains("kind=burn"), "{detail}");
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("window=5h"), "{detail}");
+        assert!(detail.contains("used=80%"), "{detail}");
+        let json = parse_status_event(&effect);
+        assert_eq!(json["schemaVersion"], 1);
+        assert_eq!(json["type"], "swap");
+        assert_eq!(json["from"], "alice");
+        assert_eq!(json["to"], "bob");
+        assert_eq!(json["kind"], "burn");
+        assert_eq!(json["window"], "5h");
+        assert_eq!(json["usagePct"], 80);
+        let trip = kimi_switch_core::read_burn_trip(&state).expect("抢用成功应写入往返记忆");
+        assert_eq!(trip.origin.0, "alice");
+        assert_eq!(trip.target.0, "bob");
+        assert_eq!(trip.window, QuotaWindow::FiveHour);
+        assert_eq!(trip.reset_at, near);
+    }
+
+    /// issue #148：reset_at 翻过 → 回程原账号，审计 kind=burn_return，JSON kind burn_return。
+    #[tokio::test]
+    async fn status_auto_swap_burn_return_on_reset_flip_activates_audits_and_json() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let recorded = now() + chrono::Duration::hours(1);
+        let flipped = recorded + chrono::Duration::hours(5);
+        kimi_switch_core::write_burn_trip_and_last_auto_swap_at(
+            &state,
+            now() - chrono::Duration::hours(1),
+            &kimi_switch_core::BurnTrip {
+                origin: AccountId("alice".into()),
+                target: AccountId("bob".into()),
+                window: QuotaWindow::FiveHour,
+                reset_at: recorded,
+            },
+        );
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", false), acc("bob", true)],
+            &[
+                ready("alice", 10, 100),
+                ready_reset("bob", 10, 100, Some(flipped)),
+            ],
+            now(),
+            kimi_switch_core::read_last_auto_swap_at(&state),
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            effect.line.as_deref(),
+            Some("auto_swap kimi/bob → kimi/alice (burn_return 5h 10%)")
+        );
+        assert!(effect.swapped);
+        assert_eq!(effect.exit_code(), 0);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("alice")
+        );
+        assert!(kimi_switch_core::read_burn_trip(&state).is_none());
+        let event = last_audit(audit.path());
+        assert_eq!(event.action, "auto_swap");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.account.as_deref(), Some("alice"));
+        let detail = event.detail.expect("burn_return audit has detail");
+        assert!(detail.contains("kind=burn_return"), "{detail}");
+        assert!(detail.contains("from=bob"), "{detail}");
+        assert!(
+            !detail.contains("window="),
+            "回程审计不强制 window: {detail}"
+        );
+        let json = parse_status_event(&effect);
+        assert_eq!(json["schemaVersion"], 1);
+        assert_eq!(json["type"], "swap");
+        assert_eq!(json["from"], "bob");
+        assert_eq!(json["to"], "alice");
+        assert_eq!(json["kind"], "burn_return");
+    }
+
+    /// issue #148：目标耗尽回程锁定原账号，不重新排序。
+    #[tokio::test]
+    async fn status_auto_swap_burn_return_on_exhaust_locks_origin() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let recorded = now() + chrono::Duration::hours(1);
+        kimi_switch_core::write_burn_trip_and_last_auto_swap_at(
+            &state,
+            now() - chrono::Duration::hours(1),
+            &kimi_switch_core::BurnTrip {
+                origin: AccountId("alice".into()),
+                target: AccountId("bob".into()),
+                window: QuotaWindow::FiveHour,
+                reset_at: recorded,
+            },
+        );
+        let activated = Arc::new(Mutex::new(None));
+        let activated_cb = activated.clone();
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", false), acc("bob", true), acc("carol", false)],
+            &[
+                ready("alice", 10, 100),
+                ready("bob", 99, 100),
+                ready("carol", 1, 100),
+            ],
+            now(),
+            kimi_switch_core::read_last_auto_swap_at(&state),
+            None,
+            move |id| {
+                let activated = activated_cb.clone();
+                async move {
+                    *activated.lock().unwrap() = Some(id);
+                    Ok(())
+                }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.swapped);
+        assert_eq!(effect.exit_code(), 0);
+        assert_eq!(
+            activated.lock().unwrap().as_ref().map(|id| id.0.as_str()),
+            Some("alice"),
+            "耗尽回程须锁定原账号，不得改选 carol"
+        );
+        let json = parse_status_event(&effect);
+        assert_eq!(json["kind"], "burn_return");
+        assert_eq!(json["to"], "alice");
+        assert!(kimi_switch_core::read_burn_trip(&state).is_none());
+        let detail = last_audit(audit.path()).detail.expect("detail");
+        assert!(detail.contains("kind=burn_return"), "{detail}");
     }
 
     /// issue #69 故事 12：CLI 编排把整份 AutoSwap 交给决策，prefer_lower_tier 生效。

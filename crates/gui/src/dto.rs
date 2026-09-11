@@ -187,6 +187,7 @@ pin_dto_fields!(
     "auto_swap",
     "auto_swap_prefer_lower_tier",
     "auto_swap_resident_lower_tier",
+    "auto_swap_pre_reset_burn",
     "message",
 );
 pin_dto_fields!(UI_MESSAGE_JSON_KEYS, UI_API_TS, "text", "tone", "kind",);
@@ -393,6 +394,8 @@ pub struct Snapshot {
     pub auto_swap_prefer_lower_tier: bool,
     /// 「额度恢复后回驻低档账号」子开关（issue #95）：直读 config.toml，默认关。
     pub auto_swap_resident_lower_tier: bool,
+    /// 「重置前抢用」子开关（issue #150）：直读 config.toml，默认关。
+    pub auto_swap_pre_reset_burn: bool,
     pub message: Option<UiMessage>,
 }
 

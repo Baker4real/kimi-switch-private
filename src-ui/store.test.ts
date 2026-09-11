@@ -141,7 +141,7 @@ describe("忙碌闸门与错误 toast 计时（issue #126）", () => {
     expect(shouldArmToastDismiss(false, false)).toBe(true);
   });
 
-  it("忙碌列表含四个设置开关；子开关 paint 与忙碌取或", () => {
+  it("忙碌列表含五个设置开关；子开关 paint 与忙碌取或", () => {
     const main = readFileSync(
       join(dirname(fileURLToPath(import.meta.url)), "main.ts"),
       "utf8",
@@ -154,6 +154,7 @@ describe("忙碌闸门与错误 toast 计时（issue #126）", () => {
     expect(busyList).toContain('"auto-swap-toggle"');
     expect(busyList).toContain('"auto-swap-prefer-lower-tier-toggle"');
     expect(busyList).toContain('"auto-swap-resident-lower-tier-toggle"');
+    expect(busyList).toContain('"auto-swap-pre-reset-burn-toggle"');
     expect(busyList).not.toContain("behavior-panel-toggle");
 
     const functionSrc = (name: string): string => {
@@ -164,10 +165,13 @@ describe("忙碌闸门与错误 toast 计时（issue #126）", () => {
     };
     const prefer = functionSrc("paintAutoSwapPreferLowerTier");
     const resident = functionSrc("paintAutoSwapResidentLowerTier");
+    const burn = functionSrc("paintAutoSwapPreResetBurn");
     expect(prefer).toContain("controlDisabledByBusy");
     expect(resident).toContain("controlDisabledByBusy");
+    expect(burn).toContain("controlDisabledByBusy");
     expect(prefer).not.toMatch(/toggle\.disabled\s*=\s*view\.disabled\s*;/);
     expect(resident).not.toMatch(/toggle\.disabled\s*=\s*view\.disabled\s*;/);
+    expect(burn).not.toMatch(/toggle\.disabled\s*=\s*view\.disabled\s*;/);
     expect(functionSrc("syncBusyChrome")).toContain("controlDisabledByBusy");
   });
 });

@@ -26,10 +26,12 @@ pub mod time;
 pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
 pub use auto_swap::{
-    decide_auto_swap, decide_resident_return, decide_resident_return_from_state,
-    read_last_auto_swap_at, read_manual_hold_until, read_resident_confirm_counts,
-    set_manual_hold_until, write_last_auto_swap_at, write_resident_confirm_counts,
-    AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget,
+    burn_trip_from_target, decide_auto_swap, decide_auto_swap_from_state, decide_resident_return,
+    decide_resident_return_from_state, read_burn_trip, read_last_auto_swap_at,
+    read_manual_hold_until, read_resident_confirm_counts, record_auto_swap_success,
+    set_manual_hold_until, write_burn_trip_and_last_auto_swap_at, write_last_auto_swap_at,
+    write_resident_confirm_counts, AutoSwapDecision, AutoSwapKind, AutoSwapReturn,
+    AutoSwapSkipReason, AutoSwapTarget, BurnTrip,
 };
 pub use auto_swap_opt_out::{
     account_auto_swap_opt_out, auto_swap_opt_out_from_extra, persist_auto_swap_opt_out,

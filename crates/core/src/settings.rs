@@ -6,8 +6,9 @@
 //!   [`reload_from_file`]，设置页落盘后下一次读取可见新值。单元测试跳过补水，以免本机配置污染并行用例。
 //! - **显式重载**：[`reload_from_file`] 供 CLI 启动时把解析/校验错误返回给调用方（CLI 短命）。
 //! - **失败兜底**：文件不存在 → 用默认值；文件存在但解析或校验失败 → 沿用上一次成功加载的值并打 warn。
-//! - **校验**：`auto_swap.threshold`、`auto_swap.candidate_margin` 与
-//!   `auto_swap.pace_warn_threshold` 收敛到 `0.0..=1.0`；冷却/宽限等时间类拒绝负值。
+//! - **校验**：`auto_swap.threshold`、`auto_swap.candidate_margin`、
+//!   `auto_swap.pace_warn_threshold` 与 `auto_swap.pre_reset_burn_min_ratio`
+//!   收敛到 `0.0..=1.0`；冷却/宽限等时间类拒绝负值。
 //! - **访问入口**：[`current`] 返回 `Arc<Settings>`，所有调用点都从这里读，不要长期缓存返回值。
 //!
 //! 字段命名遵循「按 domain 分组」的 TOML 表，方便 `vim ~/.config/kimi-switch/config.toml`。
@@ -85,6 +86,16 @@ pub struct AutoSwap {
     /// pace 预切换预警水位（0.0~1.0）。当前账号最大已用须 ≥ 此值才考虑 pace。
     /// 加载时 clamp 到 `0.0..=1.0`（与 threshold 同一套）。默认 0.8。
     pub pace_warn_threshold: f64,
+    /// 重置前抢用子开关（issue #147 / ADR-0014）。默认关闭。开启后，未达耗尽
+    /// 且 pace 未命中时，可切到临近重置且该窗口已用超水位的停泊账号。
+    pub pre_reset_burn: bool,
+    /// 重置前抢用水位（0.0~1.0）。临近重置的窗口自身已用须 > 此值。
+    /// 加载时须有限并 clamp 到 `0.0..=1.0`（与 threshold 同一套）。默认 0.7。
+    pub pre_reset_burn_min_ratio: f64,
+    /// 5 小时窗视为临近重置的剩余时间（毫秒）。默认 1 小时。
+    pub pre_reset_burn_near_5h_ms: i64,
+    /// 7 天窗视为临近重置的剩余时间（毫秒）。默认 2 天。
+    pub pre_reset_burn_near_7d_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,6 +174,10 @@ impl Default for AutoSwap {
             resident_confirm_n: defaults::AUTO_SWAP_RESIDENT_CONFIRM_N,
             pace_pre_swap: defaults::AUTO_SWAP_PACE_PRE_SWAP,
             pace_warn_threshold: defaults::AUTO_SWAP_PACE_WARN_THRESHOLD,
+            pre_reset_burn: defaults::AUTO_SWAP_PRE_RESET_BURN,
+            pre_reset_burn_min_ratio: defaults::AUTO_SWAP_PRE_RESET_BURN_MIN_RATIO,
+            pre_reset_burn_near_5h_ms: defaults::AUTO_SWAP_PRE_RESET_BURN_NEAR_5H_MS,
+            pre_reset_burn_near_7d_ms: defaults::AUTO_SWAP_PRE_RESET_BURN_NEAR_7D_MS,
         }
     }
 }
@@ -272,6 +287,14 @@ fn validate_and_normalize(settings: &mut Settings) -> Result<()> {
     }
     settings.auto_swap.pace_warn_threshold = pace_warn.clamp(0.0, 1.0);
 
+    let burn_min = settings.auto_swap.pre_reset_burn_min_ratio;
+    if !burn_min.is_finite() {
+        return Err(Error::Config(
+            "auto_swap.pre_reset_burn_min_ratio 必须是有限数值".into(),
+        ));
+    }
+    settings.auto_swap.pre_reset_burn_min_ratio = burn_min.clamp(0.0, 1.0);
+
     fn reject_negative(name: &str, value: i64) -> Result<()> {
         if value < 0 {
             Err(Error::Config(format!("{name} 不能为负（当前 {value}）")))
@@ -284,6 +307,14 @@ fn validate_and_normalize(settings: &mut Settings) -> Result<()> {
     reject_negative(
         "auto_swap.settle_grace_ms",
         settings.auto_swap.settle_grace_ms,
+    )?;
+    reject_negative(
+        "auto_swap.pre_reset_burn_near_5h_ms",
+        settings.auto_swap.pre_reset_burn_near_5h_ms,
+    )?;
+    reject_negative(
+        "auto_swap.pre_reset_burn_near_7d_ms",
+        settings.auto_swap.pre_reset_burn_near_7d_ms,
     )?;
     reject_negative("token.refresh_slack_ms", settings.token.refresh_slack_ms)?;
     reject_negative(
@@ -396,6 +427,14 @@ pub fn set_auto_swap_resident_lower_tier(enabled: bool) -> Result<Arc<Settings>>
     upsert_auto_swap_resident_lower_tier(&path, enabled)
 }
 
+/// 把「重置前抢用」写入 `<config_dir>/config.toml`，返回新快照。
+///
+/// 只落盘，不改全局当前值；写序与 [`set_auto_swap_enabled`] 相同。
+pub fn set_auto_swap_pre_reset_burn(enabled: bool) -> Result<Arc<Settings>> {
+    let path = AppPaths::resolve()?.config_file();
+    upsert_auto_swap_pre_reset_burn(&path, enabled)
+}
+
 /// 读-改-写指定配置文件里的 `auto_swap.enabled`。
 fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_bool(path, "enabled", enabled)
@@ -409,6 +448,11 @@ fn upsert_auto_swap_prefer_lower_tier(path: &Path, prefer: bool) -> Result<Arc<S
 /// 读-改-写指定配置文件里的 `auto_swap.resident_lower_tier`。
 fn upsert_auto_swap_resident_lower_tier(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_bool(path, "resident_lower_tier", enabled)
+}
+
+/// 读-改-写指定配置文件里的 `auto_swap.pre_reset_burn`（issue #150）。
+fn upsert_auto_swap_pre_reset_burn(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
+    upsert_auto_swap_bool(path, "pre_reset_burn", enabled)
 }
 
 /// 读-改-写指定配置文件里的一个 `auto_swap` 布尔键。
@@ -604,6 +648,85 @@ threshold = 0.5
             load_from(&explicit).unwrap().auto_swap.pace_warn_threshold,
             0.7
         );
+    }
+
+    /// issue #147：键缺失或 Default 均为 false，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn pre_reset_burn_defaults_off() {
+        assert!(!AutoSwap::default().pre_reset_burn);
+        assert!(!Settings::default().auto_swap.pre_reset_burn);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert!(!s.auto_swap.pre_reset_burn);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert!(!stock.auto_swap.pre_reset_burn);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[auto_swap]\npre_reset_burn = true\n").unwrap();
+        assert!(load_from(&explicit).unwrap().auto_swap.pre_reset_burn);
+    }
+
+    /// issue #147：键缺失或 Default 均为 0.7，存量无此键的 `[auto_swap]` 仍能加载。
+    #[test]
+    fn pre_reset_burn_min_ratio_defaults_point_seven() {
+        assert_eq!(AutoSwap::default().pre_reset_burn_min_ratio, 0.7);
+        assert_eq!(Settings::default().auto_swap.pre_reset_burn_min_ratio, 0.7);
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert_eq!(s.auto_swap.pre_reset_burn_min_ratio, 0.7);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert_eq!(stock.auto_swap.pre_reset_burn_min_ratio, 0.7);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(&explicit, "[auto_swap]\npre_reset_burn_min_ratio = 0.8\n").unwrap();
+        assert_eq!(
+            load_from(&explicit).unwrap().auto_swap.pre_reset_burn_min_ratio,
+            0.8
+        );
+    }
+
+    /// issue #147：5h 默认 1 小时、7d 默认 2 天；缺键与显式值均可加载。
+    #[test]
+    fn pre_reset_burn_near_ms_defaults() {
+        assert_eq!(AutoSwap::default().pre_reset_burn_near_5h_ms, 3_600_000);
+        assert_eq!(AutoSwap::default().pre_reset_burn_near_7d_ms, 172_800_000);
+        assert_eq!(
+            Settings::default().auto_swap.pre_reset_burn_near_5h_ms,
+            3_600_000
+        );
+        assert_eq!(
+            Settings::default().auto_swap.pre_reset_burn_near_7d_ms,
+            172_800_000
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let s = load_from(&tmp.path().join("config.toml")).unwrap();
+        assert_eq!(s.auto_swap.pre_reset_burn_near_5h_ms, 3_600_000);
+        assert_eq!(s.auto_swap.pre_reset_burn_near_7d_ms, 172_800_000);
+
+        let path = tmp.path().join("stock.toml");
+        std::fs::write(&path, "[auto_swap]\nenabled = true\nthreshold = 0.5\n").unwrap();
+        let stock = load_from(&path).unwrap();
+        assert!(stock.auto_swap.enabled);
+        assert_eq!(stock.auto_swap.pre_reset_burn_near_5h_ms, 3_600_000);
+        assert_eq!(stock.auto_swap.pre_reset_burn_near_7d_ms, 172_800_000);
+
+        let explicit = tmp.path().join("explicit.toml");
+        std::fs::write(
+            &explicit,
+            "[auto_swap]\npre_reset_burn_near_5h_ms = 1000\npre_reset_burn_near_7d_ms = 2000\n",
+        )
+        .unwrap();
+        let loaded = load_from(&explicit).unwrap();
+        assert_eq!(loaded.auto_swap.pre_reset_burn_near_5h_ms, 1000);
+        assert_eq!(loaded.auto_swap.pre_reset_burn_near_7d_ms, 2000);
     }
 
     #[test]
@@ -839,6 +962,29 @@ usage_cache_max_age_ms = 4000
         assert!(s.proactive_renewal.enabled);
     }
 
+    /// issue #150：写回只动 `auto_swap.pre_reset_burn`：手写注释、其它键与其它段原样保留。
+    #[test]
+    fn upsert_auto_swap_pre_reset_burn_preserves_comments_and_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# 我的调优\n[auto_swap]\nthreshold = 0.5 # 别动\nenabled = true # 开关别动\n[proactive_renewal]\nenabled = true # 续期别动\n",
+        )
+        .unwrap();
+        upsert_auto_swap_pre_reset_burn(&path, true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# 我的调优"), "{raw}");
+        assert!(raw.contains("threshold = 0.5 # 别动"), "{raw}");
+        assert!(raw.contains("enabled = true # 开关别动"), "{raw}");
+        assert!(raw.contains("enabled = true # 续期别动"), "{raw}");
+        let s = load_from(&path).unwrap();
+        assert!(s.auto_swap.pre_reset_burn);
+        assert!(s.auto_swap.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+        assert!(s.proactive_renewal.enabled);
+    }
+
     /// 成品不再是合法 Settings 时报错，且不动盘。
     #[test]
     fn upsert_auto_swap_rejects_invalid_settings_without_writing() {
@@ -858,6 +1004,7 @@ usage_cache_max_age_ms = 4000
             Threshold(f64),
             Margin(f64),
             PaceWarn(f64),
+            BurnMin(f64),
             ErrContains(&'static str),
         }
         let cases: &[(&str, &str, Expect)] = &[
@@ -922,6 +1069,26 @@ usage_cache_max_age_ms = 4000
                 Expect::PaceWarn(1.0),
             ),
             (
+                "burn_min_above_one",
+                "[auto_swap]\npre_reset_burn_min_ratio = 1.5\n",
+                Expect::BurnMin(1.0),
+            ),
+            (
+                "burn_min_below_zero",
+                "[auto_swap]\npre_reset_burn_min_ratio = -0.2\n",
+                Expect::BurnMin(0.0),
+            ),
+            (
+                "burn_min_zero",
+                "[auto_swap]\npre_reset_burn_min_ratio = 0.0\n",
+                Expect::BurnMin(0.0),
+            ),
+            (
+                "burn_min_one",
+                "[auto_swap]\npre_reset_burn_min_ratio = 1.0\n",
+                Expect::BurnMin(1.0),
+            ),
+            (
                 "cooldown_negative",
                 "[auto_swap]\ncooldown_ms = -1\n",
                 Expect::ErrContains("cooldown_ms"),
@@ -930,6 +1097,16 @@ usage_cache_max_age_ms = 4000
                 "settle_grace_negative",
                 "[auto_swap]\nsettle_grace_ms = -1\n",
                 Expect::ErrContains("settle_grace_ms"),
+            ),
+            (
+                "burn_near_5h_negative",
+                "[auto_swap]\npre_reset_burn_near_5h_ms = -1\n",
+                Expect::ErrContains("pre_reset_burn_near_5h_ms"),
+            ),
+            (
+                "burn_near_7d_negative",
+                "[auto_swap]\npre_reset_burn_near_7d_ms = -1\n",
+                Expect::ErrContains("pre_reset_burn_near_7d_ms"),
             ),
             (
                 "refresh_slack_negative",
@@ -965,6 +1142,10 @@ usage_cache_max_age_ms = 4000
                 Expect::PaceWarn(want) => {
                     let s = got.unwrap_or_else(|e| panic!("{name}: unexpected error {e}"));
                     assert_eq!(s.auto_swap.pace_warn_threshold, *want, "{name}");
+                }
+                Expect::BurnMin(want) => {
+                    let s = got.unwrap_or_else(|e| panic!("{name}: unexpected error {e}"));
+                    assert_eq!(s.auto_swap.pre_reset_burn_min_ratio, *want, "{name}");
                 }
                 Expect::ErrContains(needle) => {
                     let err = got.unwrap_err().to_string();

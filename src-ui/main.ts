@@ -11,6 +11,7 @@ import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./members
 import { runUserQuotaRefresh } from "./membershipToast";
 import {
   autoSwapPreferLowerTierSwitchView,
+  autoSwapPreResetBurnSwitchView,
   autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
   behaviorPanelStatusText,
@@ -54,6 +55,7 @@ const BUSY_BUTTON_IDS = [
   "auto-swap-toggle",
   "auto-swap-prefer-lower-tier-toggle",
   "auto-swap-resident-lower-tier-toggle",
+  "auto-swap-pre-reset-burn-toggle",
 ] as const;
 
 const routes: Route[] = ["overview", "library"];
@@ -334,6 +336,13 @@ function paintAutoSwapResidentLowerTier(
   toggle.disabled = controlDisabledByBusy(store.get().busy, view.disabled);
 }
 
+function paintAutoSwapPreResetBurn(autoSwapEnabled: boolean, preResetBurn: boolean): void {
+  const view = autoSwapPreResetBurnSwitchView(autoSwapEnabled, preResetBurn);
+  const toggle = required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle");
+  toggle.setAttribute("aria-checked", String(view.checked));
+  toggle.disabled = controlDisabledByBusy(store.get().busy, view.disabled);
+}
+
 /**
  * 账号行为折叠 paint（issue #120）：只涂 aria-expanded、面板隐藏与收起态状态行。
  * 开合只由会话布尔 behaviorPanelExpanded 决定，任何开关已开都不得自动展开。
@@ -355,6 +364,7 @@ function paintBehaviorPanel(): void {
         checked("auto-swap-toggle"),
         checked("auto-swap-prefer-lower-tier-toggle"),
         checked("auto-swap-resident-lower-tier-toggle"),
+        checked("auto-swap-pre-reset-burn-toggle"),
       );
   const statusEl = required<HTMLParagraphElement>("behavior-panel-status");
   statusEl.textContent = status;
@@ -475,7 +485,8 @@ function paintSnapshot(next: Snapshot): void {
   paintAutoSwap(next.auto_swap);
   paintAutoSwapPreferLowerTier(next.auto_swap, next.auto_swap_prefer_lower_tier);
   paintAutoSwapResidentLowerTier(next.auto_swap, next.auto_swap_resident_lower_tier);
-  // 折叠 paint 放在四个开关之后：收起态状态行要读刚涂好的开关真值；开合不因快照改写。
+  paintAutoSwapPreResetBurn(next.auto_swap, next.auto_swap_pre_reset_burn);
+  // 折叠 paint 放在五个开关之后：收起态状态行要读刚涂好的开关真值；开合不因快照改写。
   paintBehaviorPanel();
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
@@ -517,6 +528,8 @@ function syncBusyChrome(): void {
   required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").disabled =
     controlDisabledByBusy(busy, !masterOn);
   required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").disabled =
+    controlDisabledByBusy(busy, !masterOn);
+  required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle").disabled =
     controlDisabledByBusy(busy, !masterOn);
   syncListedActionsBusy();
 }
@@ -1077,6 +1090,11 @@ async function init(): Promise<void> {
           "aria-checked",
         ) === "true";
       paintAutoSwapResidentLowerTier(saved, resident);
+      const burn =
+        required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle").getAttribute(
+          "aria-checked",
+        ) === "true";
+      paintAutoSwapPreResetBurn(saved, burn);
       paintBehaviorPanel();
       showToast(autoSwapSwitchView(saved).toast);
     });
@@ -1116,6 +1134,25 @@ async function init(): Promise<void> {
         paintAutoSwapResidentLowerTier(masterOn, saved);
         paintBehaviorPanel();
         showToast(autoSwapResidentLowerTierSwitchView(masterOn, saved).toast);
+      });
+    },
+  );
+  required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle").addEventListener(
+    "click",
+    () => {
+      const toggle = required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle");
+      if (toggle.disabled) {
+        return;
+      }
+      const next = toggle.getAttribute("aria-checked") !== "true";
+      void runSettingsAction("正在保存设置…", async () => {
+        const saved = await api.setAutoSwapPreResetBurn(next);
+        const masterOn =
+          required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
+          "true";
+        paintAutoSwapPreResetBurn(masterOn, saved);
+        paintBehaviorPanel();
+        showToast(autoSwapPreResetBurnSwitchView(masterOn, saved).toast);
       });
     },
   );

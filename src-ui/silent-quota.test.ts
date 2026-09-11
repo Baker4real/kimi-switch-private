@@ -41,6 +41,7 @@ function sampleSnapshot(message: UiMessage | null = null): Snapshot {
     auto_swap: false,
     auto_swap_prefer_lower_tier: false,
     auto_swap_resident_lower_tier: false,
+    auto_swap_pre_reset_burn: false,
     message,
   };
 }

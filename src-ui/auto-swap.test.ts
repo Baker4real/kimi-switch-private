@@ -8,6 +8,7 @@ import {
   autoSwapOptOutSwitchHtml,
   autoSwapOptOutSwitchView,
   autoSwapPreferLowerTierSwitchView,
+  autoSwapPreResetBurnSwitchView,
   autoSwapResidentLowerTierSwitchView,
   autoSwapSwitchView,
   behaviorPanelStatusText,
@@ -61,6 +62,21 @@ describe("silentQuotaMessage", () => {
     expect(silentQuotaMessage(failed)).toEqual(failed);
   });
 
+  it("抢用 / 回程成功文案只要 kind 是 auto_swap_success 就保留", () => {
+    const burn = {
+      text: "已抢用 工作机",
+      tone: "ok" as const,
+      kind: "auto_swap_success" as const,
+    };
+    const ret = {
+      text: "已回程 原号",
+      tone: "ok" as const,
+      kind: "auto_swap_success" as const,
+    };
+    expect(silentQuotaMessage(burn)).toEqual(burn);
+    expect(silentQuotaMessage(ret)).toEqual(ret);
+  });
+
   it("普通 toast 即使文案像自动切换也丢掉", () => {
     expect(
       silentQuotaMessage({
@@ -96,30 +112,42 @@ describe("账号库页「额度耗尽自动切换」开关（issue #68）", () =
   });
 });
 
-describe("behaviorPanelStatusText 收起态状态行真值表（issue #120）", () => {
+describe("behaviorPanelStatusText 收起态状态行真值表（issue #120 / #150）", () => {
   it("全关返回空串；只开续期 → 已开启：主动续期", () => {
-    expect(behaviorPanelStatusText(false, false, false, false)).toBe("");
-    expect(behaviorPanelStatusText(true, false, false, false)).toBe("已开启：主动续期");
+    expect(behaviorPanelStatusText(false, false, false, false, false)).toBe("");
+    expect(behaviorPanelStatusText(true, false, false, false, false)).toBe(
+      "已开启：主动续期",
+    );
   });
 
   it("只开自动切换 → 已开启：自动切换；自动切换 + 回驻 → 已开启：自动切换、回驻", () => {
-    expect(behaviorPanelStatusText(false, true, false, false)).toBe("已开启：自动切换");
-    expect(behaviorPanelStatusText(false, true, false, true)).toBe("已开启：自动切换、回驻");
+    expect(behaviorPanelStatusText(false, true, false, false, false)).toBe(
+      "已开启：自动切换",
+    );
+    expect(behaviorPanelStatusText(false, true, false, true, false)).toBe(
+      "已开启：自动切换、回驻",
+    );
   });
 
-  it("自动切换 + 优先低档 → 已开启：自动切换、优先低档；全开四项钉版", () => {
-    expect(behaviorPanelStatusText(false, true, true, false)).toBe(
+  it("自动切换 + 优先低档 → 已开启：自动切换、优先低档；全开五项钉版", () => {
+    expect(behaviorPanelStatusText(false, true, true, false, false)).toBe(
       "已开启：自动切换、优先低档",
     );
-    expect(behaviorPanelStatusText(true, true, true, true)).toBe(
-      "已开启：主动续期、自动切换、优先低档、回驻",
+    expect(behaviorPanelStatusText(true, true, true, true, true)).toBe(
+      "已开启：主动续期、自动切换、优先低档、回驻、重置前抢用",
     );
   });
 
-  it("自动切换关时不写优先低档 / 回驻（总开关关不算生效项）", () => {
-    expect(behaviorPanelStatusText(false, false, true, true)).toBe("");
+  it("自动切换 + 重置前抢用 → 已开启：自动切换、重置前抢用", () => {
+    expect(behaviorPanelStatusText(false, true, false, false, true)).toBe(
+      "已开启：自动切换、重置前抢用",
+    );
+  });
+
+  it("自动切换关时不写优先低档 / 回驻 / 重置前抢用（总开关关不算生效项）", () => {
+    expect(behaviorPanelStatusText(false, false, true, true, true)).toBe("");
     // 续期也关则无状态行；续期开则只写续期。
-    expect(behaviorPanelStatusText(true, false, true, true)).toBe("已开启：主动续期");
+    expect(behaviorPanelStatusText(true, false, true, true, true)).toBe("已开启：主动续期");
   });
 
   it("文案不含禁用词", () => {
@@ -127,13 +155,21 @@ describe("behaviorPanelStatusText 收起态状态行真值表（issue #120）", 
       for (const autoSwap of [false, true]) {
         for (const prefer of [false, true]) {
           for (const resident of [false, true]) {
-            const text = behaviorPanelStatusText(renewal, autoSwap, prefer, resident);
-            expect(text).not.toContain("切回");
-            expect(text).not.toContain("下拉");
-            expect(text).not.toContain("高级");
-            expect(text).not.toContain("更多");
-            expect(text).not.toContain("套餐");
-            expect(text).not.toMatch(/plan/i);
+            for (const burn of [false, true]) {
+              const text = behaviorPanelStatusText(
+                renewal,
+                autoSwap,
+                prefer,
+                resident,
+                burn,
+              );
+              expect(text).not.toContain("切回");
+              expect(text).not.toContain("下拉");
+              expect(text).not.toContain("高级");
+              expect(text).not.toContain("更多");
+              expect(text).not.toContain("套餐");
+              expect(text).not.toMatch(/plan/i);
+            }
           }
         }
       }
@@ -173,7 +209,7 @@ describe("账号库页「账号行为」一层折叠（issue #120）", () => {
     expect(libraryPage).not.toMatch(/id="behavior-panel-toggle"[^>]*aria-describedby/);
   });
 
-  it("静态首帧收起且对视觉/辅助技术隐藏，四个开关留在文档里且顺序正确", () => {
+  it("静态首帧收起且对视觉/辅助技术隐藏，五个开关留在文档里且顺序正确", () => {
     expect(libraryPage).toMatch(
       /id="behavior-panel-body"[^>]*class="[^"]*\bhidden\b[^"]*"/,
     );
@@ -182,11 +218,13 @@ describe("账号库页「账号行为」一层折叠（issue #120）", () => {
     const master = libraryPage.indexOf('id="auto-swap-toggle"');
     const prefer = libraryPage.indexOf('id="auto-swap-prefer-lower-tier-toggle"');
     const resident = libraryPage.indexOf('id="auto-swap-resident-lower-tier-toggle"');
+    const burn = libraryPage.indexOf('id="auto-swap-pre-reset-burn-toggle"');
     expect(panel).toBeGreaterThan(-1);
     expect(renewal).toBeGreaterThan(panel);
     expect(master).toBeGreaterThan(renewal);
     expect(prefer).toBeGreaterThan(master);
     expect(resident).toBeGreaterThan(prefer);
+    expect(burn).toBeGreaterThan(resident);
   });
 
   it("#117 内层折叠不并存：无「优先低档与回驻」标题、无第二层 caret / aria-expanded、无旧节点", () => {
@@ -239,7 +277,7 @@ describe("main.ts 账号行为折叠会话接线（issue #120）", () => {
     expect(main).not.toContain("config.toml");
   });
 
-  it("四个开关保存成功后都立刻重涂折叠状态行（不等下一次快照）", () => {
+  it("五个开关保存成功后都立刻重涂折叠状态行（不等下一次快照）", () => {
     const renewalStart = main.indexOf(
       'required<HTMLButtonElement>("renewal-toggle").addEventListener',
     );
@@ -255,17 +293,20 @@ describe("main.ts 账号行为折叠会话接线（issue #120）", () => {
     const residentStart = main.indexOf(
       'required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").addEventListener',
     );
+    const burnStart = main.indexOf(
+      'required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle").addEventListener',
+    );
     expect(renewalStart).toBeGreaterThan(-1);
     expect(titleStart).toBeGreaterThan(renewalStart);
     expect(masterStart).toBeGreaterThan(titleStart);
     expect(preferStart).toBeGreaterThan(masterStart);
     expect(residentStart).toBeGreaterThan(preferStart);
+    expect(burnStart).toBeGreaterThan(residentStart);
     expect(main.slice(renewalStart, titleStart)).toContain("paintBehaviorPanel();");
     expect(main.slice(masterStart, preferStart)).toContain("paintBehaviorPanel();");
     expect(main.slice(preferStart, residentStart)).toContain("paintBehaviorPanel();");
-    expect(main.slice(residentStart, residentStart + 900)).toContain(
-      "paintBehaviorPanel();",
-    );
+    expect(main.slice(residentStart, burnStart)).toContain("paintBehaviorPanel();");
+    expect(main.slice(burnStart, burnStart + 900)).toContain("paintBehaviorPanel();");
   });
 
   it("标题 click 只取反开合并重涂：不在 BUSY_BUTTON_IDS、不弹 toast（busy 时仍可开合）", () => {
@@ -375,6 +416,63 @@ describe("autoSwapResidentLowerTierSwitchView", () => {
       disabled: false,
       toast: "已开启额度恢复后回驻低档账号",
     });
+  });
+});
+
+describe("autoSwapPreResetBurnSwitchView（issue #150）", () => {
+  it("总开关关时子开关置灰，checked 仍反映持久化值", () => {
+    expect(autoSwapPreResetBurnSwitchView(false, false)).toEqual({
+      checked: false,
+      disabled: true,
+      toast: "已关闭重置前抢用",
+    });
+    expect(autoSwapPreResetBurnSwitchView(false, true)).toEqual({
+      checked: true,
+      disabled: true,
+      toast: "已开启重置前抢用",
+    });
+  });
+
+  it("总开关开时子开关可点，checked 反映持久化值", () => {
+    expect(autoSwapPreResetBurnSwitchView(true, false)).toEqual({
+      checked: false,
+      disabled: false,
+      toast: "已关闭重置前抢用",
+    });
+    expect(autoSwapPreResetBurnSwitchView(true, true)).toEqual({
+      checked: true,
+      disabled: false,
+      toast: "已开启重置前抢用",
+    });
+  });
+});
+
+describe("账号库页「重置前抢用」子开关（issue #150）", () => {
+  it("位于回驻开关之后且同处折叠面板内，role=switch，静态关且 disabled", () => {
+    expect(libraryPage).toContain('id="auto-swap-pre-reset-burn-toggle"');
+    expect(libraryPage).toMatch(/id="auto-swap-pre-reset-burn-toggle"[^>]*role="switch"/);
+    expect(libraryPage).toMatch(
+      /id="auto-swap-pre-reset-burn-toggle"[^>]*aria-checked="false"/,
+    );
+    expect(libraryPage).toMatch(/id="auto-swap-pre-reset-burn-toggle"[^>]*\sdisabled/);
+    const panel = libraryPage.indexOf('id="behavior-panel-body"');
+    const resident = libraryPage.indexOf('id="auto-swap-resident-lower-tier-toggle"');
+    const burn = libraryPage.indexOf('id="auto-swap-pre-reset-burn-toggle"');
+    expect(burn).toBeGreaterThan(resident);
+    expect(burn).toBeGreaterThan(panel);
+  });
+
+  it("文案为重置前抢用并说明烧尾巴与自动切回，不写套餐、plan 或三个参数", () => {
+    expect(libraryPage).toContain("重置前抢用");
+    expect(libraryPage).toContain("临近重置时自动切到快清零的停泊账号烧尾巴，烧完自动切回");
+    expect(libraryPage).toContain("默认关闭");
+    const start = libraryPage.indexOf("auto-swap-pre-reset-burn");
+    const snippet = libraryPage.slice(start, start + 900);
+    expect(snippet).not.toContain("套餐");
+    expect(snippet).not.toMatch(/\bplan\b/i);
+    expect(snippet).not.toContain("pre_reset_burn_min_ratio");
+    expect(snippet).not.toContain("pre_reset_burn_near_5h_ms");
+    expect(snippet).not.toContain("pre_reset_burn_near_7d_ms");
   });
 });
 

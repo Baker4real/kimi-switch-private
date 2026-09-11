@@ -27,6 +27,7 @@ describe("createApi 动词与命令字符串", () => {
     await api.setAutoSwap(true);
     await api.setAutoSwapPreferLowerTier(true);
     await api.setAutoSwapResidentLowerTier(true);
+    await api.setAutoSwapPreResetBurn(true);
     await api.setAutoSwapOptOut("acc-6", true);
 
     expect(invoke.mock.calls).toEqual([
@@ -46,6 +47,7 @@ describe("createApi 动词与命令字符串", () => {
       ["set_auto_swap", { enabled: true }],
       ["set_auto_swap_prefer_lower_tier", { enabled: true }],
       ["set_auto_swap_resident_lower_tier", { enabled: true }],
+      ["set_auto_swap_pre_reset_burn", { enabled: true }],
       ["set_auto_swap_opt_out", { id: "acc-6", enabled: true }],
     ]);
   });

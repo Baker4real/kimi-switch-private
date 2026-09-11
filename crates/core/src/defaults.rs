@@ -58,6 +58,23 @@ pub const AUTO_SWAP_PACE_PRE_SWAP: bool = false;
 /// 当前账号最大已用比例须 ≥ 此值才走 pace 路径。默认 0.8。不进 GUI。
 pub const AUTO_SWAP_PACE_WARN_THRESHOLD: f64 = 0.8;
 
+/// 重置前抢用子开关（issue #147 / ADR-0014）。默认关闭。
+///
+/// 开启后，当前账号未达耗尽、pace 未命中时，可切到临近重置且该窗口已用超过
+/// 抢用水位的合格停泊账号。判定只读已收集快照。
+pub const AUTO_SWAP_PRE_RESET_BURN: bool = false;
+
+/// 重置前抢用水位（0.0~1.0）（issue #147 / ADR-0014）。
+///
+/// 停泊账号临近重置的窗口自身已用比例须 > 此值才成为抢用目标。默认 0.7。
+pub const AUTO_SWAP_PRE_RESET_BURN_MIN_RATIO: f64 = 0.7;
+
+/// 5 小时窗重置前抢用的临近窗口（毫秒）（issue #147 / ADR-0014）。默认 1 小时。
+pub const AUTO_SWAP_PRE_RESET_BURN_NEAR_5H_MS: i64 = 60 * 60 * 1000;
+
+/// 7 天窗重置前抢用的临近窗口（毫秒）（issue #147 / ADR-0014）。默认 2 天。
+pub const AUTO_SWAP_PRE_RESET_BURN_NEAR_7D_MS: i64 = 2 * 24 * 60 * 60 * 1000;
+
 // ============================================================
 // 额度状态视觉阈值（仅影响展示，不影响 AutoSwap 决策）
 // ============================================================
