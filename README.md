@@ -9,7 +9,7 @@ intent: Install and use the Kimi Code account switcher GUI and CLI.
 [Kimi Code](https://www.kimi.com/) 多账号管理工具：浏览器授权添加账号、一键切换、额度一目了然。
 以 Windows 为主：图形界面和命令行两个版本，单文件 exe、无运行时依赖。
 
-![主界面：总览与账号库两个页签，账号行为默认收起](docs/screenshot-light.png)
+![主界面：账号库页（2026-09-11 改版后，账号行为默认收起）](docs/screenshot-library-20260911.jpg)
 
 ## 功能
 
