@@ -46,7 +46,7 @@ One GitHub issue per ticket. Do not close or rewrite the parent spec.
 - **Blocking**: same native `blocked_by` as Wayfinding below. `issue_id` is the blocker's numeric **database id**, not `#number`.
 - **Parent/child**: attach each ticket as a GitHub sub-issue of the parent: `POST repos/Baker4real/kimi-switch-private/issues/<parent-number>/sub_issues` with JSON body `{"sub_issue_id": <child-database-id>}`. `sub_issue_id` must be a JSON integer. `gh api -F` stringifies the field and GitHub returns 422; write a UTF-8 JSON file and pass `--input`.
 - GitHub issue database ids exceed .NET `Int32` (example ~5.4e9). Do not `[int]`-cast `.id`. Keep the decimal in the JSON text, or use `[long]`.
-- Verify: parent `sub_issues_summary.total`, and each child's `issue_dependencies_summary`. `GET .../issues/<n>/sub_issues` may EOF; the parent summary is the live count.
+- Verify: parent `sub_issues_summary.total`, and each child's `issue_dependencies_summary`. `GET .../issues/<n>/sub_issues` may EOF; the parent summary is the live count, but right after attaching it can lag briefly (observed `total=4` immediately after attaching 5 while the list endpoint already showed 5; summary caught up within a minute). Verify with both: list endpoint now + summary re-read a moment later.
 
 ## When a skill says "fetch the relevant ticket"
 
