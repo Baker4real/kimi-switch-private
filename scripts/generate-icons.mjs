@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// 变形 K 图标生成器（issue #4；2026-09 高级感重设计：方向 D「宣纸墨印」）。
+// 变形 K 图标生成器（issue #4；2026-09-11 重设计：与标题栏徽标同源的蓝底白 K）。
 //
-// 设计目标：Windows 任务栏可见的圆角底变形 K，小尺寸下仍是实心块且 K 可辨认；
-// 米白纸感底（微渐变）+ 墨绿实心 K + 印刷双线框（>=64px 帧），K 缩小至 84% 留白；
-// 图形为自绘几何（竖干胶囊 + 双斜臂胶囊的并集），不复制官方 Kimi 商标路径。
+// 设计目标：任务栏图标与应用内标题栏徽标（src-ui/index.html `.window-app-mark`，
+// issue #132）视觉一致——蓝色纵向渐变圆角方块 + 白色描边 K + 右上角四角星芒；
+// 全部几何 1:1 归一化自徽标 SVG 的 40×40 viewBox，小尺寸（<32px）帧省略星芒并
+// 加粗描边保证 16px 任务栏可读；图形为自绘几何，不复制官方 Kimi 商标路径。
 //
 // 实现说明：零运行时依赖（仅用 Node 内置 zlib 做 DEFLATE），手写 PNG 编码器与
 // 多尺寸 ICO 组装器；渲染采用超采样盒式降采样得到平滑抗锯齿边缘。
@@ -18,45 +19,44 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT_DIR = path.join(ROOT, 'src-tauri', 'icons');
 
 // ---------------------------------------------------------------------------
-// 配色：「宣纸墨印」——米白纸感底 + 墨绿实心 K，与 src-ui/styles.css 纸感色系同源。
-// 高级感来自纸墨反差与印刷双线框，不依赖投影/柔光。
-const COL_PAPER_TOP = [0xf8, 0xf4, 0xe9]; // 纸面亮部（左上）
-const COL_PAPER_BOT = [0xe9, 0xe1, 0xcf]; // 纸面暗部（右下）
-const COL_INK = [0x1f, 0x3d, 0x33]; // 墨绿（K 字形与双线框共用）
-
-// 精饰参数：双线框只在 >=64px 的帧启用，小尺寸只留纸底 + 墨 K 保证剪影可读。
-const FINISH = {
-  glyphScale: 0.84, // K 形整体缩小比例（美术馆式留白）
-  ringInsets: [0.03, 0.052], // 双线框各自距底板边缘的内缩量（归一化）
-  ringHalfW: 0.0032, // 单根线框半宽
-  ringAlpha: 0.5, // 线框不透明度
-};
+// 配色：与标题栏徽标同源（src-ui/styles.css 的 .window-app-mark 系列变量）——
+// 蓝色纵向渐变底板 + 纯白 K 与星芒。
+const COL_BLUE_TOP = [0x60, 0xa5, 0xfa]; // 渐变顶部（--blue-fill）
+const COL_BLUE_BOT = [0x3b, 0x82, 0xf6]; // 渐变底部（--monitor-dot）
+const COL_WHITE = [0xff, 0xff, 0xff]; // K 描边与星芒（--text-inverse）
 
 // ---------------------------------------------------------------------------
-// 几何参数（归一化到单位画布 [0,1]×[0,1]，变形 K 的全部自绘形状）：
-//   底板：圆角矩形；大尺寸留边多些显圆润，小于 64px 时近满幅铺满保证“实心底”观感。
-//   K 形：左竖干为圆角竖条；右上臂 / 右下臂是两条端点圆头线段（胶囊），
-//         与竖干右缘中点相接形成连续剪影——这是本图标“变形”风格化的来源。
+// 几何参数（归一化自徽标 SVG 的 40×40 viewBox，坐标 = SVG 值 / 40）：
+//   底板：满幅圆角矩形（rx=12 -> 半径 0.3）；
+//   K 形：徽标描边折线 M13 11 V29 M25.5 11 L13.9 20.6 L25.5 29，拆成三条圆头
+//         线段（胶囊）取并集，圆头端点天然等价于 round linecap/linejoin；
+//   星芒：右上四角星为四条二次贝塞尔围成的填充形，展平为多边形做填充判定。
 const GEO = {
-  padBig: 0.05,
-  radBig: 0.205,
-  padSm: 0.008,
-  radSm: 0.155,
+  plateRadius: 0.3, // 12 / 40
 
-  stemCx: 0.372,
-  stemHalfW: 0.0825,
-  stemCy: 0.5,
-  stemHalfH: 0.29,
-  stemCorner: 0.056,
+  stemAX: 0.325, // 竖干 (13,11) -> (13,29)
+  stemAY: 0.275,
+  stemBX: 0.325,
+  stemBY: 0.725,
+  joinX: 0.3475, // 上下臂公共拐点 (13.9,20.6)
+  joinY: 0.515,
+  armUpX: 0.6375, // 上臂另一端 (25.5,11)
+  armUpY: 0.275,
+  armDnX: 0.6375, // 下臂另一端 (25.5,29)
+  armDnY: 0.725,
 
-  joinX: 0.435,
-  joinY: 0.5,
-  armUpX: 0.725,
-  armUpY: 0.255,
-  armDnX: 0.725,
-  armDnY: 0.745,
-  armHalfW: 0.0815,
+  strokeHalfBig: 0.0425, // 徽标 stroke-width 3.4 的半宽（3.4/2/40）
+  strokeHalfSm: 0.0625, // <32px 帧加粗到 2.5 等效宽度，保证 16px 可辨认
 };
+
+// 星芒轮廓：四条二次贝塞尔（[起点, 控制点, 终点]），归一化坐标。
+const SPARK_CURVES = [
+  [[0.78, 0.1425], [0.7995, 0.2205], [0.8775, 0.24]],
+  [[0.8775, 0.24], [0.7995, 0.2595], [0.78, 0.3375]],
+  [[0.78, 0.3375], [0.7605, 0.2595], [0.6825, 0.24]],
+  [[0.6825, 0.24], [0.7605, 0.2205], [0.78, 0.1425]],
+];
+const SPARK_FLATTEN = 8; // 每条贝塞尔细分的直线段数（超采样下足够平滑）
 
 // 圆角矩形 SDF（返回值 < 0 表示点在形状内部）。
 function sdfRoundRect(px, py, cx, cy, hw, hh, r) {
@@ -79,47 +79,57 @@ function sdfSegment(px, py, ax, ay, bx, by, r) {
   return Math.hypot(dx, dy) - r;
 }
 
-// 字形 SDF 距离（< 0 表示在 K 内部）；s 为整体缩放（<1 缩小留白），距离值随缩放等比换算。
-function glyphDist(nx, ny, s = 1) {
+// K 形描边距离（< 0 表示在描边内）；strokeHalf 为归一化描边半宽。
+function glyphDist(nx, ny, strokeHalf) {
   const g = GEO;
-  const x = (nx - 0.5) / s + 0.5;
-  const y = (ny - 0.5) / s + 0.5;
-  const stem = sdfRoundRect(
-    x, y,
-    g.stemCx, g.stemCy, g.stemHalfW, g.stemHalfH, g.stemCorner,
-  );
-  const armUp = sdfSegment(x, y, g.joinX, g.joinY, g.armUpX, g.armUpY, g.armHalfW);
-  const armDn = sdfSegment(x, y, g.joinX, g.joinY, g.armDnX, g.armDnY, g.armHalfW);
-  return Math.min(stem, armUp, armDn) * s;
+  const stem = sdfSegment(nx, ny, g.stemAX, g.stemAY, g.stemBX, g.stemBY, strokeHalf);
+  const armUp = sdfSegment(nx, ny, g.joinX, g.joinY, g.armUpX, g.armUpY, strokeHalf);
+  const armDn = sdfSegment(nx, ny, g.joinX, g.joinY, g.armDnX, g.armDnY, strokeHalf);
+  return Math.min(stem, armUp, armDn);
+}
+
+// 星芒多边形：四条二次贝塞尔各自展平成 SPARK_FLATTEN 段直线。
+const SPARK_POLY = (() => {
+  const pts = [];
+  for (const [[x0, y0], [cx, cy], [x1, y1]] of SPARK_CURVES) {
+    for (let i = 0; i < SPARK_FLATTEN; i++) {
+      const t = i / SPARK_FLATTEN;
+      const u = 1 - t;
+      pts.push([u * u * x0 + 2 * u * t * cx + t * t * x1, u * u * y0 + 2 * u * t * cy + t * t * y1]);
+    }
+  }
+  return pts;
+})();
+
+// 偶奇规则点在多边形内判定（星芒填充用）。
+function pointInPolygon(px, py, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i];
+    const [xj, yj] = poly[j];
+    if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
 }
 
 // ---------------------------------------------------------------------------
-// 逐采样点颜色：纸面微渐变 + 印刷双线框 + 墨绿 K 分层叠加，返回 RGBA。
+// 逐采样点颜色：蓝色纵向渐变底板 + 白色描边 K + 星芒分层叠加，返回 RGBA。
 const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 function sampleColor(nx, ny, size) {
   const g = GEO;
-  const smallMode = size < 64;
-  const pad = smallMode ? g.padSm : g.padBig;
-  const rad = smallMode ? g.radSm : g.radBig;
-  const dBg = sdfRoundRect(nx, ny, 0.5, 0.5, 0.5 - pad, 0.5 - pad, rad);
+  const smallMode = size < 32; // 小尺寸帧省略星芒、加粗描边
+  const dBg = sdfRoundRect(nx, ny, 0.5, 0.5, 0.5, 0.5, g.plateRadius);
   if (dBg > 0) return [0, 0, 0, 0];
 
-  // 纸面底板：左上亮 -> 右下暗的微弱斜向渐变。
-  let col = mix(COL_PAPER_TOP, COL_PAPER_BOT, clamp01(0.25 * nx + 0.75 * ny));
+  // 底板：自上而下的蓝色纵向渐变（与徽标 linearGradient x1=0,y1=0 -> x2=0,y2=1 同向）。
+  let col = mix(COL_BLUE_TOP, COL_BLUE_BOT, ny);
 
-  // 印刷双线框：贴近底板边缘的两根低透明度墨绿细线（书装框感）。
-  if (!smallMode) {
-    for (const inset of FINISH.ringInsets) {
-      const ra = FINISH.ringAlpha * clamp01(1 - Math.abs(dBg + inset + FINISH.ringHalfW) / FINISH.ringHalfW);
-      if (ra > 0) col = mix(col, COL_INK, ra);
-    }
-  }
-
-  // K 形：实心墨绿，缩小后盖在最上层。
-  if (glyphDist(nx, ny, FINISH.glyphScale) <= 0) {
-    col = COL_INK;
+  // 白色层：K 描边 + 星芒（小尺寸帧只留加粗 K）。
+  if (glyphDist(nx, ny, smallMode ? g.strokeHalfSm : g.strokeHalfBig) <= 0) {
+    col = COL_WHITE;
+  } else if (!smallMode && pointInPolygon(nx, ny, SPARK_POLY)) {
+    col = COL_WHITE;
   }
   return [col[0], col[1], col[2], 255];
 }
