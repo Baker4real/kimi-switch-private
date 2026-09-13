@@ -88,10 +88,32 @@ export function autoSwapPreResetBurnSwitchView(
   };
 }
 
+/** 「pace 预切换」子开关（issue #159，ADR-0013）的展示决策。不碰 DOM。 */
+export interface AutoSwapPacePreSwapSwitchView {
+  /** 开关是否处于开态（对应 aria-checked）。总开关关闭时仍反映持久化值。 */
+  checked: boolean;
+  /** 总开关关闭时置灰，不可点。 */
+  disabled: boolean;
+  /** 切换成功后的 toast 文案。 */
+  toast: string;
+}
+
+/** 总开关关只置灰子开关，不把持久化 checked 清掉。 */
+export function autoSwapPacePreSwapSwitchView(
+  autoSwapEnabled: boolean,
+  pacePreSwap: boolean,
+): AutoSwapPacePreSwapSwitchView {
+  return {
+    checked: pacePreSwap,
+    disabled: !autoSwapEnabled,
+    toast: pacePreSwap ? "已开启 pace 预切换" : "已关闭 pace 预切换",
+  };
+}
+
 /**
  * 「账号行为」一层折叠收起态的状态行文案（issue #120，取代 #116/#117 内层折叠）：
  * 标题下用一行字写出当前生效项（「已开启：……」）。纯函数，不碰 DOM、不碰盘；由 paint 层只在收起时渲染。
- * 总开关关闭时不写「优先低档」/「回驻」/「重置前抢用」（置灰不算生效项）；全关返回空串（不写状态行）。
+ * 总开关关闭时不写「优先低档」/「回驻」/「pace 预切换」/「重置前抢用」（置灰不算生效项）；全关返回空串（不写状态行）。
  */
 export function behaviorPanelStatusText(
   proactiveRenewal: boolean,
@@ -99,6 +121,7 @@ export function behaviorPanelStatusText(
   preferLowerTier: boolean,
   residentLowerTier: boolean,
   preResetBurn: boolean,
+  pacePreSwap: boolean,
 ): string {
   const items: string[] = [];
   if (proactiveRenewal) {
@@ -111,6 +134,9 @@ export function behaviorPanelStatusText(
     }
     if (residentLowerTier) {
       items.push("回驻");
+    }
+    if (pacePreSwap) {
+      items.push("pace 预切换");
     }
     if (preResetBurn) {
       items.push("重置前抢用");

@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import "./styles.css";
-import { api, commandError, type Snapshot } from "./api";
+import { api, commandError, isErrorMessageTone, type Snapshot, type SwapOutcome } from "./api";
 import { accountStatusBodyHtml, accountStatusView } from "./account-status";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { accountDisplayName, displayInitial, parseAliasInput } from "./labels";
@@ -10,6 +10,7 @@ import { credentialRecoveredToast } from "./credentialToast";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
 import {
+  autoSwapPacePreSwapSwitchView,
   autoSwapPreferLowerTierSwitchView,
   autoSwapPreResetBurnSwitchView,
   autoSwapResidentLowerTierSwitchView,
@@ -29,6 +30,7 @@ import {
   parkedAccountCount,
   shouldArmToastDismiss,
   snapshotAnnouncement,
+  snapshotWithSwitchedCurrent,
   toastDismissMs,
   type ListFocusKey,
   type SnapshotAnnounceSource,
@@ -55,6 +57,7 @@ const BUSY_BUTTON_IDS = [
   "auto-swap-toggle",
   "auto-swap-prefer-lower-tier-toggle",
   "auto-swap-resident-lower-tier-toggle",
+  "auto-swap-pace-pre-swap-toggle",
   "auto-swap-pre-reset-burn-toggle",
 ] as const;
 
@@ -90,14 +93,14 @@ const silentQuota = createSilentQuotaScheduler({
     },
   },
   host: {
-    isHidden: () => document.hidden,
     isBusy: () => store.get().busy,
     accountCount: () => {
       const snapshot = store.get().snapshot;
       return snapshot ? snapshot.accounts.length : null;
     },
     accounts: () => store.get().snapshot?.accounts ?? null,
-    listAccounts: () => api.listAccounts(),
+    // 适应性轮询（issue #161）：加密轮只对当前账号发真实查询；"all" 走全量。
+    listAccounts: (scope) => api.listAccounts(false, scope === "current"),
     applySnapshot: (snapshot, generation) => applySnapshot(snapshot, generation),
     toast: (text, isError) => showToast(text, isError),
   },
@@ -343,6 +346,13 @@ function paintAutoSwapPreResetBurn(autoSwapEnabled: boolean, preResetBurn: boole
   toggle.disabled = controlDisabledByBusy(store.get().busy, view.disabled);
 }
 
+function paintAutoSwapPacePreSwap(autoSwapEnabled: boolean, pacePreSwap: boolean): void {
+  const view = autoSwapPacePreSwapSwitchView(autoSwapEnabled, pacePreSwap);
+  const toggle = required<HTMLButtonElement>("auto-swap-pace-pre-swap-toggle");
+  toggle.setAttribute("aria-checked", String(view.checked));
+  toggle.disabled = controlDisabledByBusy(store.get().busy, view.disabled);
+}
+
 /**
  * 账号行为折叠 paint（issue #120）：只涂 aria-expanded、面板隐藏与收起态状态行。
  * 开合只由会话布尔 behaviorPanelExpanded 决定，任何开关已开都不得自动展开。
@@ -365,6 +375,7 @@ function paintBehaviorPanel(): void {
         checked("auto-swap-prefer-lower-tier-toggle"),
         checked("auto-swap-resident-lower-tier-toggle"),
         checked("auto-swap-pre-reset-burn-toggle"),
+        checked("auto-swap-pace-pre-swap-toggle"),
       );
   const statusEl = required<HTMLParagraphElement>("behavior-panel-status");
   statusEl.textContent = status;
@@ -486,7 +497,8 @@ function paintSnapshot(next: Snapshot): void {
   paintAutoSwapPreferLowerTier(next.auto_swap, next.auto_swap_prefer_lower_tier);
   paintAutoSwapResidentLowerTier(next.auto_swap, next.auto_swap_resident_lower_tier);
   paintAutoSwapPreResetBurn(next.auto_swap, next.auto_swap_pre_reset_burn);
-  // 折叠 paint 放在五个开关之后：收起态状态行要读刚涂好的开关真值；开合不因快照改写。
+  paintAutoSwapPacePreSwap(next.auto_swap, next.auto_swap_pace_pre_swap);
+  // 折叠 paint 放在六个开关之后：收起态状态行要读刚涂好的开关真值；开合不因快照改写。
   paintBehaviorPanel();
   const current = next.accounts.find((row) => row.active);
   required<HTMLHeadingElement>("current-title").textContent = current?.display_name ?? "--";
@@ -528,6 +540,8 @@ function syncBusyChrome(): void {
   required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").disabled =
     controlDisabledByBusy(busy, !masterOn);
   required<HTMLButtonElement>("auto-swap-resident-lower-tier-toggle").disabled =
+    controlDisabledByBusy(busy, !masterOn);
+  required<HTMLButtonElement>("auto-swap-pace-pre-swap-toggle").disabled =
     controlDisabledByBusy(busy, !masterOn);
   required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle").disabled =
     controlDisabledByBusy(busy, !masterOn);
@@ -600,21 +614,13 @@ function applySnapshot(
 
 function stopSilentQuotaQueries(): void {
   silentQuota.stop();
-  document.removeEventListener("visibilitychange", onVisibilityChange);
   window.removeEventListener("pagehide", stopSilentQuotaQueries);
   window.removeEventListener("beforeunload", stopSilentQuotaQueries);
 }
 
-function onVisibilityChange(): void {
-  if (document.hidden) {
-    silentQuota.pause();
-    return;
-  }
-  silentQuota.arm();
-}
-
 function wireSilentQuota(): void {
-  document.addEventListener("visibilitychange", onVisibilityChange);
+  // 界面可见性与静默轮询解耦（issue #160）：不监听 visibilitychange，
+  // 隐藏/最小化时排程与执行照常，无暂停与可见补跳。
   window.addEventListener("pagehide", stopSilentQuotaQueries);
   window.addEventListener("beforeunload", stopSilentQuotaQueries);
 }
@@ -652,6 +658,119 @@ async function runSettingsAction(label: string, action: () => Promise<void>): Pr
   } finally {
     setBusy(false);
   }
+}
+
+/** 手动切换流的宿主面（issue #157）：把 busy / 世代 / 快照应用 / toast 从
+ * main 接线中解耦出来，供切换流纯编排与测试复用（runDeviceAuth 同款模式）。 */
+export interface SwapFlowHost {
+  isBusy(): boolean;
+  setBusy(busy: boolean, label?: string): void;
+  reserveGeneration(): number;
+  currentSnapshot(): Snapshot | null;
+  applySnapshot(next: Snapshot, generation: number): void;
+  showToast(text: string, isError?: boolean): void;
+  reportError(message: string): void;
+  refreshInBackground(): void;
+}
+
+/**
+ * 切换结果 toast 文案（issue #156）：目标凭证本地已确认失效时，警告文本叠加
+ * 在成功提示之后——单条 toast 同时承载「已切换到 X」与「建议重新授权」，成功
+ * 提示本体不被顶掉；健康卡（credential_warning 为 null）走原文案，一字不差。
+ */
+function swapToastText(outcome: SwapOutcome): string {
+  return outcome.credential_warning === null
+    ? outcome.message.text
+    : `${outcome.message.text}；${outcome.credential_warning}`;
+}
+
+/** 警告存在时按错误样式弹出：alert 样式更醒目，且 toastDismissMs 按 isError
+ * 给足按字数的阅读时间。 */
+function swapToastIsError(outcome: SwapOutcome): boolean {
+  return isErrorMessageTone(outcome.message.tone) || outcome.credential_warning !== null;
+}
+
+/**
+ * 手动切换流（issue #157，spec #152 决策 1–2）：切换命令在 activate（含审计、
+ * 手动保持期）提交后立即返回；成功响应即背书——立即把所点卡片标记为当前账号，
+ * 额度数字沿用该账号既有缓存值（不空白、不错配）；随后在后台触发快照重列，
+ * 不打忙碌闸门，用户感知的完成线 = 界面恢复可用，与快照耗时无关。
+ * 死卡目标（issue #156 / 决策 9）：切换照常成功，警告叠加在成功 toast 上呈现。
+ */
+export async function runSwapFlow(
+  id: string,
+  host: SwapFlowHost,
+  swapAccount: (id: string) => Promise<SwapOutcome>,
+): Promise<boolean> {
+  if (host.isBusy()) {
+    return false;
+  }
+  host.setBusy(true, "正在切换…");
+  const generation = host.reserveGeneration();
+  try {
+    const outcome = await swapAccount(id);
+    const current = host.currentSnapshot();
+    if (current !== null) {
+      host.applySnapshot(snapshotWithSwitchedCurrent(current, outcome.account_id), generation);
+    }
+    host.showToast(swapToastText(outcome), swapToastIsError(outcome));
+    // 后台重列在忙碌释放前发起、不等待其结果——期间可立刻再切另一张卡。
+    host.refreshInBackground();
+    return true;
+  } catch (error) {
+    host.reportError(commandError(error).message);
+    return false;
+  } finally {
+    host.setBusy(false);
+  }
+}
+
+/** 切换成功后的后台快照重列（issue #157）：不打忙碌闸门、不挡再次切换；结果经
+ * 世代守卫应用——用户期间又发起新操作（含再切一张卡）时，这份落后快照自然
+ * 落空，由新操作自己的结果接管；失败静默，界面已有切换成功背书与缓存值，
+ * 静默轮询稍后会再试。 */
+function refreshAfterSwapInBackground(): void {
+  const generation = silentQuota.generation.next();
+  void (async () => {
+    try {
+      const next = await api.listAccounts();
+      if (store.get().busy) {
+        return;
+      }
+      if (!silentQuota.generation.applyIfCurrent(generation)) {
+        return;
+      }
+      applySnapshot(next, generation);
+    } catch {
+      // 后台刷新失败不 toast：额度区此刻显示的是切换成功账号的缓存值。
+    }
+  })();
+}
+
+/** 点卡片「切换」入口：走解耦切换流；成功收起就近重试面板，失败留给面板复用。 */
+async function runSwap(id: string): Promise<boolean> {
+  lastActionError = "";
+  const ok = await runSwapFlow(
+    id,
+    {
+      isBusy: () => store.get().busy,
+      setBusy,
+      reserveGeneration: reserveUserSnapshotGeneration,
+      currentSnapshot: () => store.get().snapshot,
+      applySnapshot,
+      showToast,
+      reportError: (message) => {
+        lastActionError = message;
+        showToast(message, true);
+      },
+      refreshInBackground: refreshAfterSwapInBackground,
+    },
+    (target) => api.swapAccount(target),
+  );
+  if (ok) {
+    hideLibraryRetry();
+  }
+  return ok;
 }
 
 /** 两个「刷新」按钮专用：列出成功后再弹会员失败 toast。启动 / 静默 / 定时不走这里。 */
@@ -978,10 +1097,12 @@ function wireList(): void {
     }
     if (swap?.dataset.swap) {
       const id = swap.dataset.swap;
+      // 切换流（issue #157）：activate 后立即返回并标记当前账号，额度后台刷新；
+      // 失败就近重试，点按钮即复用刚才那次切换。
       const retrySwap = (): void => {
         hideLibraryRetry();
         void (async () => {
-          const ok = await runAction("正在切换…", () => api.swapAccount(id));
+          const ok = await runSwap(id);
           if (!ok && lastActionError !== "") {
             showLibraryRetry(lastActionError, retrySwap);
           }
@@ -1090,6 +1211,11 @@ async function init(): Promise<void> {
           "aria-checked",
         ) === "true";
       paintAutoSwapResidentLowerTier(saved, resident);
+      const pace =
+        required<HTMLButtonElement>("auto-swap-pace-pre-swap-toggle").getAttribute(
+          "aria-checked",
+        ) === "true";
+      paintAutoSwapPacePreSwap(saved, pace);
       const burn =
         required<HTMLButtonElement>("auto-swap-pre-reset-burn-toggle").getAttribute(
           "aria-checked",
@@ -1134,6 +1260,25 @@ async function init(): Promise<void> {
         paintAutoSwapResidentLowerTier(masterOn, saved);
         paintBehaviorPanel();
         showToast(autoSwapResidentLowerTierSwitchView(masterOn, saved).toast);
+      });
+    },
+  );
+  required<HTMLButtonElement>("auto-swap-pace-pre-swap-toggle").addEventListener(
+    "click",
+    () => {
+      const toggle = required<HTMLButtonElement>("auto-swap-pace-pre-swap-toggle");
+      if (toggle.disabled) {
+        return;
+      }
+      const next = toggle.getAttribute("aria-checked") !== "true";
+      void runSettingsAction("正在保存设置…", async () => {
+        const saved = await api.setAutoSwapPacePreSwap(next);
+        const masterOn =
+          required<HTMLButtonElement>("auto-swap-toggle").getAttribute("aria-checked") ===
+          "true";
+        paintAutoSwapPacePreSwap(masterOn, saved);
+        paintBehaviorPanel();
+        showToast(autoSwapPacePreSwapSwitchView(masterOn, saved).toast);
       });
     },
   );

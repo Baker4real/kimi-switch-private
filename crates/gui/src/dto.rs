@@ -188,9 +188,18 @@ pin_dto_fields!(
     "auto_swap_prefer_lower_tier",
     "auto_swap_resident_lower_tier",
     "auto_swap_pre_reset_burn",
+    "auto_swap_pace_pre_swap",
     "message",
 );
 pin_dto_fields!(UI_MESSAGE_JSON_KEYS, UI_API_TS, "text", "tone", "kind",);
+pin_dto_fields!(
+    SWAP_OUTCOME_JSON_KEYS,
+    UI_API_TS,
+    "account_id",
+    "display_name",
+    "message",
+    "credential_warning",
+);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QuotaView {
@@ -396,6 +405,8 @@ pub struct Snapshot {
     pub auto_swap_resident_lower_tier: bool,
     /// 「重置前抢用」子开关（issue #150）：直读 config.toml，默认关。
     pub auto_swap_pre_reset_burn: bool,
+    /// 「pace 预切换」子开关（issue #159，ADR-0013）：直读 config.toml，默认关。
+    pub auto_swap_pace_pre_swap: bool,
     pub message: Option<UiMessage>,
 }
 
@@ -403,6 +414,24 @@ pub struct Snapshot {
 pub struct AuthLink {
     pub url: String,
     pub user_code: String,
+}
+
+/// 手动切换的立即返回载荷（issue #157，spec #152 决策 1–2）：activate（含审计
+/// 追加、手动保持期写入）已提交的成功背书，命令不再同步等待额度快照重列。前端
+/// 据 `account_id` 立即把所点卡片标记为当前账号；额度数字沿用该账号既有缓存值，
+/// 由后台快照到齐后整体刷新。
+#[derive(Debug, Clone, Serialize)]
+pub struct SwapOutcome {
+    /// 刚切换到的账号 id；前端按它翻转当前账号标记。
+    pub account_id: String,
+    /// 后端单一规则计算的显示名，供界面即时确认切换结果。
+    pub display_name: String,
+    pub message: UiMessage,
+    /// 目标凭证本地已确认失效（invalid_grant 指纹命中，issue #156，spec #152
+    /// 决策 9）：切换已照常成功，附加「该账号凭证已失效，建议重新授权」警告
+    /// 文本；`None` = 无提示（健康卡或信号未知，判定 fail-open）。不顶掉
+    /// `message` 的成功提示，前端叠加呈现。
+    pub credential_warning: Option<String>,
 }
 
 /// Tauri 命令错误：serde 内部标记为 `{ kind, message }`。
@@ -417,6 +446,8 @@ pub enum CommandError {
     Json(String),
     QuotaFetch(String),
     Provider(String),
+    /// 交换排他文件锁 3 秒等待超时（issue #153）：另一切换未完成，提示重试。
+    SwitchLockTimeout(String),
     Cancelled(String),
     NoPendingAuth(String),
     ReauthIdentityMismatch(String),
@@ -435,6 +466,7 @@ impl CommandError {
             | Self::Json(message)
             | Self::QuotaFetch(message)
             | Self::Provider(message)
+            | Self::SwitchLockTimeout(message)
             | Self::Cancelled(message)
             | Self::NoPendingAuth(message)
             | Self::ReauthIdentityMismatch(message)
@@ -470,6 +502,8 @@ impl CommandError {
                 Self::NoPendingAuth(message)
             }
             Error::Provider(_) => Self::Provider(message),
+            // issue #153：锁超时单独成 kind；message 已含「另一切换操作未完成，请重试」语义。
+            Error::SwitchLockTimeout => Self::SwitchLockTimeout(message),
             Error::Reauth(ReauthError::IdentityMismatch { observed, target }) => {
                 Self::ReauthIdentityMismatch(format!(
                     "登录的是账号 {observed}，不是这张卡（{target}），已拒绝更新凭证"

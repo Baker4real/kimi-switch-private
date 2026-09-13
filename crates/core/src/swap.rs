@@ -163,11 +163,43 @@ pub fn swap_with_snapshot<'a, C>(
 where
     C: FnOnce() -> Result<()>,
 {
-    fs::create_dir_all(provider_home)?;
-    crate::switch_lock::with_exclusive_lock(lock_dir, || swap_locked(provider_id, targets, commit))
+    swap_with_snapshot_protected(provider_id, provider_home, lock_dir, targets, Vec::new(), commit)
 }
 
-fn swap_locked<'a, C>(provider_id: &str, targets: Vec<SwapTarget<'a>>, commit: C) -> Result<()>
+/// 同 [`swap_with_snapshot`]，但额外把 `protected` 里的文件纳入备份/回滚集。
+///
+/// 这些文件不由 `targets` 的 writer 写入（典型：registry.toml 由 `commit` 里的
+/// `AccountRegistry::set_active` 写），却在同一临界区内备份进切换前快照，
+/// commit 失败时与 live 一起按字节原子恢复。没有这一保护，commit 阶段 registry
+/// 写入的 fsync 失败（rename 已成功）会留下「registry 已换 active 标记、live 却
+/// 回滚为旧账号」的发散中间态（issue #153 续跑，reviewer P1-2）；纳入后 registry
+/// 的写入（含其 fsync 失败）进入既有回滚/错误路径，spec #152 决策 7 的验收语义
+/// 对全部切换写入点成立。
+///
+/// 快照内备份文件名取原文件名，调用方保证不与 `targets` 的 `snapshot_name` 冲突。
+pub fn swap_with_snapshot_protected<'a, C>(
+    provider_id: &str,
+    provider_home: &Path,
+    lock_dir: &Path,
+    targets: Vec<SwapTarget<'a>>,
+    protected: Vec<PathBuf>,
+    commit: C,
+) -> Result<()>
+where
+    C: FnOnce() -> Result<()>,
+{
+    fs::create_dir_all(provider_home)?;
+    crate::switch_lock::with_exclusive_lock(lock_dir, || {
+        swap_locked(provider_id, targets, protected, commit)
+    })
+}
+
+fn swap_locked<'a, C>(
+    provider_id: &str,
+    targets: Vec<SwapTarget<'a>>,
+    protected: Vec<PathBuf>,
+    commit: C,
+) -> Result<()>
 where
     C: FnOnce() -> Result<()>,
 {
@@ -175,43 +207,37 @@ where
     let ts = snapshot_now().format("%Y%m%dT%H%M%S%.6fZ").to_string();
     let snap_dir = unique_snapshot_dir(&AppPaths::resolve()?.snapshots_dir(), provider_id, &ts)?;
 
-    // 2. 备份现有文件（原本存在的进 snapshot 目录 + 内存）。
+    // 2. 备份现有文件（原本存在的进 snapshot 目录 + 内存）。回滚集同时覆盖
+    //    targets 的 live 文件与 protected 的 commit 阶段文件（registry 等）。
+    let mut backups: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     let mut plans: Vec<TargetPlan> = Vec::with_capacity(targets.len());
     for target in targets {
-        let backup = match fs::read(&target.live_path) {
-            Ok(raw) => {
-                let snapshot_path = snap_dir.join(target.snapshot_name);
-                fs::write(&snapshot_path, &raw)?;
-                restrict_permissions(&snapshot_path)?;
-                Some(raw)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
+        let backup = backup_into_snapshot(&snap_dir, &target.live_path, target.snapshot_name)?;
+        backups.push((target.live_path.clone(), backup));
         plans.push(TargetPlan {
             live_path: target.live_path,
             writer: target.writer,
-            backup,
         });
+    }
+    for path in protected {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("protected");
+        let backup = backup_into_snapshot(&snap_dir, &path, name)?;
+        backups.push((path, backup));
     }
     tracing::info!(snapshot = %snap_dir.display(), "pre-swap snapshot saved");
 
     // 3. 顺序写入；任一失败回滚所有 plan（即使 writer 没跑到也尝试 restore，让状态一致）。
-    let backups: Vec<(PathBuf, Option<Vec<u8>>)> = plans
-        .iter()
-        .map(|p| (p.live_path.clone(), p.backup.clone()))
-        .collect();
-
     for plan in plans {
-        let TargetPlan {
-            live_path, writer, ..
-        } = plan;
+        let TargetPlan { live_path, writer } = plan;
         if let Err(e) = writer(&live_path) {
             return Err(with_rollback(e, rollback(&backups)));
         }
     }
 
-    // 4. 收尾 commit（典型：registry.set_active）。失败同样回滚。
+    // 4. 收尾 commit（典型：registry.set_active）。失败同样回滚（含 protected 文件）。
     if let Err(e) = commit() {
         return Err(with_rollback(e, rollback(&backups)));
     }
@@ -222,6 +248,26 @@ where
     }
 
     Ok(())
+}
+
+/// 备份单个文件进切换前快照：存在的写进快照目录（含文件级 fsync，issue #153）
+/// 并返回字节，不存在的返回 None（回滚语义 = 删除）。
+fn backup_into_snapshot(
+    snap_dir: &Path,
+    live_path: &Path,
+    snapshot_name: &str,
+) -> Result<Option<Vec<u8>>> {
+    match fs::read(live_path) {
+        Ok(raw) => {
+            let snapshot_path = snap_dir.join(snapshot_name);
+            fs::write(&snapshot_path, &raw)?;
+            restrict_permissions(&snapshot_path)?;
+            sync_file(&snapshot_path)?;
+            Ok(Some(raw))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(unix)]
@@ -239,7 +285,6 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
 struct TargetPlan<'a> {
     live_path: PathBuf,
     writer: SwapWriter<'a>,
-    backup: Option<Vec<u8>>,
 }
 
 fn with_rollback(origin: Error, rolled: std::result::Result<(), String>) -> Error {
@@ -249,7 +294,51 @@ fn with_rollback(origin: Error, rolled: std::result::Result<(), String>) -> Erro
     }
 }
 
+/// 切换路径写入的文件级 fsync（issue #153）：在「临时文件 + rename」之后把文件数据
+/// 落盘，掉电不再丢失最后一次切换。只做文件级，不做目录 fsync（目录项持久性依赖
+/// NTFS 元数据日志）。Windows 的 `FlushFileBuffers` 需要写权限句柄，故以写权限
+/// 重新打开目标；失败如实上抛，由既有回滚/错误路径兜底。
+pub fn sync_file(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if take_fail_next_sync() {
+        return Err(Error::provider(format!(
+            "injected fsync failure: {}",
+            path.display()
+        )));
+    }
+    #[cfg(test)]
+    FSYNC_CALLS.with(|cell| cell.set(cell.get() + 1));
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    file.sync_all()
+        .map_err(|e| Error::provider(format!("fsync {} failed: {e}", path.display())))
+}
+
+// 测试 seam（issue #153）：让下一次 [`sync_file`] 失败，覆盖错误注入路径。
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FSYNC_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_fail_next_sync() -> bool {
+    FAIL_NEXT_SYNC.with(|cell| cell.replace(false))
+}
+
+/// 测试专用：注入下一次 `sync_file` 失败（一次性，触发后自动复位）。
+#[cfg(test)]
+pub(crate) fn fail_next_sync() {
+    FAIL_NEXT_SYNC.with(|cell| cell.set(true));
+}
+
+/// 测试专用：读取本线程 `sync_file` 的累计调用次数，用于断言调用可达性。
+#[cfg(test)]
+pub(crate) fn sync_call_count() -> u32 {
+    FSYNC_CALLS.with(|cell| cell.get())
+}
+
 /// 同目录临时文件 + rename；Unix 下临时文件经 [`restrict_permissions`] 收为 0600。
+/// rename 之后做文件级 fsync（issue #153），失败进入既有回滚/错误路径。
 fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<()> {
     let tmp = {
         let mut name = path.as_os_str().to_os_string();
@@ -260,6 +349,7 @@ fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<()> {
         fs::write(&tmp, contents)?;
         restrict_permissions(&tmp)?;
         fs::rename(&tmp, path)?;
+        sync_file(path)?;
         Ok(())
     })();
     if written.is_err() {
@@ -1042,6 +1132,258 @@ mod tests {
                 "删不掉的最旧快照应仍在: {}",
                 oldest.display()
             );
+        });
+    }
+
+    // --- issue #153：切换路径写入 fsync ---
+
+    /// 快照备份的 fsync 失败必须让切换如实报错（进既有错误路径），且此时任何
+    /// live 文件都还没被写——不得静默成功。
+    #[test]
+    fn snapshot_fsync_failure_fails_swap_before_any_live_write() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+
+            fail_next_sync();
+            let err = swap_with_snapshot(
+                "ticket153",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("new"),
+                }],
+                || Ok(()),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("injected fsync failure"),
+                "fsync 失败必须上抛: {err}"
+            );
+            assert_eq!(
+                fs::read_to_string(&live).unwrap(),
+                "old",
+                "快照阶段失败时 live 尚未被写，应保持原内容"
+            );
+        });
+    }
+
+    /// 调用可达性：成功切换必须 fsync 切换前快照；写入失败回滚时恢复写也要 fsync。
+    #[test]
+    fn fsync_is_reached_for_snapshot_backup_and_rollback_restore() {
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+
+            let before = sync_call_count();
+            swap_with_snapshot(
+                "ticket153",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("new"),
+                }],
+                || Ok(()),
+            )
+            .unwrap();
+            let after_success = sync_call_count();
+            assert!(
+                after_success > before,
+                "成功切换至少应对切换前快照做一次 fsync"
+            );
+
+            // 写入失败 → 回滚：restore_one 走 atomic_write_file，rename 后也要 fsync。
+            let err = swap_with_snapshot(
+                "ticket153",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_err("newer", "injected writer failure"),
+                }],
+                || Ok(()),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("injected writer failure"), "{err}");
+            assert!(
+                sync_call_count() > after_success,
+                "回滚恢复写之后应再次 fsync"
+            );
+            assert_eq!(fs::read_to_string(&live).unwrap(), "new");
+        });
+    }
+
+    /// issue #153：锁被他人持有时，第二次切换最多等约 3 秒即返回明确错误，
+    /// 不再无限阻塞；错误文案语义「另一切换操作未完成，请重试」。
+    #[test]
+    fn swap_returns_clear_error_after_about_three_seconds_when_lock_held_elsewhere() {
+        use std::sync::mpsc;
+
+        with_isolated_home(|home| {
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+
+            let lock = lock_dir();
+            let (held_tx, held_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let holder_lock = lock.clone();
+            let holder = std::thread::spawn(move || {
+                crate::switch_lock::with_exclusive_lock(&holder_lock, || {
+                    held_tx.send(()).ok();
+                    // 持锁直到测试释放信号（上限 10s 防悬挂）。
+                    release_rx.recv_timeout(Duration::from_secs(10)).ok();
+                    Ok(())
+                })
+            });
+            held_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("持锁线程应先进入临界区");
+
+            let started = std::time::Instant::now();
+            let err = swap_with_snapshot(
+                "ticket153",
+                home,
+                &lock,
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("new"),
+                }],
+                || Ok(()),
+            )
+            .unwrap_err();
+            let elapsed = started.elapsed();
+
+            release_tx.send(()).ok();
+            holder.join().unwrap().unwrap();
+
+            assert!(
+                matches!(err, crate::error::Error::SwitchLockTimeout),
+                "持锁超时应返回 SwitchLockTimeout: {err}"
+            );
+            assert_eq!(err.to_string(), "另一切换操作未完成，请重试");
+            assert!(
+                elapsed >= Duration::from_millis(2500) && elapsed <= Duration::from_millis(4500),
+                "有界等待应约 3 秒返回，实际 {elapsed:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&live).unwrap(),
+                "old",
+                "超时失败时 live 不得被改动"
+            );
+        });
+    }
+
+    /// issue #153 续跑（reviewer P1-2）：commit 阶段 registry 写入（set_active 的
+    /// tmp+rename+fsync）失败时，registry 必须与 live 一起回滚——盘上 registry.toml
+    /// 不得残留新 active 标记而 live 已恢复旧账号（live/registry 发散中间态）。
+    #[test]
+    fn registry_fsync_failure_rolls_back_registry_and_live_consistently() {
+        with_isolated_home(|home| {
+            let paths = AppPaths::resolve().unwrap();
+            let registry = AccountRegistry::new(paths.registry_file());
+            registry.upsert(sample_account("alice")).unwrap();
+            registry.upsert(sample_account("bob")).unwrap();
+            // 切换前状态：alice 为 active，live 为 alice 内容。
+            registry
+                .set_active("kimi", &AccountId("alice".into()))
+                .unwrap();
+
+            let live = home.join("live.txt");
+            fs::write(&live, "alice-live").unwrap();
+
+            let err = swap_with_snapshot_protected(
+                "ticket153",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("bob-live"),
+                }],
+                vec![paths.registry_file()],
+                || {
+                    // 精确注入：此刻快照备份的 fsync 已全部完成，writer 只 fs::write
+                    // 不 sync，因此下一个 sync_file 恰是 set_active → save_unlocked
+                    // 里 registry 写入的 fsync（rename 已成功）。
+                    fail_next_sync();
+                    registry.set_active("kimi", &AccountId("bob".into()))
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("injected fsync failure"),
+                "registry fsync 失败必须上抛: {err}"
+            );
+            assert!(
+                !err.to_string().contains("rollback failed"),
+                "回滚成功时错误不应声称回滚失败: {err}"
+            );
+
+            // 不变式钉住：live 与 registry 都回到切换前状态，无发散中间态。
+            assert_eq!(
+                fs::read_to_string(&live).unwrap(),
+                "alice-live",
+                "live 应回滚为切换前内容"
+            );
+            let accounts = AccountRegistry::new(paths.registry_file())
+                .load()
+                .unwrap();
+            let active = accounts
+                .iter()
+                .find(|a| a.active)
+                .expect("registry 应回滚到仍有 active 标记的状态");
+            assert_eq!(
+                active.id.0, "alice",
+                "registry 不得残留切换未完成的新 active 标记: {accounts:?}"
+            );
+        });
+    }
+
+    /// issue #153 续跑（reviewer P1-2）边界：protected 文件原本不存在（新装环境
+    /// 首次切换、registry 尚未创建）时，commit 失败后回滚语义 = 删除，不留半截文件。
+    #[test]
+    fn protected_file_that_did_not_exist_is_deleted_on_rollback() {
+        with_isolated_home(|home| {
+            let paths = AppPaths::resolve().unwrap();
+            assert!(!paths.registry_file().exists());
+
+            let live = home.join("live.txt");
+            fs::write(&live, "old").unwrap();
+
+            let err = swap_with_snapshot_protected(
+                "ticket153",
+                home,
+                &lock_dir(),
+                vec![SwapTarget {
+                    snapshot_name: "live",
+                    live_path: live.clone(),
+                    writer: write_then_ok("new"),
+                }],
+                vec![paths.registry_file()],
+                || {
+                    // commit 里「写出」registry 后再失败：模拟 set_active 写盘成功
+                    // 但后续步骤失败，回滚必须把新建的 registry 删掉。
+                    std::fs::write(paths.registry_file(), "half-written").unwrap();
+                    Err(Error::provider("injected commit failure"))
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("injected commit failure"), "{err}");
+            assert!(
+                !err.to_string().contains("rollback failed"),
+                "回滚成功时错误不应声称回滚失败: {err}"
+            );
+            assert!(
+                !paths.registry_file().exists(),
+                "原本不存在的 protected 文件在回滚后应被删除"
+            );
+            assert_eq!(fs::read_to_string(&live).unwrap(), "old");
         });
     }
 }

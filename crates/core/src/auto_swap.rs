@@ -1,16 +1,24 @@
-//! 额度耗尽自动切换、pace 预切换、重置前抢用与回驻：纯决策 + 上次切换时刻 / 手动保持期 / 回驻确认计数 / 抢用往返记忆的可丢弃状态。
+//! 额度耗尽自动切换、pace 预切换、重置前抢用、回驻与配额失败被动切换：纯决策 +
+//! 上次切换时刻 / 手动保持期 / 回驻确认计数 / 抢用往返记忆的可丢弃状态。
 //!
-//! 决策函数无 IO、无网络；状态文件读写失败静默忽略。
+//! 决策函数无 IO、无网络；状态文件读写失败静默忽略。停泊候选另经本地凭证快检
+//! （issue #158）：`locally_invalid` 集合里的「已确认失效」账号（invalid_grant 指纹
+//! 在案；#158 续跑裁定只认指纹、不认 JWT exp）不作为任何自动路径的候选，
+//! 见 [`crate::credential_health`]。
+//! 配额失败被动切换（issue #162，spec #152 决策 14）：Kimi Code `StopFailure` hook
+//! 的 403 原文是当前账号耗尽的权威证据，经 [`classify_stop_failure`] 分类、
+//! [`overlay_exhausted_snapshot`] 合成耗尽快照后，走 [`decide_auto_swap_passive_from_state`]
+//! 进入与轮询路径同一判定单点。
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::auto_swap_opt_out::account_auto_swap_opt_out;
-use crate::model::{Account, AccountId, Quota, QuotaWindow};
+use crate::model::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
 use crate::quota_snapshot::{QuotaSnapshot, QuotaState};
 use crate::settings::AutoSwap;
 
@@ -83,7 +91,26 @@ pub enum AutoSwapDecision {
     Swap(AutoSwapTarget),
 }
 
+/// 自动切换判定的触发来源（issue #162）。同一判定单点对不同来源只开放一处差异：
+/// 安顿宽限是否放行——其余闸门（开关、冷却、资格线、防抖边际、摘出、往返记忆、
+/// 候选本地凭证快检）对所有来源语义一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerSource {
+    /// 快照轮询（GUI 静默查询 / CLI status）：安顿宽限照常阻挡。
+    Snapshot,
+    /// 配额失败被动（StopFailure hook 403）：403 原文是「此刻已耗尽」的权威证据，
+    /// 胜过「刚被手动选中先观察一阵」的保守等待，安顿宽限不阻挡（spec #152 决策 14）。
+    QuotaFailureHook,
+}
+
 /// 根据已收集的额度快照判定是否自动切换。纯函数，不碰盘、不联网。
+///
+/// `locally_invalid` 是「本地凭证已确认失效」的账号集合（issue #158，spec #152
+/// 决策 15；#158 续跑裁定收紧为只认 invalid_grant 指纹、不认 JWT exp），由
+/// [`crate::credential_health::locally_invalid_accounts`] 纯本地收集；
+/// 集合中的账号不作为任何自动路径（耗尽 / pace / 回驻 / 重置前抢用与回程）的停泊
+/// 候选。无信号时传空集合——unknown ≠ 失效，语义与快照缺失一致。当前账号在集合中
+/// 不影响它被切走；手动切换不经此过滤。
 ///
 /// 停泊候选须先过阈值资格线，再满足最大已用比例 ≤ 当前最大已用 − [`AutoSwap::candidate_margin`]。
 /// 已达 `threshold` 走耗尽路径（[`AutoSwapKind::Exhausted`]）。未达阈值时，若开启
@@ -104,6 +131,7 @@ pub fn decide_auto_swap(
     settings: &AutoSwap,
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
+    locally_invalid: &HashSet<AccountId>,
 ) -> AutoSwapDecision {
     let mut trip = None;
     decide_auto_swap_with_trip(
@@ -113,10 +141,13 @@ pub fn decide_auto_swap(
         now,
         last_auto_swap_at,
         &mut trip,
+        locally_invalid,
+        TriggerSource::Snapshot,
     )
 }
 
 /// 带往返记忆的自动切换判定。回程命中但原账号不合格时把 `trip` 置 `None`。
+/// `trigger` 只影响安顿宽限是否放行（见 [`TriggerSource`]）。
 fn decide_auto_swap_with_trip(
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
@@ -124,6 +155,8 @@ fn decide_auto_swap_with_trip(
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
     trip: &mut Option<BurnTrip>,
+    locally_invalid: &HashSet<AccountId>,
+    trigger: TriggerSource,
 ) -> AutoSwapDecision {
     if !settings.enabled {
         return stay(AutoSwapSkipReason::Disabled);
@@ -137,7 +170,10 @@ fn decide_auto_swap_with_trip(
         return stay(AutoSwapSkipReason::Cooldown);
     }
 
-    if in_settle_grace(now, current.last_used_at, settings.settle_grace_ms) {
+    // 被动触发（403 权威耗尽证据）跳过安顿宽限；轮询路径照常被挡。
+    if trigger == TriggerSource::Snapshot
+        && in_settle_grace(now, current.last_used_at, settings.settle_grace_ms)
+    {
         return stay(AutoSwapSkipReason::SettleGrace);
     }
 
@@ -148,9 +184,15 @@ fn decide_auto_swap_with_trip(
         return stay(AutoSwapSkipReason::CurrentUnavailable);
     };
 
-    if let Some(decision) =
-        decide_burn_return(current, current_quotas, accounts, snapshots, settings, trip)
-    {
+    if let Some(decision) = decide_burn_return(
+        current,
+        current_quotas,
+        accounts,
+        snapshots,
+        settings,
+        trip,
+        locally_invalid,
+    ) {
         return decision;
     }
 
@@ -161,20 +203,34 @@ fn decide_auto_swap_with_trip(
         }
         // issue #149：往返记忆存续期间不评估 pace 与新抢用，只留耗尽与回程。
         if trip.is_none() {
-            if let Some(target) =
-                decide_pace_swap(current, current_quotas, accounts, snapshots, settings, now)
-            {
+            if let Some(target) = decide_pace_swap(
+                current,
+                current_quotas,
+                accounts,
+                snapshots,
+                settings,
+                now,
+                locally_invalid,
+            ) {
                 return AutoSwapDecision::Swap(target);
             }
-            if let Some(target) = decide_burn_swap(current, accounts, snapshots, settings, now) {
+            if let Some(target) =
+                decide_burn_swap(current, accounts, snapshots, settings, now, locally_invalid)
+            {
                 return AutoSwapDecision::Swap(target);
             }
         }
         return stay(AutoSwapSkipReason::BelowThreshold);
     };
 
-    let Some(best) = pick_best_eligible(accounts, snapshots, current, current_quotas, settings)
-    else {
+    let Some(best) = pick_best_eligible(
+        accounts,
+        snapshots,
+        current,
+        current_quotas,
+        settings,
+        locally_invalid,
+    ) else {
         return stay(AutoSwapSkipReason::NoEligibleCandidate);
     };
     AutoSwapDecision::Swap(AutoSwapTarget {
@@ -195,6 +251,7 @@ fn decide_pace_swap(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     now: DateTime<Utc>,
+    locally_invalid: &HashSet<AccountId>,
 ) -> Option<AutoSwapTarget> {
     if !settings.pace_pre_swap {
         return None;
@@ -203,7 +260,14 @@ fn decide_pace_swap(
         return None;
     }
     let (trigger_window, usage_ratio) = overpacing_trigger(current_quotas, now)?;
-    let best = pick_best_eligible(accounts, snapshots, current, current_quotas, settings)?;
+    let best = pick_best_eligible(
+        accounts,
+        snapshots,
+        current,
+        current_quotas,
+        settings,
+        locally_invalid,
+    )?;
     Some(AutoSwapTarget {
         from: current.id.clone(),
         to: best.id.clone(),
@@ -222,12 +286,13 @@ fn decide_burn_swap(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     now: DateTime<Utc>,
+    locally_invalid: &HashSet<AccountId>,
 ) -> Option<AutoSwapTarget> {
     if !settings.pre_reset_burn {
         return None;
     }
     let (best, trigger_window, usage_ratio) =
-        pick_best_burn_candidate(accounts, snapshots, current, settings, now)?;
+        pick_best_burn_candidate(accounts, snapshots, current, settings, now, locally_invalid)?;
     Some(AutoSwapTarget {
         from: current.id.clone(),
         to: best.id.clone(),
@@ -246,6 +311,7 @@ fn decide_burn_return(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     trip: &mut Option<BurnTrip>,
+    locally_invalid: &HashSet<AccountId>,
 ) -> Option<AutoSwapDecision> {
     let existing = trip.as_ref()?;
     if current.id != existing.target {
@@ -261,6 +327,7 @@ fn decide_burn_return(
         snapshots,
         settings,
         existing,
+        locally_invalid,
     ) {
         Some(target) => Some(AutoSwapDecision::Swap(target)),
         None => {
@@ -288,6 +355,7 @@ fn burn_return_swap(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     trip: &BurnTrip,
+    locally_invalid: &HashSet<AccountId>,
 ) -> Option<AutoSwapTarget> {
     let origin = eligible_return_origin(
         accounts,
@@ -295,6 +363,7 @@ fn burn_return_swap(
         &trip.origin,
         &current.id,
         settings.threshold,
+        locally_invalid,
     )?;
     let (trigger_window, usage_ratio) = trigger_window(current_quotas, settings.threshold)
         .unwrap_or_else(|| {
@@ -320,12 +389,13 @@ fn eligible_return_origin<'a>(
     origin_id: &AccountId,
     current_id: &AccountId,
     threshold: f64,
+    locally_invalid: &HashSet<AccountId>,
 ) -> Option<&'a Account> {
     if origin_id == current_id {
         return None;
     }
     let account = accounts.iter().find(|account| account.id == *origin_id)?;
-    if account_auto_swap_opt_out(account) {
+    if !parked_candidate_admitted(account, locally_invalid) {
         return None;
     }
     let snap = snapshot_of(snapshots, &account.id)?;
@@ -342,11 +412,12 @@ fn pick_best_burn_candidate<'a>(
     current: &Account,
     settings: &AutoSwap,
     now: DateTime<Utc>,
+    locally_invalid: &HashSet<AccountId>,
 ) -> Option<(&'a Account, QuotaWindow, f64)> {
     let mut eligible: Vec<(&Account, &[Quota], QuotaWindow, f64)> = accounts
         .iter()
         .filter(|account| account.id != current.id)
-        .filter(|account| !account_auto_swap_opt_out(account))
+        .filter(|account| parked_candidate_admitted(account, locally_invalid))
         .filter_map(|account| {
             let snap = snapshot_of(snapshots, &account.id)?;
             let quotas = usable_quotas(snap)?;
@@ -375,12 +446,13 @@ fn pick_best_eligible<'a>(
     current: &Account,
     current_quotas: &[Quota],
     settings: &AutoSwap,
+    locally_invalid: &HashSet<AccountId>,
 ) -> Option<&'a Account> {
     let current_max = candidate_max_ratio(current_quotas);
     let mut eligible: Vec<(&Account, &[Quota], Option<&str>)> = accounts
         .iter()
         .filter(|account| account.id != current.id)
-        .filter(|account| !account_auto_swap_opt_out(account))
+        .filter(|account| parked_candidate_admitted(account, locally_invalid))
         .filter_map(|account| {
             let snap = snapshot_of(snapshots, &account.id)?;
             let quotas = usable_quotas(snap)?;
@@ -425,6 +497,9 @@ pub struct AutoSwapReturn {
 /// 回驻判定：当前账号未达耗尽阈值、但存在档位严格更低的合格停泊账号时，切回其中
 /// 档位最低者。纯函数，不碰盘、不联网。
 ///
+/// `locally_invalid` 语义与 [`decide_auto_swap`] 相同（issue #158）：本地凭证已确认
+/// 失效的账号不作为回驻目标，经 [`parked_candidate_admitted`] 与其它自动路径共用同一闸。
+///
 /// 闸门与 [`decide_auto_swap`] 共用语义：总开关或回驻子开关关、无当前账号、冷却期
 /// （与耗尽切换共享一把锁）、安顿宽限、手动保持期都不回驻。当前账号快照不可用、
 /// 额度未知、任一窗口已达阈值（那是耗尽路径的事）或档位未知时不回驻；候选须快照
@@ -443,6 +518,7 @@ pub fn decide_resident_return(
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
     manual_hold_until: Option<DateTime<Utc>>,
+    locally_invalid: &HashSet<AccountId>,
     confirm_counts: &mut HashMap<AccountId, u32>,
 ) -> Option<AutoSwapReturn> {
     if !settings.enabled || !settings.resident_lower_tier {
@@ -482,7 +558,7 @@ pub fn decide_resident_return(
     let mut eligible: Vec<(&Account, &[Quota], &str)> = accounts
         .iter()
         .filter(|account| account.id != current.id)
-        .filter(|account| !account_auto_swap_opt_out(account))
+        .filter(|account| parked_candidate_admitted(account, locally_invalid))
         .filter_map(|account| {
             let snap = snapshot_of(snapshots, &account.id)?;
             let quotas = usable_quotas(snap)?;
@@ -537,6 +613,15 @@ fn note_resident_confirm(
 
 fn stay(reason: AutoSwapSkipReason) -> AutoSwapDecision {
     AutoSwapDecision::Stay { reason }
+}
+
+/// 停泊候选第一道闸（issue #158）：账号未摘出自动切换，且本地凭证未「已确认失效」
+/// （[`crate::credential_health`]：invalid_grant 指纹在案；#158 续跑裁定口径）。
+/// 耗尽 / pace / 重置前抢用 / 抢用回程 / 回驻的全部停泊候选筛选共用此判定，
+/// 是本地凭证过滤的单点；手动切换不经过这里。unknown ≠ 失效：不在
+/// `locally_invalid` 集合中的账号照常参与。
+fn parked_candidate_admitted(account: &Account, locally_invalid: &HashSet<AccountId>) -> bool {
+    !account_auto_swap_opt_out(account) && !locally_invalid.contains(&account.id)
 }
 
 fn snapshot_of<'a>(snapshots: &'a [QuotaSnapshot], id: &AccountId) -> Option<&'a QuotaSnapshot> {
@@ -888,6 +973,8 @@ pub fn write_resident_confirm_counts(path: &Path, counts: &HashMap<AccountId, u3
 
 /// 读状态文件中的回驻确认计数、判定、写回。调用方不必自己搬 HashMap。
 /// 往返记忆存续时整段跳过（issue #149），不读改写确认计数。
+/// 停泊目标额外经本地凭证快检过滤（issue #158）：`credentials.json` 与拒止指纹文件
+/// 只读一次，读取失败一律 fail-open（视为信号未知）。
 pub fn decide_resident_return_from_state(
     path: &Path,
     accounts: &[Account],
@@ -902,6 +989,7 @@ pub fn decide_resident_return_from_state(
         return None;
     }
     let mut confirm_counts = read_resident_confirm_counts(path);
+    let locally_invalid = crate::credential_health::locally_invalid_accounts(path, accounts, now);
     let target = decide_resident_return(
         accounts,
         snapshots,
@@ -909,6 +997,7 @@ pub fn decide_resident_return_from_state(
         now,
         last_auto_swap_at,
         manual_hold_until,
+        &locally_invalid,
         &mut confirm_counts,
     );
     write_resident_confirm_counts(path, &confirm_counts);
@@ -916,6 +1005,9 @@ pub fn decide_resident_return_from_state(
 }
 
 /// 读往返记忆、判定、不合格时写回清除。调用方不必自己搬 [`BurnTrip`]。
+/// 停泊候选额外经本地凭证快检过滤（issue #158）：invalid_grant 指纹在案的账号
+/// 不作为任何自动路径候选（续跑裁定只认指纹，不认 JWT exp）；本地文件只读、
+/// 零网络，读取失败 fail-open。
 pub fn decide_auto_swap_from_state(
     path: &Path,
     accounts: &[Account],
@@ -924,8 +1016,30 @@ pub fn decide_auto_swap_from_state(
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
 ) -> AutoSwapDecision {
+    decide_auto_swap_from_state_with_trigger(
+        path,
+        accounts,
+        snapshots,
+        settings,
+        now,
+        last_auto_swap_at,
+        TriggerSource::Snapshot,
+    )
+}
+
+/// 状态文件读取 + 判定的共用实现（触发来源只影响安顿宽限，见 [`TriggerSource`]）。
+fn decide_auto_swap_from_state_with_trigger(
+    path: &Path,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+    last_auto_swap_at: Option<DateTime<Utc>>,
+    trigger: TriggerSource,
+) -> AutoSwapDecision {
     let mut trip = read_burn_trip(path);
     let before = trip.clone();
+    let locally_invalid = crate::credential_health::locally_invalid_accounts(path, accounts, now);
     let decision = decide_auto_swap_with_trip(
         accounts,
         snapshots,
@@ -933,11 +1047,223 @@ pub fn decide_auto_swap_from_state(
         now,
         last_auto_swap_at,
         &mut trip,
+        &locally_invalid,
+        trigger,
     );
     if trip != before {
         persist_burn_trip(path, trip);
     }
     decision
+}
+
+// ---------------------------------------------------------------------------
+// 配额失败被动切换（issue #162，spec #152 实现决策 14/16）
+// ---------------------------------------------------------------------------
+
+/// StopFailure hook 事件对「当前账号配额耗尽」信号的分类结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopFailureSignal {
+    /// 403 配额耗尽：文案含官方 "usage limit" 字样，且带 403 状态信号。
+    /// `window` 是文案中可辨认的耗尽窗口（5 小时 / 7 天 / 月度），辨认不出为 `None`。
+    QuotaExhausted { window: Option<QuotaWindow> },
+    /// 其他：429 过载 / 瞬时限流、非配额错误，或 stdin 不是合法 JSON（畸形静默）。
+    Other,
+}
+
+/// Kimi Code `StopFailure` hook 事件分类（纯函数，stdin 原文 → 分类）。
+///
+/// 官方配额错误是 403 且文案明确含 "usage limit"（5 小时 / 7 天 / 月度窗口各有文案）；
+/// 429 仅瞬时限流 / 引擎过载，与配额无关，绝不匹配。事件 JSON 的错误字段官方文档未
+/// 枚举，因此对整份 JSON 递归扫描：任一字符串含 "usage limit"（大小写不敏感）且
+/// 存在 403 信号（数值 403，或任一字符串含作为独立 token 的 "403"，见
+/// [`contains_403_token`]——时间戳 / request id 等数字串里的 "403" 子串不算）才判
+/// 耗尽——hook schema 变化最坏漏触发，不会误触发。原不是合法 JSON 一律归
+/// [`StopFailureSignal::Other`]。
+pub fn classify_stop_failure(raw: &str) -> StopFailureSignal {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return StopFailureSignal::Other;
+    };
+    let mut usage_limit_texts: Vec<&str> = Vec::new();
+    let mut saw_403 = false;
+    scan_stop_failure_values(&value, &mut usage_limit_texts, &mut saw_403);
+    if !saw_403 || usage_limit_texts.is_empty() {
+        return StopFailureSignal::Other;
+    }
+    StopFailureSignal::QuotaExhausted {
+        window: window_from_usage_limit_texts(usage_limit_texts),
+    }
+}
+
+/// 递归收集：含 "usage limit" 的字符串（供窗口辨认），以及 403 信号。
+fn scan_stop_failure_values<'a>(
+    value: &'a serde_json::Value,
+    usage_limit_texts: &mut Vec<&'a str>,
+    saw_403: &mut bool,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.to_lowercase().contains("usage limit") {
+                usage_limit_texts.push(text.as_str());
+            }
+            if !*saw_403 && contains_403_token(text) {
+                *saw_403 = true;
+            }
+        }
+        serde_json::Value::Number(number) => {
+            if !*saw_403 && number.as_i64() == Some(403) {
+                *saw_403 = true;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scan_stop_failure_values(item, usage_limit_texts, saw_403);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                scan_stop_failure_values(item, usage_limit_texts, saw_403);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 字符串里的 "403" 是否作为独立 token 出现：前后都不是 ASCII 字母数字
+/// （字符串首尾视为边界；非 ASCII 字符也视为边界）。时间戳（epoch 秒如
+/// `1760004031`）、request id（`req-1403f8`）、行号（`line 1403`）等数字串里的
+/// "403" 子串不算 403 状态信号；`403 Forbidden`、`status code 403.`、
+/// `(403)`、`status=403` 这类写法算。
+fn contains_403_token(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("403") {
+        let start = from + offset;
+        let end = start + "403".len();
+        let boundary_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let boundary_after = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if boundary_before && boundary_after {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// 从官方耗尽文案辨认窗口："month" → 月度；"5"+"hour" → 5 小时；"7"+"day" → 7 天。
+/// 只看含 "usage limit" 的字符串（不扫整份文档，避免会话标题之类误供词）；
+/// 多条不一致取首条可辨认者；辨认不出返回 `None`（只影响合成证据标注哪个窗口，
+/// 不影响切换与否）。
+fn window_from_usage_limit_texts<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+) -> Option<QuotaWindow> {
+    for text in texts {
+        let lower = text.to_lowercase();
+        if lower.contains("month") {
+            return Some(QuotaWindow::Month);
+        }
+        if lower.contains('5') && lower.contains("hour") {
+            return Some(QuotaWindow::FiveHour);
+        }
+        if lower.contains('7') && lower.contains("day") {
+            return Some(QuotaWindow::SevenDay);
+        }
+    }
+    None
+}
+
+/// 以 403 权威证据合成 / 覆盖当前账号快照（纯函数，不写缓存、不落盘）：
+/// 被动路径复用既有耗尽判定，「当前账号已耗尽」这一证据以快照形态进入判定单点。
+///
+/// - 缓存快照可用（`Ready` / 非 stale `Cached`）时以其为底：把 `window`（文案辨认
+///   不出时取已用比例最高的已知窗口）覆写为已用 = 上限，其余窗口保留缓存真值；
+/// - 底上没有该窗口则追加一条合成窗口（已用 = 上限 = 1，`reset_at` 未知）；
+/// - 无可用缓存时整条合成，窗口缺省 5 小时。
+/// 合成结果 `reset_at` / 档位沿用缓存已知值，未知即 `None`，不凭空捏造。
+pub fn overlay_exhausted_snapshot(
+    account_id: &AccountId,
+    cached: Option<&QuotaSnapshot>,
+    window: Option<QuotaWindow>,
+    now: DateTime<Utc>,
+) -> QuotaSnapshot {
+    // 缓存可用（Ready / 非 stale Cached）时以其为底；Failed / stale 回落 / 无缓存时整条合成。
+    let mut quotas = Vec::new();
+    let mut fetched_at = now;
+    let mut membership = None;
+    if let Some(snapshot) = cached {
+        if let Some(cached_quotas) = usable_quotas(snapshot) {
+            quotas = cached_quotas.to_vec();
+            fetched_at = snapshot.fetched_at;
+            membership = snapshot.membership.clone();
+        }
+    }
+    let target_window = window
+        .or_else(|| {
+            quotas
+                .iter()
+                .filter_map(|quota| quota.usage_ratio().map(|ratio| (quota.window, ratio)))
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                .map(|(window, _)| window)
+        })
+        .unwrap_or(QuotaWindow::FiveHour);
+
+    if let Some(quota) = quotas
+        .iter_mut()
+        .find(|quota| quota.window == target_window)
+    {
+        // 上限未知（limit=0）时按已用量充当，保证 ratio=1.0 可判定。
+        if quota.limit == 0 {
+            quota.limit = quota.used.max(1);
+        }
+        quota.used = quota.limit;
+    } else {
+        quotas.push(Quota {
+            provider: quotas
+                .first()
+                .map(|quota| quota.provider.clone())
+                .unwrap_or_else(|| "kimi".into()),
+            account_id: account_id.clone(),
+            window: target_window,
+            used: 1,
+            limit: 1,
+            reset_at: None,
+            status: QuotaStatus::Ok,
+            note: Some("403 usage limit (StopFailure hook)".into()),
+            membership: None,
+        });
+    }
+    QuotaSnapshot {
+        account_id: account_id.clone(),
+        fetched_at,
+        stale: false,
+        membership,
+        state: QuotaState::Cached(quotas),
+    }
+}
+
+/// 配额失败被动切换判定门面（issue #162）：调用方先用 [`overlay_exhausted_snapshot`]
+/// 把当前账号快照换成权威耗尽证据，再经本门面进入与轮询路径同一判定单点。
+///
+/// 与 [`decide_auto_swap_from_state`] 的唯一差异是安顿宽限不阻挡（403 原文是
+/// 「此刻已耗尽」的权威证据；手动保持期本就只约束回驻、不约束耗尽路径）。
+/// 冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆与候选本地凭证快检
+/// 语义与轮询路径完全一致，由同一实现保证。
+pub fn decide_auto_swap_passive_from_state(
+    path: &Path,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    settings: &AutoSwap,
+    now: DateTime<Utc>,
+    last_auto_swap_at: Option<DateTime<Utc>>,
+) -> AutoSwapDecision {
+    decide_auto_swap_from_state_with_trigger(
+        path,
+        accounts,
+        snapshots,
+        settings,
+        now,
+        last_auto_swap_at,
+        TriggerSource::QuotaFailureHook,
+    )
 }
 
 /// 从抢用判定与当时快照取出往返记忆。缺目标窗口 `reset_at` 则不写。
@@ -1301,6 +1627,7 @@ mod tests {
             &case.settings,
             now(),
             case.last_auto_swap_at,
+            &HashSet::new(),
         );
         match (got, &case.expect) {
             (AutoSwapDecision::Stay { reason }, Expect::Stay(expected)) => {
@@ -2510,7 +2837,10 @@ mod tests {
                 },
                 last_auto_swap_at: None,
                 accounts: vec![settled("alice", true), settled("bob", false)],
-                snapshots: vec![ready_reset("alice", w85, half), ready_reset("bob", w80, at_5h)],
+                snapshots: vec![
+                    ready_reset("alice", w85, half),
+                    ready_reset("bob", w80, at_5h),
+                ],
                 expect: Expect::Pace("alice", "bob", five),
             },
             Case {
@@ -2554,11 +2884,7 @@ mod tests {
     }
 
     fn seed_trip(path: &Path, memory: &BurnTrip) {
-        write_burn_trip_and_last_auto_swap_at(
-            path,
-            now() - chrono::Duration::hours(1),
-            memory,
-        );
+        write_burn_trip_and_last_auto_swap_at(path, now() - chrono::Duration::hours(1), memory);
     }
 
     #[derive(Debug)]
@@ -2728,6 +3054,8 @@ mod tests {
                 now(),
                 case.last_auto_swap_at,
                 &mut memory,
+                &HashSet::new(),
+                TriggerSource::Snapshot,
             );
             match (got, &case.expect) {
                 (AutoSwapDecision::Stay { reason }, Expect::Stay(expected)) => {
@@ -3058,6 +3386,8 @@ mod tests {
                 now(),
                 case.last_auto_swap_at,
                 &mut memory,
+                &HashSet::new(),
+                TriggerSource::Snapshot,
             );
             match (got, &case.expect) {
                 (AutoSwapDecision::Stay { reason }, Expect::Stay(expected)) => {
@@ -3290,6 +3620,7 @@ mod tests {
             &on(),
             now(),
             read_last_auto_swap_at(&path),
+            &HashSet::new(),
         );
         match got {
             AutoSwapDecision::Swap(target) => {
@@ -3649,6 +3980,7 @@ mod tests {
                 now(),
                 case.last_auto_swap_at,
                 case.manual_hold_until,
+                &HashSet::new(),
                 &mut counts,
             );
             match (got, case.expect_to) {
@@ -3851,6 +4183,7 @@ mod tests {
                 now(),
                 case.last_auto_swap_at,
                 case.manual_hold_until,
+                &HashSet::new(),
                 &mut counts,
             );
             match (got, case.expect_to) {
@@ -3952,6 +4285,283 @@ mod tests {
                 .copied(),
             Some(2)
         );
+    }
+
+    /// issue #158：本地凭证「已确认失效」的停泊账号在全部自动路径被排除（等价覆盖：
+    /// 耗尽 / pace / 重置前抢用 / 回程分别断言；四处过滤同源于 [`parked_candidate_admitted`]
+    /// 单点）。健康账号不受影响；当前账号在集合中不影响它被切走（过滤只作用于停泊候选）。
+    #[test]
+    fn decide_auto_swap_locally_invalid_parked_excluded() {
+        let five = QuotaWindow::FiveHour;
+        let w99 = &[(five, 99, 100)];
+        let w10 = &[(five, 10, 100)];
+        // 5h 窗已流逝 50%（pace>1）与 30 分钟后 reset（5h 抢用临近窗内）。
+        let half = now() + chrono::Duration::minutes(150);
+        let near = now() + chrono::Duration::minutes(30);
+        let invalid = HashSet::from([AccountId("bob".into())]);
+
+        // 耗尽：失效候选跳过，选下一健康账号。
+        let accounts = vec![
+            settled("alice", true),
+            settled("bob", false),
+            settled("carol", false),
+        ];
+        let snapshots = vec![
+            ready("alice", w99),
+            ready("bob", w10),
+            ready("carol", &[(five, 20, 100)]),
+        ];
+        match decide_auto_swap(&accounts, &snapshots, &on(), now(), None, &invalid) {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.to.0, "carol");
+                assert_eq!(target.kind, AutoSwapKind::Exhausted);
+            }
+            other => panic!("耗尽路径应跳过失效候选切 carol，got {other:?}"),
+        }
+
+        // 耗尽：唯一候选失效 → 无合格候选。
+        let two = vec![settled("alice", true), settled("bob", false)];
+        let two_snaps = vec![ready("alice", w99), ready("bob", w10)];
+        match decide_auto_swap(&two, &two_snaps, &on(), now(), None, &invalid) {
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::NoEligibleCandidate,
+            } => {}
+            other => panic!("唯一候选失效应无合格候选，got {other:?}"),
+        }
+
+        // 对照：无失效信号时同夹具切 bob（健康账号不受影响）。
+        match decide_auto_swap(&two, &two_snaps, &on(), now(), None, &HashSet::new()) {
+            AutoSwapDecision::Swap(target) => assert_eq!(target.to.0, "bob"),
+            other => panic!("无失效信号应切 bob，got {other:?}"),
+        }
+
+        // 当前账号在集合中不影响它被切走。
+        let current_invalid = HashSet::from([AccountId("alice".into())]);
+        match decide_auto_swap(&two, &two_snaps, &on(), now(), None, &current_invalid) {
+            AutoSwapDecision::Swap(target) => assert_eq!(target.to.0, "bob"),
+            other => panic!("当前账号在集合中仍应被切走，got {other:?}"),
+        }
+
+        // pace：唯一更健康候选失效 → 不提前切；对照无信号时 pace 到 bob。
+        let pace_snaps = vec![
+            ready_reset("alice", &[(five, 85, 100)], half),
+            ready("bob", w10),
+        ];
+        match decide_auto_swap(&two, &pace_snaps, &pace_on(), now(), None, &invalid) {
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::BelowThreshold,
+            } => {}
+            other => panic!("pace 路径失效候选应排除，got {other:?}"),
+        }
+        match decide_auto_swap(&two, &pace_snaps, &pace_on(), now(), None, &HashSet::new()) {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::Pace);
+                assert_eq!(target.to.0, "bob");
+            }
+            other => panic!("无失效信号应 pace 到 bob，got {other:?}"),
+        }
+
+        // 抢用：唯一临近超水位候选失效 → 不抢用；对照无信号时抢用 bob。
+        let burn_snaps = vec![
+            ready("alice", w10),
+            ready_reset("bob", &[(five, 80, 100)], near),
+        ];
+        match decide_auto_swap(&two, &burn_snaps, &burn_on(), now(), None, &invalid) {
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::BelowThreshold,
+            } => {}
+            other => panic!("抢用路径失效候选应排除，got {other:?}"),
+        }
+        match decide_auto_swap(&two, &burn_snaps, &burn_on(), now(), None, &HashSet::new()) {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::Burn);
+                assert_eq!(target.to.0, "bob");
+            }
+            other => panic!("无失效信号应抢用 bob，got {other:?}"),
+        }
+
+        // 回程：原账号失效 → 清记忆并留在目标；对照无信号时回程 bob。
+        let recorded = now() + chrono::Duration::hours(1);
+        let flipped = recorded + chrono::Duration::hours(5);
+        let return_accounts = vec![settled("bob", false), settled("alice", true)];
+        let return_snaps = vec![ready("bob", w10), ready_reset("alice", w10, flipped)];
+        let mut memory = Some(trip("bob", "alice", five, recorded));
+        match decide_auto_swap_with_trip(
+            &return_accounts,
+            &return_snaps,
+            &on(),
+            now(),
+            None,
+            &mut memory,
+            &invalid,
+            TriggerSource::Snapshot,
+        ) {
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::BelowThreshold,
+            } => {}
+            other => panic!("回程原账号失效应留在目标，got {other:?}"),
+        }
+        assert!(memory.is_none(), "原账号失效应清往返记忆");
+        let mut memory = Some(trip("bob", "alice", five, recorded));
+        match decide_auto_swap_with_trip(
+            &return_accounts,
+            &return_snaps,
+            &on(),
+            now(),
+            None,
+            &mut memory,
+            &HashSet::new(),
+            TriggerSource::Snapshot,
+        ) {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::BurnReturn);
+                assert_eq!(target.to.0, "bob");
+            }
+            other => panic!("无失效信号应回程 bob，got {other:?}"),
+        }
+    }
+
+    /// issue #158：回驻目标本地凭证失效 → 不回驻（确认计数清零）；
+    /// 当前账号在集合中不影响被回驻切走。
+    #[test]
+    fn decide_resident_return_locally_invalid_target_excluded() {
+        let five = QuotaWindow::FiveHour;
+        let w_low = &[(five, 10, 100)];
+        let adv = "LEVEL_ADVANCED";
+        let mid = "LEVEL_INTERMEDIATE";
+        let accounts = vec![settled("alice", true), settled("bob", false)];
+        let snapshots = vec![membered("alice", w_low, adv), membered("bob", w_low, mid)];
+
+        let invalid = HashSet::from([AccountId("bob".into())]);
+        let mut counts = HashMap::new();
+        let got = decide_resident_return(
+            &accounts,
+            &snapshots,
+            &resident(),
+            now(),
+            None,
+            None,
+            &invalid,
+            &mut counts,
+        );
+        assert!(got.is_none(), "回驻目标失效不回驻");
+        assert!(counts.is_empty(), "无合格目标应清零确认计数");
+
+        // 对照：无失效信号 → 回驻 bob。
+        let mut counts = HashMap::new();
+        let got = decide_resident_return(
+            &accounts,
+            &snapshots,
+            &resident(),
+            now(),
+            None,
+            None,
+            &HashSet::new(),
+            &mut counts,
+        );
+        assert_eq!(got.as_ref().map(|t| t.to.0.as_str()), Some("bob"));
+
+        // 当前账号在集合中不影响被回驻切走。
+        let current_invalid = HashSet::from([AccountId("alice".into())]);
+        let mut counts = HashMap::new();
+        let got = decide_resident_return(
+            &accounts,
+            &snapshots,
+            &resident(),
+            now(),
+            None,
+            None,
+            &current_invalid,
+            &mut counts,
+        );
+        assert_eq!(got.as_ref().map(|t| t.to.0.as_str()), Some("bob"));
+    }
+
+    /// issue #158：from_state 门面自动收集本地失效信号：bob 的 refresh token 指纹
+    /// 命中拒止文件 → bob 不作候选，耗尽切换选健康的 carol。续跑裁定口径：
+    /// 只认指纹；access token 已过 exp 但无指纹 → 照常作候选（反例一并钉住）。
+    #[test]
+    fn decide_auto_swap_from_state_filters_locally_invalid_candidate() {
+        crate::credential_health::test_env::with_isolated_kimi_home(|home| {
+            use crate::credential_health::refresh_fingerprint;
+            use crate::credential_health::test_env::blob_with_exp;
+
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            std::fs::create_dir_all(data.join("state")).unwrap();
+            // bob 的 access token 未过期，失效仅因 refresh 指纹在案；carol 干净。
+            let entries = serde_json::json!({
+                "kimi:bob:blob": blob_with_exp(now().timestamp() + 3600, "refresh-bob"),
+                "kimi:carol:blob": blob_with_exp(now().timestamp() + 3600, "refresh-carol"),
+            });
+            std::fs::write(data.join("credentials.json"), entries.to_string()).unwrap();
+            std::fs::create_dir_all(home.join("credentials")).unwrap();
+            std::fs::write(
+                home.join("credentials").join(".kimi-switch-dead-refresh"),
+                format!("{}\n", refresh_fingerprint("refresh-bob")),
+            )
+            .unwrap();
+            let state_path = data.join("state").join("auto_swap.json");
+
+            let five = QuotaWindow::FiveHour;
+            let accounts = vec![
+                settled("alice", true),
+                settled("bob", false),
+                settled("carol", false),
+            ];
+            let snapshots = vec![
+                ready("alice", &[(five, 99, 100)]),
+                ready("bob", &[(five, 10, 100)]),
+                ready("carol", &[(five, 20, 100)]),
+            ];
+            match decide_auto_swap_from_state(
+                &state_path,
+                &accounts,
+                &snapshots,
+                &on(),
+                now(),
+                None,
+            ) {
+                AutoSwapDecision::Swap(target) => {
+                    assert_eq!(target.to.0, "carol", "指纹在案的 bob 应被跳过");
+                }
+                other => panic!("应切到健康的 carol，got {other:?}"),
+            }
+
+            // 裁定反例：bob access token 已过 exp、拒止文件不含其指纹 → bob 仍是
+            // 合格候选（停泊号轮询停摆后自然过期，不是死卡）。
+            std::fs::write(
+                home.join("credentials").join(".kimi-switch-dead-refresh"),
+                format!("{}\n", refresh_fingerprint("someone-else")),
+            )
+            .unwrap();
+            std::fs::write(
+                data.join("credentials.json"),
+                serde_json::json!({
+                    "kimi:bob:blob": blob_with_exp(now().timestamp() - 1, "refresh-bob"),
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let accounts = vec![settled("alice", true), settled("bob", false)];
+            let snapshots = vec![
+                ready("alice", &[(five, 99, 100)]),
+                ready("bob", &[(five, 10, 100)]),
+            ];
+            match decide_auto_swap_from_state(
+                &state_path,
+                &accounts,
+                &snapshots,
+                &on(),
+                now(),
+                None,
+            ) {
+                AutoSwapDecision::Swap(target) => {
+                    assert_eq!(target.to.0, "bob", "exp 已过但无指纹不得排除");
+                }
+                other => panic!("应照常切到 bob，got {other:?}"),
+            }
+        });
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod account_registry;
 pub mod audit;
 pub mod auto_swap;
 pub mod auto_swap_opt_out;
+pub mod credential_health;
 pub mod defaults;
 pub mod display_name;
 pub mod error;
@@ -18,9 +19,9 @@ pub mod remove_account;
 pub mod removed;
 pub mod settings;
 pub mod store;
+pub mod startup_check;
 pub mod swap;
 mod switch_lock;
-pub mod sync_active;
 pub mod time;
 
 pub use account_registry::AccountRegistry;
@@ -36,6 +37,10 @@ pub use auto_swap::{
 pub use auto_swap_opt_out::{
     account_auto_swap_opt_out, auto_swap_opt_out_from_extra, persist_auto_swap_opt_out,
     write_auto_swap_opt_out_extra, EXTRA_AUTO_SWAP_OPT_OUT,
+};
+pub use credential_health::{
+    blob_refresh_fingerprint, is_locally_invalid, load_dead_refresh_fingerprints,
+    locally_invalid_accounts, refresh_fingerprint,
 };
 pub use display_name::{
     display_name, official_nickname_from_extra, official_nickname_known, persist_official_nickname,
@@ -62,4 +67,4 @@ pub use quota_snapshot::{
 pub use remove_account::remove_account;
 pub use removed::RemovedAccounts;
 pub use store::{CredentialStore, FileStore, KeyringStore};
-pub use sync_active::sync_local_active;
+pub use startup_check::{startup_consistency_check, StartupCheckOutcome};

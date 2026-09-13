@@ -7,8 +7,8 @@ mod dto;
 
 pub use backend::Backend;
 pub use dto::{
-    AccountRow, AuthLink, CommandError, MessageTone, QuotaTone, QuotaView, Snapshot, UiMessage,
-    UiMessageKind, URGENT_USED_RATIO,
+    AccountRow, AuthLink, CommandError, MessageTone, QuotaTone, QuotaView, Snapshot, SwapOutcome,
+    UiMessage, UiMessageKind, URGENT_USED_RATIO,
 };
 pub use kimi_switch_core::QuotaCollectReason;
 
@@ -31,10 +31,11 @@ mod tests {
         attach_auto_swap_message, attach_skip_message, auth_success_message,
         auto_swap_opt_out_message, auto_swap_success_message, bind_web_success_message,
         bind_web_user_message, cached_membership_plan, collect_account_rows,
-        delete_success_message, import_success_message, pre_reset_burn_message,
-        pre_reset_burn_return_message, reauth_success_message,
-        rename_success_message, swap_failure_message, swap_success_message, AutoSwapSnapshotEffect,
-        WebMembershipRefresh,
+        collect_account_rows_scoped, credential_locally_dead, delete_success_message,
+        import_success_message, pre_reset_burn_message, pre_reset_burn_return_message,
+        reauth_success_message, rename_success_message, startup_notice_message,
+        swap_after_activate, swap_failure_message, swap_success_message,
+        AutoSwapSnapshotEffect, DEAD_CREDENTIAL_WARNING, WebMembershipRefresh,
     };
     use kimi_switch_core::{AuditEvent, AuditLog};
 
@@ -155,11 +156,23 @@ mod tests {
             auto_swap_prefer_lower_tier: false,
             auto_swap_resident_lower_tier: false,
             auto_swap_pre_reset_burn: false,
+            auto_swap_pace_pre_swap: false,
             message: Some(message),
         };
         assert_eq!(
             json_object_keys(&serde_json::to_value(&snapshot).unwrap()),
             sorted_key_list(crate::dto::SNAPSHOT_JSON_KEYS)
+        );
+
+        let outcome = SwapOutcome {
+            account_id: "alice".into(),
+            display_name: "工作机".into(),
+            message: UiMessage::ok("已切换到 工作机"),
+            credential_warning: None,
+        };
+        assert_eq!(
+            json_object_keys(&serde_json::to_value(&outcome).unwrap()),
+            sorted_key_list(crate::dto::SWAP_OUTCOME_JSON_KEYS)
         );
     }
 
@@ -285,6 +298,20 @@ mod tests {
     fn command_error_maps_no_pending_auth_kind() {
         let cmd = CommandError::from_anyhow(kimi_switch_core::Error::no_pending_auth().into());
         assert!(matches!(cmd, CommandError::NoPendingAuth(_)));
+    }
+
+    /// issue #153：交换锁 3 秒超时映射为独立 kind，message 透出
+    /// 「另一切换操作未完成，请重试」语义（前端按 message 呈现，不穷举 kind）。
+    #[test]
+    fn command_error_maps_switch_lock_timeout_from_enum() {
+        let err = anyhow::Error::from(kimi_switch_core::Error::SwitchLockTimeout)
+            .context("切换到 Forever 失败");
+        let cmd = CommandError::from_anyhow(err);
+        assert!(matches!(cmd, CommandError::SwitchLockTimeout(_)));
+        assert_eq!(
+            cmd.message(),
+            "切换到 Forever 失败: 另一切换操作未完成，请重试"
+        );
     }
 
     #[test]
@@ -614,6 +641,142 @@ mod tests {
         }));
     }
 
+    /// 按账号计数的收集替身（issue #161）：全局计数 + 每账号计数，供聚焦轮
+    /// 「只对当前账号发查询」的请求计数证明使用。
+    struct FocusCountingProvider {
+        calls: AtomicUsize,
+        calls_by_id: Mutex<HashMap<String, usize>>,
+    }
+
+    impl FocusCountingProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                calls_by_id: Mutex::new(HashMap::new()),
+            })
+        }
+
+        fn calls_for(&self, id: &str) -> usize {
+            self.calls_by_id.lock().unwrap().get(id).copied().unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FocusCountingProvider {
+        async fn activate(&self, _id: &AccountId) -> kimi_switch_core::Result<()> {
+            Ok(())
+        }
+
+        async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut by_id = self.calls_by_id.lock().unwrap();
+                *by_id.entry(id.0.clone()).or_insert(0) += 1;
+            }
+            Ok(vec![sample_quota(
+                &id.0,
+                Some("LEVEL_ADVANCED"),
+                Some("LEVEL_INTERMEDIATE"),
+            )])
+        }
+    }
+
+    /// 聚焦轮（issue #161）：current_only = true 时只对当前账号（active 行）做
+    /// 真实查询，停泊账号零查询、行来自缓存；20s 旧缓存在全量 90s 节流下本会
+    /// 跳过，聚焦轮因 10s 档下限而真正落网。快照仍覆盖全部账号。
+    #[tokio::test]
+    async fn scoped_collect_queries_only_current_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("quota_cache.json");
+        let provider = FocusCountingProvider::new();
+        let mut current = sample_account("alice");
+        current.active = true;
+        let parked = sample_account("bob");
+        let accounts = vec![current, parked];
+
+        // 冷启动全量轮：两账号各查一次，建立缓存。
+        let (full_rows, full_stats, _) = collect_account_rows_scoped(
+            provider.clone(),
+            None,
+            &accounts,
+            &cache_path,
+            QuotaCollectReason::Scheduled,
+            false,
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(full_rows.len(), 2);
+        assert_eq!(full_stats.skipped_out_of_focus, 0);
+
+        // 缓存拨到 20s：过聚焦 10s 下限、仍在全量 90s 窗内。
+        let mut cache = QuotaCache::load(&cache_path);
+        for id in ["alice", "bob"] {
+            cache.age_success("kimi", id, chrono::Duration::seconds(20));
+        }
+        cache.save(&cache_path);
+
+        let (rows, stats, snapshots) = collect_account_rows_scoped(
+            provider.clone(),
+            None,
+            &accounts,
+            &cache_path,
+            QuotaCollectReason::Scheduled,
+            true,
+        )
+        .await;
+        // 请求计数证明：加密轮只新增当前账号一次查询。
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.calls_for("alice"), 2);
+        assert_eq!(provider.calls_for("bob"), 1);
+        assert_eq!(stats.queried, 1);
+        assert_eq!(stats.skipped_out_of_focus, 1);
+        // 快照仍覆盖全部账号：停泊行来自窗内缓存，自动切换判定与展示不受聚焦影响。
+        assert_eq!(rows.len(), 2);
+        assert_eq!(snapshots.len(), 2);
+        assert!(rows.iter().all(|row| row.error.is_none() && !row.quotas.is_empty()));
+    }
+
+    /// current_only = false 与既有全量行为等价：20s 旧缓存仍在 90s 窗内，第二轮全量零查询。
+    #[tokio::test]
+    async fn scoped_collect_false_keeps_full_round_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("quota_cache.json");
+        let provider = FocusCountingProvider::new();
+        let mut current = sample_account("alice");
+        current.active = true;
+        let accounts = vec![current, sample_account("bob")];
+
+        let _ = collect_account_rows_scoped(
+            provider.clone(),
+            None,
+            &accounts,
+            &cache_path,
+            QuotaCollectReason::Scheduled,
+            false,
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let mut cache = QuotaCache::load(&cache_path);
+        for id in ["alice", "bob"] {
+            cache.age_success("kimi", id, chrono::Duration::seconds(20));
+        }
+        cache.save(&cache_path);
+
+        let (_, stats, _) = collect_account_rows_scoped(
+            provider.clone(),
+            None,
+            &accounts,
+            &cache_path,
+            QuotaCollectReason::Scheduled,
+            false,
+        )
+        .await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(stats.queried, 0);
+        assert_eq!(stats.skipped_success_throttle, 2);
+    }
+
     #[tokio::test]
     async fn user_initiated_collect_queries_when_success_cache_is_10s_old() {
         let dir = tempfile::tempdir().unwrap();
@@ -862,6 +1025,271 @@ mod tests {
         assert!(!row.quotas.is_empty(), "额度行不受影响");
     }
 
+    /// issue #157（spec #152 决策 1 / Testing Seam 4）：切换命令不再等待额度
+    /// 快照重列。注入慢快照（`query_quota` 睡 30s，对齐 #52 挂起替身量级）作为
+    /// 后台重列跑起来——重列走 `collect_account_rows`（与前端切换成功后触发的
+    /// 列出命令同一条路径）并与切换并发：切换编排在远小于 30s 内返回、返回时
+    /// 重列仍未完成（返回时延与快照耗时无关）；后台刷新未完成时再次切换另一张
+    /// 卡同样立即返回。
+    #[tokio::test]
+    async fn swap_returns_without_waiting_for_slow_quota_relist() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("quota_cache.json");
+        let audit = AuditLog::new(dir.path().join("audit.log"));
+        let accounts = vec![sample_account("alice"), sample_account("bob")];
+        let slow = Arc::new(SlowQuotaProvider {
+            delay: std::time::Duration::from_secs(30),
+            started: AtomicUsize::new(0),
+        });
+
+        // 后台快照重列（前端切换成功后触发的列出等价物）先与切换并发发起。
+        let relist = {
+            let slow = slow.clone();
+            let accounts = accounts.clone();
+            let cache_path = cache_path.clone();
+            tokio::spawn(async move {
+                collect_account_rows(
+                    slow,
+                    None,
+                    &accounts,
+                    &cache_path,
+                    QuotaCollectReason::Scheduled,
+                )
+                .await
+            })
+        };
+        // 等慢重列确实已进入 query_quota，保证并发是真实的而不是重列还没起步。
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slow.started.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < wait_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            slow.started.load(Ordering::SeqCst) > 0,
+            "慢重列应已发起额度查询"
+        );
+
+        let hold_written = Arc::new(AtomicBool::new(false));
+        let mark_hold_written = hold_written.clone();
+        let started = std::time::Instant::now();
+        let outcome = swap_after_activate(
+            &accounts[0],
+            || async { Ok(()) },
+            &audit,
+            move || {
+                mark_hold_written.store(true, Ordering::SeqCst);
+            },
+            || None,
+            || false,
+        )
+        .await
+        .expect("切换编排应立即成功");
+        // 预算对照：远小于重列的 30s 慢快照——证明由解耦放行，而非等快照完成。
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "切换返回必须与慢快照耗时无关，实际 {elapsed:?}"
+        );
+        assert!(!relist.is_finished(), "慢重列仍在进行：切换没有等它");
+        assert!(hold_written.load(Ordering::SeqCst), "保持期须在返回前写入");
+        assert_eq!(outcome.account_id, "alice");
+        assert_eq!(outcome.display_name, "alice");
+        assert_eq!(outcome.message.text, "已切换到 alice");
+        assert_eq!(outcome.message.kind, UiMessageKind::Generic);
+
+        // 后台刷新未完成时再次切换（另一张卡）：同样不等重列，立即返回。
+        let second = swap_after_activate(
+            &accounts[1],
+            || async { Ok(()) },
+            &audit,
+            || {},
+            || Some("Allegro".into()),
+            || false,
+        )
+        .await
+        .expect("后台刷新未完成时再次切换应照常成功");
+        assert_eq!(second.account_id, "bob");
+        assert_eq!(second.message.text, "已切换到 bob（Allegro）");
+        assert!(!relist.is_finished(), "第二次切换也不得等待重列");
+        relist.abort();
+    }
+
+    /// issue #157：切换编排的 activate 失败原样上抛（调用方映射「切换到 X 失败」），
+    /// 审计、保持期与成功载荷都不落。
+    #[tokio::test]
+    async fn swap_after_activate_propagates_activate_failure_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(dir.path().join("audit.log"));
+        let account = sample_account("alice");
+        let hold_written = Arc::new(AtomicBool::new(false));
+        let mark_hold = hold_written.clone();
+        let plan_read = Arc::new(AtomicBool::new(false));
+        let mark_plan = plan_read.clone();
+        let dead_checked = Arc::new(AtomicBool::new(false));
+        let mark_dead = dead_checked.clone();
+
+        let err = swap_after_activate(
+            &account,
+            || async { Err(kimi_switch_core::Error::SwitchLockTimeout) },
+            &audit,
+            move || {
+                mark_hold.store(true, Ordering::SeqCst);
+            },
+            move || {
+                mark_plan.store(true, Ordering::SeqCst);
+                None
+            },
+            move || {
+                mark_dead.store(true, Ordering::SeqCst);
+                false
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, kimi_switch_core::Error::SwitchLockTimeout));
+        assert!(!hold_written.load(Ordering::SeqCst), "失败不写保持期");
+        assert!(!plan_read.load(Ordering::SeqCst), "失败不读档位");
+        assert!(
+            !dead_checked.load(Ordering::SeqCst),
+            "失败不做死卡快检（issue #156：警告只属于成功路径）"
+        );
+        let audit_text = std::fs::read_to_string(dir.path().join("audit.log")).unwrap_or_default();
+        assert!(
+            !audit_text.contains("\"action\":\"activate\""),
+            "失败不写 activate 审计"
+        );
+    }
+
+    /// issue #156（spec #152 决策 9）：切到本地已确认失效（快检命中）的卡——
+    /// 切换照常成功，成功提示原样保留，另附「建议重新授权」警告文本。
+    #[tokio::test]
+    async fn swap_after_activate_attaches_warning_for_dead_credential_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(dir.path().join("audit.log"));
+        let account = sample_account("alice");
+
+        let outcome = swap_after_activate(
+            &account,
+            || async { Ok(()) },
+            &audit,
+            || {},
+            || Some("Allegro".into()),
+            || true,
+        )
+        .await
+        .expect("死卡也必须照常切换成功");
+
+        // 成功提示的正常路径不被顶掉：文案与 tone 原样，警告只是附加载荷。
+        assert_eq!(outcome.account_id, "alice");
+        assert_eq!(outcome.message.text, "已切换到 alice（Allegro）");
+        assert_eq!(
+            serde_json::to_value(outcome.message.tone).unwrap(),
+            "ok",
+            "警告不得改变成功提示的 tone"
+        );
+        assert_eq!(
+            outcome.credential_warning.as_deref(),
+            Some(DEAD_CREDENTIAL_WARNING),
+            "警告文本语义应为「已失效，建议重新授权」"
+        );
+    }
+
+    /// 健康卡负例（issue #156）：无警告载荷；快检信号未知（fail-open）同形。
+    #[tokio::test]
+    async fn swap_after_activate_healthy_target_has_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(dir.path().join("audit.log"));
+        let account = sample_account("alice");
+
+        let outcome = swap_after_activate(
+            &account,
+            || async { Ok(()) },
+            &audit,
+            || {},
+            || None,
+            || false,
+        )
+        .await
+        .expect("健康卡切换成功");
+
+        assert_eq!(outcome.message.text, "已切换到 alice");
+        assert!(
+            outcome.credential_warning.is_none(),
+            "健康卡不得出现死卡警告"
+        );
+    }
+
+    /// KIMI_CODE_HOME 隔离（生产死卡快检接线测试用）：拒止指纹文件路径由 core
+    /// 按该 env 解析；同一把锁避免并发 set_var 竞态（模式与 core / CLI 夹具一致）。
+    fn with_isolated_kimi_code_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        static KIMI_CODE_HOME_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = KIMI_CODE_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("KIMI_CODE_HOME");
+        std::env::set_var("KIMI_CODE_HOME", tmp.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("KIMI_CODE_HOME", value),
+                    None => std::env::remove_var("KIMI_CODE_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        f(tmp.path())
+    }
+
+    /// 生产死卡快检接线（issue #156）：目标 blob 的 refresh 指纹命中拒止文件 →
+    /// 判死；健康卡不命中；指纹文件缺失 fail-open 判活。纯本地读文件、零网络。
+    /// token 均为合成占位值，不进断言文本。
+    #[test]
+    fn credential_locally_dead_reads_fingerprint_file_and_blob_store() {
+        use kimi_switch_core::paths::AppPaths;
+        use kimi_switch_core::refresh_fingerprint;
+
+        with_isolated_kimi_code_home(|kimi_home| {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(data_dir.join("state")).unwrap();
+            let blobs = serde_json::json!({
+                "kimi:bob:blob": r#"{"access_token":"tok-bob","refresh_token":"refresh-bob"}"#,
+                "kimi:carol:blob": r#"{"access_token":"tok-carol","refresh_token":"refresh-carol"}"#,
+            });
+            std::fs::write(data_dir.join("credentials.json"), blobs.to_string()).unwrap();
+            let paths = AppPaths {
+                config_dir: tmp.path().join("config"),
+                data_dir: data_dir.clone(),
+                state_dir: data_dir.join("state"),
+                cache_dir: tmp.path().join("cache"),
+            };
+            // 拒止文件里只有 bob 的 refresh 指纹。
+            let dead_file = kimi_home.join("credentials").join(".kimi-switch-dead-refresh");
+            std::fs::create_dir_all(dead_file.parent().unwrap()).unwrap();
+            std::fs::write(&dead_file, format!("{}\n", refresh_fingerprint("refresh-bob")))
+                .unwrap();
+
+            assert!(
+                credential_locally_dead(&paths, &sample_account("bob")),
+                "指纹命中应判死"
+            );
+            assert!(
+                !credential_locally_dead(&paths, &sample_account("carol")),
+                "健康卡不得判死"
+            );
+
+            // 指纹文件缺失 → fail-open 全员判活（不因提示机制破坏切换）。
+            std::fs::remove_file(&dead_file).unwrap();
+            assert!(
+                !credential_locally_dead(&paths, &sample_account("bob")),
+                "指纹文件缺失必须 fail-open"
+            );
+        });
+    }
+
     /// 行级刷新结果映射（account_row 直测）：成功但订阅无到期数据 → 日期清空
     /// + 弱提示（与绑定语义一致）；成功有日期 → 不给提示。
     #[test]
@@ -1060,6 +1488,7 @@ mod tests {
             auto_swap_prefer_lower_tier: false,
             auto_swap_resident_lower_tier: false,
             auto_swap_pre_reset_burn: false,
+            auto_swap_pace_pre_swap: false,
             message: attach_skip_message(None, reason, stats),
         }
     }
@@ -1331,14 +1760,8 @@ mod tests {
         );
         assert_eq!(pre_reset_burn_message(&named), "已抢用 Forever");
         assert_eq!(pre_reset_burn_message(&aliased), "已抢用 工作机");
-        assert_eq!(
-            pre_reset_burn_return_message(&named),
-            "已回程 Forever"
-        );
-        assert_eq!(
-            pre_reset_burn_return_message(&aliased),
-            "已回程 工作机"
-        );
+        assert_eq!(pre_reset_burn_return_message(&named), "已回程 Forever");
+        assert_eq!(pre_reset_burn_return_message(&aliased), "已回程 工作机");
     }
 
     #[test]
@@ -1408,6 +1831,30 @@ mod tests {
 
         async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![sample_quota(
+                &id.0,
+                Some("LEVEL_ADVANCED"),
+                Some("LEVEL_INTERMEDIATE"),
+            )])
+        }
+    }
+
+    /// 慢快照替身（issue #157 Seam 4）：`query_quota` 先计数再睡给定时长，人为
+    /// 制造远超切换返回预算的快照重列耗时；`started` 用于确认重列确实已发起。
+    struct SlowQuotaProvider {
+        delay: std::time::Duration,
+        started: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SlowQuotaProvider {
+        async fn activate(&self, _id: &AccountId) -> kimi_switch_core::Result<()> {
+            Ok(())
+        }
+
+        async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             Ok(vec![sample_quota(
                 &id.0,
                 Some("LEVEL_ADVANCED"),
@@ -1663,6 +2110,11 @@ mod tests {
         assert_eq!(event.provider, "kimi");
         assert_eq!(event.result, "ok");
         assert_eq!(event.account.as_deref(), Some("bob"));
+        // issue #153 续跑：自动切换成功审计同样携带 activate 段耗时。
+        assert!(
+            event.duration_ms.is_some(),
+            "自动切换成功审计应含 duration_ms（activate 段耗时）"
+        );
         let detail = event.detail.expect("success audit has detail");
         assert!(detail.contains("from=alice"), "{detail}");
         assert!(detail.contains("window=5h"), "{detail}");
@@ -2322,6 +2774,7 @@ mod tests {
             skipped_success_throttle: 1,
             skipped_rate_limit: 0,
             skipped_auth: 0,
+            ..Default::default()
         };
         let auto = UiMessage::auto_swap_success("已自动切换到 工作机");
         let merged = attach_auto_swap_message(
@@ -2338,5 +2791,31 @@ mod tests {
             .expect("skip toast");
         assert_eq!(skip.text, "刚刚更新过");
         assert_eq!(skip.kind, UiMessageKind::Generic);
+    }
+
+    /// issue #155：启动自检提示文案——一致零输出；工具外身份有导入引导；纠正有确认。
+    #[test]
+    fn startup_notice_message_covers_all_outcomes() {
+        use kimi_switch_core::StartupCheckOutcome;
+
+        assert!(startup_notice_message(&StartupCheckOutcome::Consistent).is_none());
+
+        let untracked =
+            startup_notice_message(&StartupCheckOutcome::UntrackedLiveIdentity {
+                live: AccountId("carol".into()),
+            })
+            .expect("工具外身份应有提示");
+        assert!(untracked.text.contains("工具外身份"), "{}", untracked.text);
+        assert!(untracked.text.contains("导入"), "{}", untracked.text);
+        assert_eq!(untracked.tone, MessageTone::Info);
+
+        let corrected = startup_notice_message(&StartupCheckOutcome::CorrectedActive {
+            account: AccountId("bob".into()),
+            previous: Some(AccountId("alice".into())),
+        })
+        .expect("纠正应有提示");
+        assert!(corrected.text.contains("纠正"), "{}", corrected.text);
+        assert!(corrected.text.contains("alice") && corrected.text.contains("bob"));
+        assert_eq!(corrected.tone, MessageTone::Info);
     }
 }

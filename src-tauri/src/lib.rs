@@ -7,7 +7,7 @@ compile_error!(
 
 use std::sync::Arc;
 
-use kimi_switch_gui::{Backend, CommandError, QuotaCollectReason, Snapshot};
+use kimi_switch_gui::{Backend, CommandError, QuotaCollectReason, Snapshot, SwapOutcome};
 use tauri::{Manager, State};
 
 struct AppState {
@@ -20,17 +20,24 @@ fn map_err(err: anyhow::Error) -> CommandError {
 
 /// 列出账号并 collect 额度（节流）。启动加载、静默查询、刷新按钮共用这一条。
 /// `user_initiated` 缺省为计划内；点「刷新」传 true 走用户发起的额度查询。
+/// `current_only` 传 true 时聚焦当前账号（issue #161 适应性轮询加密轮）：只对
+/// 当前账号发真实查询，停泊账号以缓存行组装；Tauri v2 参数键为 camelCase
+/// （前端传 `currentOnly`）。
 #[tauri::command]
 async fn list_accounts(
     state: State<'_, AppState>,
     user_initiated: Option<bool>,
+    current_only: Option<bool>,
 ) -> Result<Snapshot, CommandError> {
     let reason = if user_initiated.unwrap_or(false) {
         QuotaCollectReason::UserInitiated
     } else {
         QuotaCollectReason::Scheduled
     };
-    Ok(state.backend.snapshot(None, reason).await)
+    Ok(state
+        .backend
+        .snapshot_scoped(None, reason, current_only.unwrap_or(false))
+        .await)
 }
 
 #[tauri::command]
@@ -38,8 +45,11 @@ async fn import_current(state: State<'_, AppState>) -> Result<Snapshot, CommandE
     state.backend.import().await.map_err(map_err)
 }
 
+/// 手动切换（issue #157）：activate 提交（含审计、手动保持期）后立即返回轻量
+/// 结果，不再同步等待额度快照重列；前端据返回立即把所点卡片标记为当前账号，
+/// 再后台触发既有 `list_accounts` 刷新额度，刷新期间可立刻再切另一张卡。
 #[tauri::command]
-async fn swap_account(state: State<'_, AppState>, id: String) -> Result<Snapshot, CommandError> {
+async fn swap_account(state: State<'_, AppState>, id: String) -> Result<SwapOutcome, CommandError> {
     state.backend.swap(&id).await.map_err(map_err)
 }
 
@@ -138,6 +148,12 @@ fn set_auto_swap_resident_lower_tier(enabled: bool) -> Result<bool, CommandError
 #[tauri::command]
 fn set_auto_swap_pre_reset_burn(enabled: bool) -> Result<bool, CommandError> {
     Backend::save_auto_swap_pre_reset_burn(enabled).map_err(map_err)
+}
+
+/// 「pace 预切换」子开关（issue #159，ADR-0013）：写 config.toml，返回落盘后的生效值。
+#[tauri::command]
+fn set_auto_swap_pace_pre_swap(enabled: bool) -> Result<bool, CommandError> {
+    Backend::save_auto_swap_pace_pre_swap(enabled).map_err(map_err)
 }
 
 /// 任务栏图标修正（Windows）：tao 只给窗口设 16px 的 ICON_SMALL，从不设 ICON_BIG；
@@ -247,7 +263,9 @@ fn abort_on_init_failure(err: &anyhow::Error) -> ! {
 pub fn run() {
     let backend = match Backend::new() {
         Ok(backend) => {
-            backend.sync_local_active();
+            // 启动一致性自检（issue #155）：以 live 为准纠正 active / 提示工具外身份
+            // 可导入；一致时零副作用。提示由首个快照的 toast 带出。
+            backend.startup_check();
             Arc::new(backend)
         }
         Err(err) => abort_on_init_failure(&err),
@@ -287,6 +305,7 @@ pub fn run() {
             set_auto_swap_prefer_lower_tier,
             set_auto_swap_resident_lower_tier,
             set_auto_swap_pre_reset_burn,
+            set_auto_swap_pace_pre_swap,
             set_auto_swap_opt_out,
         ])
         .run(tauri::generate_context!())

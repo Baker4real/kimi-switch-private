@@ -102,6 +102,9 @@ impl AccountRegistry {
             .with_extension(format!("toml.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serialized)?;
         std::fs::rename(&tmp, &self.path)?;
+        // 文件级 fsync（issue #153）：切换 commit（set_active）等注册表写入在
+        // 临时文件 + rename 之后落盘；失败如实上抛，由切换的回滚路径兜底。
+        crate::swap::sync_file(&self.path)?;
         Ok(())
     }
 
@@ -404,6 +407,28 @@ mod tests {
         let actives: Vec<_> = all.iter().filter(|a| a.active).collect();
         assert_eq!(actives.len(), 1);
         assert_eq!(actives[0].id.0, "b");
+    }
+
+    /// issue #153：注册表保存的文件级 fsync 失败必须如实报错（进既有错误路径），
+    /// 不得静默成功。切换路径上的恢复责任在 swap 层：registry.toml 经
+    /// `swap_with_snapshot_protected` 纳入备份/回滚集，commit 失败时与 live 一起
+    /// 原子恢复（不变式见 swap.rs 的
+    /// `registry_fsync_failure_rolls_back_registry_and_live_consistently`）。
+    #[test]
+    fn set_active_fsync_failure_propagates_as_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = AccountRegistry::new(tmp.path().join("registry.toml"));
+        reg.upsert(make_account("alpha", "a")).unwrap();
+        reg.upsert(make_account("alpha", "b")).unwrap();
+
+        crate::swap::fail_next_sync();
+        let err = reg
+            .set_active("alpha", &AccountId("b".into()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected fsync failure"),
+            "fsync 失败必须上抛: {err}"
+        );
     }
 
     #[test]

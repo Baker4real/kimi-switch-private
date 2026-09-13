@@ -13,6 +13,8 @@ describe("createApi 动词与命令字符串", () => {
 
     await api.listAccounts();
     await api.listAccounts(true);
+    await api.listAccounts(false, true);
+    await api.listAccounts(true, true);
     await api.importCurrent();
     await api.swapAccount("acc-1");
     await api.removeAccount("acc-2");
@@ -28,11 +30,16 @@ describe("createApi 动词与命令字符串", () => {
     await api.setAutoSwapPreferLowerTier(true);
     await api.setAutoSwapResidentLowerTier(true);
     await api.setAutoSwapPreResetBurn(true);
+    await api.setAutoSwapPacePreSwap(true);
     await api.setAutoSwapOptOut("acc-6", true);
 
     expect(invoke.mock.calls).toEqual([
       ["list_accounts"],
       ["list_accounts", { userInitiated: true }],
+      // currentOnly（issue #161 加密轮）必须走 camelCase 键：Tauri v2 命令参数
+      // 是 snake_case `current_only`，键名写错两侧测试都探测不到。
+      ["list_accounts", { currentOnly: true }],
+      ["list_accounts", { userInitiated: true, currentOnly: true }],
       ["import_current"],
       ["swap_account", { id: "acc-1" }],
       ["remove_account", { id: "acc-2" }],
@@ -48,6 +55,7 @@ describe("createApi 动词与命令字符串", () => {
       ["set_auto_swap_prefer_lower_tier", { enabled: true }],
       ["set_auto_swap_resident_lower_tier", { enabled: true }],
       ["set_auto_swap_pre_reset_burn", { enabled: true }],
+      ["set_auto_swap_pace_pre_swap", { enabled: true }],
       ["set_auto_swap_opt_out", { id: "acc-6", enabled: true }],
     ]);
   });

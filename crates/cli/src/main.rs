@@ -1,7 +1,7 @@
 //! kimi-switch（Kimi Code 裁剪版）CLI 入口。
 //!
 //! 命令面（刻意保持最小）：
-//! - `kimi-switch`              — 默认入口：同步本地激活账号，列出 Kimi 账号 + 5h/7d 额度。
+//! - `kimi-switch`              — 默认入口：启动一致性自检（以 live 为准）后列出 Kimi 账号 + 5h/7d 额度。
 //!   `[auto_swap] enabled = true` 时，额度收集完成后若达阈值则自动切换并追加一行英文结果；
 //!   `resident_lower_tier` 子开关开启时，未达阈值也可能因档位更低而回驻（ADR-0008）。
 //!   `pace_pre_swap` 开启时，未达阈值但预测撑不到 reset 也可能提前切（ADR-0013）。
@@ -20,12 +20,26 @@
 //!   到期写进账号 extra，默认列表即可见「有效期至」。
 //! - `kimi-switch config`       — 打印生效配置（含 `proactive_renewal.enabled`，只读）。
 //!   与 GUI 设置页同源：都是 `<config_dir>/config.toml`。
+//! - `kimi-switch on-quota-failure` — 配额失败被动切换（issue #162，spec #152 决策 14）：
+//!   Kimi Code `StopFailure` hook 观察型入口，stdin 读事件 JSON，命中 403 配额耗尽
+//!   （"usage limit"）即以 403 原文为当前账号耗尽的权威证据，零新增网络查询，按耗尽
+//!   路径语义（安顿宽限与手动保持期不阻挡、冷却照常）复用既有自动切换判定与
+//!   activate。任何情况下退出码恒 0；stdin 畸形静默放行。
+//! - `kimi-switch install-hook [--uninstall]` — 幂等写入 / 卸载 Kimi Code
+//!   `config.toml` 的 `[[hooks]]` StopFailure 条目（指向 `on-quota-failure`）。
+//!   除此命令外，工具任何路径不得隐式修改 Kimi Code 配置（spec #152 决策 16）。
 //!
 //! `<id>` 是账号 id（Kimi user_id）、label 或 `kimi/<id>`；`<N>` 是默认入口
 //! 显示的编号（1 起）。`login` / `swap` / `rm` / `bind-web` / `config` 仍是 anyhow 的 0/1。
+//!
+//! 启动一致性自检（issue #155，spec #152 决策 8）：除 `install-hook` /
+//! `on-quota-failure`（观察型，自带 live 对齐）外，每次 CLI 启动都以 live 登录文件
+//! 为准比对并纠正注册表 active 标记；live 身份不在账号库时清除标记并在 stderr
+//! 提示可导入。纯本地读，一致时零副作用、零可见输出；提示只走 stderr，
+//! 不污染 stdout 的账号列表与 `--json` 事件流。
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -35,12 +49,12 @@ use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
     decide_auto_swap_from_state, decide_resident_return_from_state, earliest_reset_at,
-    membership_expiry_from_extra, prettify_membership, read_last_auto_swap_at,
-    read_manual_hold_until, record_auto_swap_success, set_manual_hold_until, settings,
-    write_last_auto_swap_at, Account, AccountId, AccountRegistry, AuditEvent, AuditLog,
-    AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget,
-    CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaSnapshot, QuotaState,
-    QuotaWindow, RemovedAccounts,
+    locally_invalid_accounts, membership_expiry_from_extra, prettify_membership,
+    read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
+    set_manual_hold_until, settings, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
+    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason,
+    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCache,
+    QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 use serde::Serialize;
@@ -65,7 +79,9 @@ Human-readable listing and auto_swap lines go to stderr when `--json` is set. \
 Without `--json`, stdout is the existing account list plus auto_swap lines.
 
 `--json` and these exit codes apply only to the default status path. \
-`login` / `swap` / `rm` / `bind-web` / `config` keep exit 0 or 1.";
+`login` / `swap` / `rm` / `bind-web` / `config` keep exit 0 or 1. \
+`on-quota-failure` (StopFailure hook observer) always exits 0. \
+`install-hook` manages the Kimi Code StopFailure hook entry (idempotent).";
 
 #[derive(Parser)]
 #[command(
@@ -115,6 +131,21 @@ enum Cmd {
 
     /// Print the effective settings (read-only), as loaded from config.toml.
     Config,
+
+    /// Observe a Kimi Code StopFailure hook event (stdin JSON). On a 403
+    /// quota-exhaustion signal ("usage limit"), run one passive auto-swap
+    /// reusing the existing exhaustion-path decision. Zero new network
+    /// queries. Always exits 0 (observer hook; never blocks the session).
+    OnQuotaFailure,
+
+    /// Idempotently install (or remove with --uninstall) the Kimi Code
+    /// StopFailure [[hooks]] entry wiring events to `on-quota-failure`.
+    /// No other code path ever modifies Kimi Code's config.toml.
+    InstallHook {
+        /// Remove the hook entry instead of installing it.
+        #[arg(long)]
+        uninstall: bool,
+    },
 }
 
 /// 进程级共享上下文：明文文件凭证仓库 + registry + Kimi provider。
@@ -189,27 +220,53 @@ async fn main() -> Result<ExitCode> {
         tracing::warn!(err = %e, "load config failed; using built-in defaults");
     }
 
-    let ctx = AppContext::build()?;
+    // ctx 按命令消费：`on-quota-failure` 是观察型 hook，任何内部错误（含 ctx 构建
+    // 失败）只写 stderr 日志，退出码恒 0，绝不阻断用户会话（issue #162）。
+    let ctx = AppContext::build();
 
     match cli.cmd {
-        None => match status(&ctx, cli.json).await {
-            Ok(code) => Ok(code),
-            Err(err) => {
-                if cli.json {
-                    emit_status_output(
-                        true,
-                        &[],
-                        &StatusJsonEvent::error(None, format!("{err:#}")),
-                    )?;
-                }
-                Err(err)
+        Some(Cmd::OnQuotaFailure) => {
+            match ctx.as_ref() {
+                Ok(ctx) => on_quota_failure(ctx).await,
+                Err(err) => tracing::warn!(err = %err, "on-quota-failure: context unavailable"),
             }
-        },
-        Some(Cmd::Login { provider }) => login(&ctx, &provider).await.map(|()| ExitCode::SUCCESS),
-        Some(Cmd::Swap { id }) => swap(&ctx, id.as_deref()).await.map(|()| ExitCode::SUCCESS),
-        Some(Cmd::Rm { id }) => rm(&ctx, &id).await.map(|()| ExitCode::SUCCESS),
-        Some(Cmd::BindWeb { id }) => bind_web(&ctx, &id).await.map(|()| ExitCode::SUCCESS),
-        Some(Cmd::Config) => config().map(|()| ExitCode::SUCCESS),
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Cmd::InstallHook { uninstall }) => install_hook(uninstall).map(|()| ExitCode::SUCCESS),
+        other => {
+            let ctx = ctx?;
+            // 启动一致性自检（issue #155）：以 live 为准纠正 active / 清除工具外身份
+            // 标记；一致时零副作用零输出。提示走 stderr，stdout 保持机器可读契约。
+            if let Some(notice) = startup_check_notice(&startup_check(&ctx)) {
+                eprintln!("{notice}");
+            }
+            match other {
+                None => match status(&ctx, cli.json).await {
+                    Ok(code) => Ok(code),
+                    Err(err) => {
+                        if cli.json {
+                            emit_status_output(
+                                true,
+                                &[],
+                                &StatusJsonEvent::error(None, format!("{err:#}")),
+                            )?;
+                        }
+                        Err(err)
+                    }
+                },
+                Some(Cmd::Login { provider }) => {
+                    login(&ctx, &provider).await.map(|()| ExitCode::SUCCESS)
+                }
+                Some(Cmd::Swap { id }) => {
+                    swap(&ctx, id.as_deref()).await.map(|()| ExitCode::SUCCESS)
+                }
+                Some(Cmd::Rm { id }) => rm(&ctx, &id).await.map(|()| ExitCode::SUCCESS),
+                Some(Cmd::BindWeb { id }) => bind_web(&ctx, &id).await.map(|()| ExitCode::SUCCESS),
+                Some(Cmd::Config) => config().map(|()| ExitCode::SUCCESS),
+                // OnQuotaFailure / InstallHook 已在前面的分支消费，这里不可达。
+                Some(Cmd::OnQuotaFailure) | Some(Cmd::InstallHook { .. }) => unreachable!(),
+            }
+        }
     }
 }
 
@@ -218,10 +275,7 @@ async fn main() -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 
 async fn status(ctx: &AppContext, json: bool) -> Result<ExitCode> {
-    // 1. 自动导入/对齐本地激活账号（`rm` 过的账号有墓碑，跳过）。
-    sync_local_active(ctx);
-
-    // 2. 列出账号。
+    // 1. 列出账号（启动一致性自检已在 main 统一执行，见文件头说明）。
     let mut accounts = ctx.list_ordered()?;
     if accounts.is_empty() {
         let effect = AutoSwapStatusEffect::stay("no_accounts");
@@ -233,7 +287,7 @@ async fn status(ctx: &AppContext, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::from(effect.exit_code()));
     }
 
-    // 3. 额度快照（节流 / 退避 / 并发 / 陈旧回退收口在 core）。
+    // 2. 额度快照（节流 / 退避 / 并发 / 陈旧回退收口在 core）。
     let cache_path = AppPaths::resolve()?.quota_cache_file();
     let ids: Vec<_> = accounts.iter().map(|account| account.id.clone()).collect();
     let snapshots = kimi_switch_core::quota_snapshot::collect(
@@ -245,14 +299,16 @@ async fn status(ctx: &AppContext, json: bool) -> Result<ExitCode> {
     )
     .await;
 
-    // 4. 自动切换：开关关闭则短路（零判定、不读冷却文件）。触发时走既有 activate。
+    // 3. 自动切换：开关关闭则短路（零判定、不读冷却文件）。触发时走既有 activate。
     let auto_swap = maybe_run_status_auto_swap(ctx, &accounts, &snapshots).await;
     if auto_swap.swapped {
-        sync_local_active(ctx);
+        // 自动切换后再对齐一次（activate 已保证一致，正常零副作用的自检兜底）；
+        // 不渲染提示：此刻的账号列表即是最新的自检结果。
+        startup_check(ctx);
         accounts = ctx.list_ordered()?;
     }
 
-    // 5. 渲染。账号 id 旁带档位名与会员到期（extra 有 → `有效期至 <日期>`；
+    // 4. 渲染。账号 id 旁带档位名与会员到期（extra 有 → `有效期至 <日期>`；
     //    无 → 绑定弱提示）；节流命中不标 stale，失败回落标 `(stale)`。
     let mut human_lines = Vec::with_capacity(accounts.len() + 2);
     human_lines.push("kimi".to_string());
@@ -602,57 +658,73 @@ where
                 manual_hold_until,
             ) {
                 None => AutoSwapStatusEffect::stay(skip_reason_json(reason)),
-                Some(target) => match activate(target.to.clone()).await {
-                    Ok(()) => {
-                        write_last_auto_swap_at(state_path, Utc::now());
-                        audit.append(
-                            AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
-                                .with_detail(resident_return_audit_detail(&target)),
-                        );
-                        AutoSwapStatusEffect::swapped(
-                            resident_return_line(&target),
-                            StatusJsonEvent::swap_resident(&target),
-                        )
+                // activate 段计时（issue #153 续跑）：自动切换与手动切换同口径，
+                // 只覆盖 activate 段，耗时写入审计 duration_ms。
+                Some(target) => {
+                    let activate_started = std::time::Instant::now();
+                    match activate(target.to.clone()).await {
+                        Ok(()) => {
+                            write_last_auto_swap_at(state_path, Utc::now());
+                            audit.append(
+                                AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
+                                    .with_detail(resident_return_audit_detail(&target))
+                                    .with_duration_ms(
+                                        activate_started.elapsed().as_millis() as u64,
+                                    ),
+                            );
+                            AutoSwapStatusEffect::swapped(
+                                resident_return_line(&target),
+                                StatusJsonEvent::swap_resident(&target),
+                            )
+                        }
+                        Err(err) => {
+                            audit.append(AuditEvent::err(
+                                "auto_swap",
+                                "kimi",
+                                Some(target.to.0.as_str()),
+                                &err.to_string(),
+                            ));
+                            AutoSwapStatusEffect::activate_failed(&target.to, err)
+                        }
                     }
-                    Err(err) => {
-                        audit.append(AuditEvent::err(
-                            "auto_swap",
-                            "kimi",
-                            Some(target.to.0.as_str()),
-                            &err.to_string(),
-                        ));
-                        AutoSwapStatusEffect::activate_failed(&target.to, err)
-                    }
-                },
+                }
             }
         }
-        AutoSwapDecision::Swap(target) => match activate(target.to.clone()).await {
-            Ok(()) => {
-                record_auto_swap_success(state_path, Utc::now(), &target, snapshots);
-                audit.append(
-                    AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
-                        .with_detail(auto_swap_audit_detail(&target)),
-                );
-                AutoSwapStatusEffect::swapped(
-                    auto_swap_success_line(&target),
-                    match target.kind {
-                        AutoSwapKind::Pace => StatusJsonEvent::swap_pace(&target),
-                        AutoSwapKind::Burn => StatusJsonEvent::swap_burn(&target),
-                        AutoSwapKind::BurnReturn => StatusJsonEvent::swap_burn_return(&target),
-                        AutoSwapKind::Exhausted => StatusJsonEvent::swap_exhausted(&target),
-                    },
-                )
+        AutoSwapDecision::Swap(target) => {
+            // activate 段计时（issue #153 续跑）：耗尽 / pace / 抢用 / 回程共用，
+            // 与手动切换同口径写入审计 duration_ms。
+            let activate_started = std::time::Instant::now();
+            match activate(target.to.clone()).await {
+                Ok(()) => {
+                    record_auto_swap_success(state_path, Utc::now(), &target, snapshots);
+                    audit.append(
+                        AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
+                            .with_detail(auto_swap_audit_detail(&target))
+                            .with_duration_ms(activate_started.elapsed().as_millis() as u64),
+                    );
+                    AutoSwapStatusEffect::swapped(
+                        auto_swap_success_line(&target),
+                        match target.kind {
+                            AutoSwapKind::Pace => StatusJsonEvent::swap_pace(&target),
+                            AutoSwapKind::Burn => StatusJsonEvent::swap_burn(&target),
+                            AutoSwapKind::BurnReturn => {
+                                StatusJsonEvent::swap_burn_return(&target)
+                            }
+                            AutoSwapKind::Exhausted => StatusJsonEvent::swap_exhausted(&target),
+                        },
+                    )
+                }
+                Err(err) => {
+                    audit.append(AuditEvent::err(
+                        "auto_swap",
+                        "kimi",
+                        Some(target.to.0.as_str()),
+                        &err.to_string(),
+                    ));
+                    AutoSwapStatusEffect::activate_failed(&target.to, err)
+                }
             }
-            Err(err) => {
-                audit.append(AuditEvent::err(
-                    "auto_swap",
-                    "kimi",
-                    Some(target.to.0.as_str()),
-                    &err.to_string(),
-                ));
-                AutoSwapStatusEffect::activate_failed(&target.to, err)
-            }
-        },
+        }
     }
 }
 
@@ -748,19 +820,38 @@ fn membership_status_text(
     })
 }
 
-/// 扫本地 `~/.kimi-code`；当前账号没记录过就入库（已存在则对齐 active）。墓碑命中或未登录则跳过。
-fn sync_local_active(ctx: &AppContext) {
+/// 启动一致性自检（issue #155，spec #152 决策 8）：以 live 为准比对并纠正注册表
+/// active 标记；live 身份不在账号库（工具外登录）时清除标记并返回导入提示信号。
+/// 零网络；一致、live 不可读或墓碑命中时零副作用。
+fn startup_check(ctx: &AppContext) -> kimi_switch_core::StartupCheckOutcome {
     let Ok(paths) = AppPaths::resolve() else {
-        return;
+        return kimi_switch_core::StartupCheckOutcome::Consistent;
     };
-    let removed_path = paths.removed_file();
-    kimi_switch_core::sync_local_active(
+    kimi_switch_core::startup_consistency_check(
         "kimi",
-        &removed_path,
+        &paths.removed_file(),
         ctx.registry.as_ref(),
+        &ctx.audit,
         || ctx.kimi.live_account_id(),
-        || ctx.kimi.sync_active_metadata(None),
-    );
+    )
+}
+
+/// 自检结果的用户可见提示（issue #155）。一致或无法判定时返回 `None`
+/// （零可见输出）；其余输出简洁中文，由调用方写 stderr。
+fn startup_check_notice(outcome: &kimi_switch_core::StartupCheckOutcome) -> Option<String> {
+    use kimi_switch_core::StartupCheckOutcome;
+    match outcome {
+        StartupCheckOutcome::Consistent => None,
+        StartupCheckOutcome::CorrectedActive { account, previous } => Some(match previous {
+            Some(prev) => {
+                format!("已按登录文件纠正当前账号标记：kimi/{account}（原 kimi/{prev}）")
+            }
+            None => format!("已按登录文件纠正当前账号标记：kimi/{account}"),
+        }),
+        StartupCheckOutcome::UntrackedLiveIdentity { live } => Some(format!(
+            "检测到工具外身份 kimi/{live}，不在账号库；可运行 kimi-switch login kimi 导入收进账号库"
+        )),
+    }
 }
 
 /// 把多窗口额度渲染成一行：`5h 18% (18/100) resets 08-15 20:52 · 7d 4% (4/100)`。
@@ -840,6 +931,41 @@ async fn login(ctx: &AppContext, provider: &str) -> Result<()> {
 // swap
 // ---------------------------------------------------------------------------
 
+/// 手动切换死卡提示行（issue #156，spec #152 决策 9）：目标凭证本地已确认失效
+/// （invalid_grant 指纹命中）时切换照常成功，stdout 成功行之后向 stderr 补这行
+/// 中文警告；与 GUI toast 警告文本同文。
+const DEAD_CREDENTIAL_WARNING: &str = "该账号凭证已失效，建议重新授权";
+
+/// 手动切换死卡快检（issue #156，spec #152 决策 9）：目标凭证 refresh token
+/// 指纹命中本地 invalid_grant 拒止集合时返回警告行（调用方写 stderr）。复用
+/// core 共享原语 [`locally_invalid_accounts`]（#158 裁定口径：只认指纹、不认
+/// JWT exp——access 过期但 refresh 有效的账号激活后自愈，不是死卡）。纯本地
+/// 只读 credentials.json 与拒止指纹文件，零网络；任何读取/解析失败 fail-open
+/// 返回 `None`（不因提示机制破坏切换）。
+fn dead_credential_warning(account: &Account) -> Option<&'static str> {
+    let paths = AppPaths::resolve().ok()?;
+    let dead = locally_invalid_accounts(
+        &paths.auto_swap_state_file(),
+        std::slice::from_ref(account),
+        Utc::now(),
+    );
+    dead.contains(&account.id).then_some(DEAD_CREDENTIAL_WARNING)
+}
+
+/// 把死卡警告写往 stderr（issue #156）：`None` 零输出；写失败由调用方忽略——
+/// 提示机制绝不影响切换结果。测试经 writer 断言行内容（与
+/// `emit_status_output_to` 同款 seam）。
+fn write_dead_credential_warning(
+    warning: Option<&str>,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    if let Some(text) = warning {
+        writeln!(out, "{text}")?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
 /// 显式切换激活账号。手动入口，不依赖网络/quota（原子写 + 快照回滚在 provider 内部）。
 async fn swap(ctx: &AppContext, id_input: Option<&str>) -> Result<()> {
     let Some(input) = id_input else {
@@ -848,10 +974,15 @@ async fn swap(ctx: &AppContext, id_input: Option<&str>) -> Result<()> {
     };
 
     let acc = resolve_account(ctx, input)?;
+    // activate 段计时（issue #153）：纯本地原子写 + 快照回滚 + 文件锁，零网络；
+    // 耗时写入审计 duration_ms，预算对照 P50 < 200ms（spec #152 决策 4）。
+    let activate_started = std::time::Instant::now();
     match ctx.kimi.activate(&acc.id).await {
         Ok(()) => {
-            ctx.audit
-                .append(AuditEvent::ok("activate", "kimi", Some(acc.id.0.as_str())));
+            ctx.audit.append(
+                AuditEvent::ok("activate", "kimi", Some(acc.id.0.as_str()))
+                    .with_duration_ms(activate_started.elapsed().as_millis() as u64),
+            );
             // 手动切换写回驻保持期（issue #97 / ADR-0008）：期间回驻不触发，
             // 耗尽被迫切换不受影响。只写本机状态文件，不引入网络依赖；
             // 写失败在 core 内只 warn，不影响 swap 成功结果。
@@ -865,6 +996,13 @@ async fn swap(ctx: &AppContext, id_input: Option<&str>) -> Result<()> {
                 );
             }
             println!("swap → kimi/{}", acc.id);
+            // 死卡提示（issue #156，spec #152 决策 9）：切换已照常成功，stdout
+            // 成功行之后向 stderr 补一行中文警告；判定纯本地 fail-open，写失败
+            // 也忽略，绝不影响切换结果。
+            let _ = write_dead_credential_warning(
+                dead_credential_warning(&acc).as_deref(),
+                &mut std::io::stderr(),
+            );
             Ok(())
         }
         Err(e) => {
@@ -1010,6 +1148,366 @@ fn config() -> Result<()> {
 fn render_config() -> Result<String> {
     let current = settings::current();
     toml::to_string_pretty(current.as_ref()).context("render effective settings")
+}
+
+// ---------------------------------------------------------------------------
+// on-quota-failure（配额失败被动切换，issue #162 / spec #152 决策 14）
+// ---------------------------------------------------------------------------
+
+/// Kimi Code `StopFailure` hook 观察型入口：stdin 读事件 JSON → 分类 → 命中 403
+/// 配额耗尽时按耗尽路径语义复用既有自动切换判定与 activate。零新增网络查询；
+/// 任何错误只写 stderr 日志，退出码由调用方恒置 0；stdin 畸形静默放行。
+async fn on_quota_failure(ctx: &AppContext) {
+    use std::io::Read;
+
+    let mut raw = String::new();
+    if let Err(err) = std::io::stdin().lock().read_to_string(&mut raw) {
+        tracing::warn!(err = %err, "on-quota-failure: read stdin failed");
+        return;
+    }
+    if let Err(err) = run_on_quota_failure_with(ctx, &raw, &settings::current().auto_swap).await {
+        tracing::warn!(err = %err, "on-quota-failure handler failed");
+    }
+}
+
+/// `on-quota-failure` 的可测内核：事件原文 → 被动切换编排。测试直接喂伪造 hook
+/// 事件与显式 AutoSwap 设置（tempdir 双隔离），与 `apply_status_auto_swap` 同一
+/// 测试形态。观察型约定：内部任何失败都不向上抛给退出码之外的主流程语义。
+async fn run_on_quota_failure_with(
+    ctx: &AppContext,
+    raw: &str,
+    auto_swap: &kimi_switch_core::settings::AutoSwap,
+) -> Result<()> {
+    use kimi_switch_core::auto_swap::{
+        classify_stop_failure, decide_auto_swap_passive_from_state, overlay_exhausted_snapshot,
+        StopFailureSignal,
+    };
+
+    // 1. 分类：仅 403 配额类（"usage limit"）命中；429 / 其他 / 畸形静默放行。
+    let window = match classify_stop_failure(raw) {
+        StopFailureSignal::QuotaExhausted { window } => window,
+        StopFailureSignal::Other => {
+            tracing::debug!("on-quota-failure: not a quota-exhaustion 403; ignoring");
+            return Ok(());
+        }
+    };
+
+    // 2. 总开关沿用既有语义：自动切换关闭时被动路径同闸，零副作用。
+    if !auto_swap.enabled {
+        tracing::debug!("on-quota-failure: auto_swap disabled; ignoring");
+        return Ok(());
+    }
+
+    let paths = AppPaths::resolve()?;
+
+    // 3. 被动串行化锁（独立于交换锁，无嵌套）：把「读状态 → 判定 → activate →
+    //    写冷却」整段排成队列。并发触发时后到者在锁内重读状态，看到冷却或新
+    //    当前账号健康即自然落空（issue #162 锁 + 冷却收敛；冷却写在 activate
+    //    返回之后，没有这把锁时 [提交, 写冷却] 间隙里迟到的触发会把 403 证据
+    //    错按在新当前账号上再切一跳）。等待超时视为另一触发处理中：观察型放弃。
+    let lock_path = paths.state_dir.join("passive-swap.lock");
+    let guard = tokio::task::spawn_blocking(move || PassiveSwapLock::acquire(&lock_path))
+        .await
+        .ok()
+        .flatten();
+    let Some(_serialized) = guard else {
+        tracing::debug!("on-quota-failure: another passive trigger in flight; skipping");
+        return Ok(());
+    };
+
+    // 4. 以 live 为准一致性自检（ADR-0002 / issue #155），再取账号列表与缓存快照
+    //    （零网络；无缓存账号无快照，候选资格线照旧不通过——判定只用已收集的额度快照）。
+    //    观察型上下文：结果只记 debug；live 身份不在库时清除标记后无当前账号，
+    //    下方 find(active) 自然落空返回。
+    tracing::debug!(outcome = ?startup_check(ctx), "startup check (passive)");
+    let accounts = ctx.list_ordered()?;
+    let Some(current) = accounts.iter().find(|account| account.active) else {
+        return Ok(());
+    };
+    let state_path = paths.auto_swap_state_file();
+    let cache = QuotaCache::load(&paths.quota_cache_file());
+    let mut snapshots: Vec<QuotaSnapshot> = accounts
+        .iter()
+        .filter_map(|account| cached_quota_snapshot(&cache, &account.id))
+        .collect();
+
+    // 5. 403 原文 = 当前账号耗尽的权威证据：合成/覆盖当前账号快照后进既有判定。
+    //    耗尽语义（冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆、候选本地
+    //    凭证快检）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。
+    let overlay = overlay_exhausted_snapshot(
+        &current.id,
+        snapshots.iter().find(|item| item.account_id == current.id),
+        window,
+        Utc::now(),
+    );
+    match snapshots
+        .iter_mut()
+        .find(|item| item.account_id == current.id)
+    {
+        Some(existing) => *existing = overlay,
+        None => snapshots.push(overlay),
+    }
+
+    let decision = decide_auto_swap_passive_from_state(
+        &state_path,
+        &accounts,
+        &snapshots,
+        auto_swap,
+        Utc::now(),
+        read_last_auto_swap_at(&state_path),
+    );
+
+    match decision {
+        // 与轮询路径同口径：本应触发但无合格候选时记审计，便于事后核查。
+        AutoSwapDecision::Stay {
+            reason: AutoSwapSkipReason::NoEligibleCandidate,
+        } => {
+            ctx.audit.append(AuditEvent::err(
+                "auto_swap",
+                "kimi",
+                Some(current.id.0.as_str()),
+                "no eligible candidate",
+            ));
+            Ok(())
+        }
+        // 冷却 / 无当前账号等其余 Stay：静默落空（观察型，不打扰会话）。
+        AutoSwapDecision::Stay { .. } => Ok(()),
+        AutoSwapDecision::Swap(target) => {
+            // 决定之后、真正 activate 之前重读当前账号与冷却（GUI 编排同款防线）：
+            // 并发的 GUI/CLI 轮询切换已完成时放弃，不重复 activate、不审计。
+            let still_current = ctx
+                .list_ordered()?
+                .iter()
+                .any(|account| account.active && account.id == target.from);
+            let cooldown_held = read_last_auto_swap_at(&state_path).is_some_and(|at| {
+                Utc::now() < at + chrono::Duration::milliseconds(auto_swap.cooldown_ms)
+            });
+            if !still_current || cooldown_held {
+                return Ok(());
+            }
+            // activate 段计时（issue #153 续跑）：被动路径与轮询 / 手动切换同口径，
+            // 耗时写入审计 duration_ms。
+            let activate_started = std::time::Instant::now();
+            match ctx.kimi.activate(&target.to).await {
+                Ok(()) => {
+                    record_auto_swap_success(&state_path, Utc::now(), &target, &snapshots);
+                    ctx.audit.append(
+                        AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
+                            .with_detail(format!(
+                                "{} trigger=passive",
+                                auto_swap_audit_detail(&target)
+                            ))
+                            .with_duration_ms(activate_started.elapsed().as_millis() as u64),
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    // activate 失败不写冷却（与既有路径一致）；观察型不影响退出码。
+                    ctx.audit.append(AuditEvent::err(
+                        "auto_swap",
+                        "kimi",
+                        Some(target.to.0.as_str()),
+                        &err.to_string(),
+                    ));
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// 被动触发串行化锁（issue #162 并发收敛）：`<state_dir>/passive-swap.lock` 上的
+/// 排他文件锁，独立于交换锁（registry 目录的 `.kimi-switch.lock`），二者无嵌套。
+/// 文件锁随 File drop / 进程退出自动释放；等待上限对齐交换锁的 3 秒。
+struct PassiveSwapLock(std::fs::File);
+
+impl Drop for PassiveSwapLock {
+    fn drop(&mut self) {
+        // 显式解锁；即便遗忘，进程退出时 OS 也会释放文件锁。
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+impl PassiveSwapLock {
+    /// 阻塞轮询获取（须在 `spawn_blocking` 内调用）；超时或打不开返回 `None`，
+    /// 调用方观察型放弃（任何锁错误都按「拿不到」处理，不影响退出码）。
+    fn acquire(path: &Path) -> Option<Self> {
+        use fs2::FileExt;
+        use std::time::{Duration, Instant};
+
+        const WAIT_LIMIT: Duration = Duration::from_secs(3);
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        let started = Instant::now();
+        loop {
+            if file.try_lock_exclusive().is_ok() {
+                return Some(Self(file));
+            }
+            if started.elapsed() >= WAIT_LIMIT {
+                return None;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+/// 只读额度缓存构造快照（被动路径零网络）。档位取窗口一字段（与 core
+/// `membership_of` 同口径）。无缓存账号返回 `None`（无快照 → 候选资格线不通过）。
+fn cached_quota_snapshot(cache: &QuotaCache, id: &AccountId) -> Option<QuotaSnapshot> {
+    let entry = cache.get("kimi", &id.0)?;
+    let membership = entry.quotas.iter().find_map(|q| q.membership.clone());
+    Some(QuotaSnapshot {
+        account_id: id.clone(),
+        fetched_at: entry.cached_at,
+        stale: false,
+        membership,
+        state: QuotaState::Cached(entry.quotas),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// install-hook（issue #162 / spec #152 决策 16）
+// ---------------------------------------------------------------------------
+
+/// 我们写入 Kimi Code config.toml 的 StopFailure 条目识别标记：`command` 含
+/// `on-quota-failure` 子命令即视为本工具条目。重复安装只刷新（不重复追加），
+/// 卸载只删自己的，不动用户其它 hooks 条目。
+const HOOK_MARKER: &str = "on-quota-failure";
+
+/// Kimi Code 工作目录（只读镜像 `crates/providers/kimi/src/paths.rs::kimi_home`，
+/// owner 在那边；布局调整时需同步）。`KIMI_CODE_HOME` > `~/.kimi-code` > `.kimi-code`。
+fn kimi_code_home() -> PathBuf {
+    if let Some(value) = std::env::var_os("KIMI_CODE_HOME") {
+        return PathBuf::from(value);
+    }
+    directories::UserDirs::new()
+        .map(|dirs| dirs.home_dir().join(".kimi-code"))
+        .unwrap_or_else(|| PathBuf::from(".kimi-code"))
+}
+
+/// `install-hook` 命令体：幂等写入 / 卸载 Kimi Code `config.toml` 的 `[[hooks]]`
+/// StopFailure 条目，command 指向当前可执行文件的 `on-quota-failure` 子命令。
+fn install_hook(uninstall: bool) -> Result<()> {
+    let config_path = kimi_code_home().join("config.toml");
+    let exe = std::env::current_exe().context("resolve current executable path")?;
+    let message = install_hook_into(&config_path, &exe, uninstall)?;
+    println!("{message}");
+    Ok(())
+}
+
+/// 安装 / 卸载的可测内核（tempdir 假 config）：先 toml_edit 解析后写回，保留注释、
+/// 顺序与既有条目；解析失败报错退出、绝不覆写。无变化时不重写文件（字节不变）。
+fn install_hook_into(config_path: &Path, exe: &Path, uninstall: bool) -> Result<String> {
+    let raw = std::fs::read_to_string(config_path).unwrap_or_default();
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parse {}", config_path.display()))?;
+
+    if doc.get("hooks").is_none() {
+        doc["hooks"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    }
+    let Some(hooks) = doc["hooks"].as_array_of_tables_mut() else {
+        anyhow::bail!(
+            "`hooks` in {} is not an array of tables ([[hooks]]); refusing to touch it",
+            config_path.display()
+        );
+    };
+    let ours: Vec<usize> = hooks
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| hook_entry_is_ours(table))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if uninstall {
+        if ours.is_empty() {
+            return Ok("no kimi-switch StopFailure hook installed; nothing to remove".into());
+        }
+        for idx in ours.into_iter().rev() {
+            hooks.remove(idx);
+        }
+        // 数组被清空时连 `hooks` 键一起移除，还原到没有 hooks 段的原始形态。
+        if hooks.is_empty() {
+            doc.remove("hooks");
+        }
+    } else {
+        let command = format!("\"{}\" {HOOK_MARKER}", exe.display());
+        match ours.first() {
+            // 已安装：刷新 command（可执行文件可能移动过）与 timeout，多余重复条目收敛成一个。
+            Some(&first) => {
+                let table = hooks
+                    .get_mut(first)
+                    .expect("ours 索引来自同一 hooks 数组，必然存在");
+                table.insert("command", toml_edit::value(command));
+                table.insert("timeout", toml_edit::value(HOOK_TIMEOUT_SECS));
+                for idx in ours.into_iter().skip(1).rev() {
+                    hooks.remove(idx);
+                }
+            }
+            None => {
+                let mut table = toml_edit::Table::new();
+                table.insert("event", toml_edit::value("StopFailure"));
+                table.insert("command", toml_edit::value(command));
+                table.insert("timeout", toml_edit::value(HOOK_TIMEOUT_SECS));
+                hooks.push(table);
+            }
+        }
+    }
+
+    let body = doc.to_string();
+    if body == raw {
+        return Ok(format!(
+            "kimi-switch StopFailure hook already up to date in {}",
+            config_path.display()
+        ));
+    }
+    write_config_atomically(config_path, &body)?;
+    Ok(if uninstall {
+        format!(
+            "removed kimi-switch StopFailure hook from {}",
+            config_path.display()
+        )
+    } else {
+        format!(
+            "installed kimi-switch StopFailure hook in {} (command runs {})",
+            config_path.display(),
+            HOOK_MARKER
+        )
+    })
+}
+
+/// hook 条目超时（秒）：被动切换为纯本地文件操作（毫秒级），10s 上限兜底即可，
+/// 不让 hook 拖慢会话（官方默认 30s）。
+const HOOK_TIMEOUT_SECS: i64 = 10;
+
+/// 判定 [[hooks]] 条目是否为本工具写入的 StopFailure 条目。
+fn hook_entry_is_ours(table: &toml_edit::Table) -> bool {
+    table.get("event").and_then(|value| value.as_str()) == Some("StopFailure")
+        && table
+            .get("command")
+            .and_then(|value| value.as_str())
+            .is_some_and(|command| command.contains(HOOK_MARKER))
+}
+
+/// 同目录临时文件 + rename 写回（config.toml 非机密，默认权限即可）。
+fn write_config_atomically(path: &Path, body: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("toml.kimi-switch.tmp");
+    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1341,6 +1839,11 @@ mod tests {
         assert_eq!(event.provider, "kimi");
         assert_eq!(event.result, "ok");
         assert_eq!(event.account.as_deref(), Some("bob"));
+        // issue #153 续跑：自动切换成功审计同样携带 activate 段耗时。
+        assert!(
+            event.duration_ms.is_some(),
+            "自动切换成功审计应含 duration_ms（activate 段耗时）"
+        );
         let detail = event.detail.expect("success audit has detail");
         assert!(detail.contains("from=alice"), "{detail}");
         assert!(detail.contains("window=5h"), "{detail}");
@@ -1431,7 +1934,10 @@ mod tests {
         let effect = super::apply_status_auto_swap(
             &settings,
             &[acc("alice", true), acc("bob", false)],
-            &[ready("alice", 10, 100), ready_reset("bob", 80, 100, Some(near))],
+            &[
+                ready("alice", 10, 100),
+                ready_reset("bob", 80, 100, Some(near)),
+            ],
             now(),
             None,
             None,
@@ -2228,5 +2734,1037 @@ mod tests {
         let event = parse_status_event(&effect);
         assert_eq!(event["type"], "stay");
         assert_eq!(event["reason"], "no_accounts");
+    }
+
+    /// issue #153 P50 实测（手动执行；spec #152 决策 4 明确不做 CI 时延断言）：
+    /// `cargo test -p kimi-switch-cli swap_duration_p50 -- --ignored --nocapture`
+    ///
+    /// 在 tempdir 内双隔离（`KIMI_SWITCH_HOME` 收口 registry/审计/凭证/快照，
+    /// `KIMI_CODE_HOME` 收口 live 登录文件），经真实 CLI `swap` 命令交替切换 21 次，
+    /// 从审计记录读出每条 activate 的 `duration_ms`，打印 P50 对照 200ms 预算。
+    /// 账号为合成 blob（无任何真实 token），切换全程零网络。
+    #[tokio::test]
+    #[ignore = "时延实测专用：本地手动执行，只打印数值不做时延断言"]
+    async fn swap_duration_p50_measure() {
+        use kimi_switch_core::paths::AppPaths;
+        use kimi_switch_core::{
+            Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
+        };
+        use kimi_switch_kimi::KimiProvider;
+        use std::sync::{Arc, Mutex as TestMutex};
+
+        static ENV_LOCK: TestMutex<()> = TestMutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let switch_home = tempfile::tempdir().unwrap();
+        let kimi_home = tempfile::tempdir().unwrap();
+
+        struct RestoreEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("KIMI_SWITCH_HOME", value),
+                    None => std::env::remove_var("KIMI_SWITCH_HOME"),
+                }
+                match self.1.take() {
+                    Some(value) => std::env::set_var("KIMI_CODE_HOME", value),
+                    None => std::env::remove_var("KIMI_CODE_HOME"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            std::env::var_os("KIMI_SWITCH_HOME"),
+            std::env::var_os("KIMI_CODE_HOME"),
+        );
+        std::env::set_var("KIMI_SWITCH_HOME", switch_home.path());
+        std::env::set_var("KIMI_CODE_HOME", kimi_home.path());
+
+        let paths = AppPaths::resolve().unwrap();
+        let store: Arc<dyn CredentialStore> = Arc::new(FileStore::new(paths.credentials_file()));
+        let registry = Arc::new(AccountRegistry::new(paths.registry_file()));
+        let kimi: Arc<KimiProvider> =
+            Arc::new(kimi_switch_kimi::new(store.clone(), registry.clone()));
+        let audit = AuditLog::new(paths.audit_log());
+        let ctx = super::AppContext {
+            store,
+            registry,
+            kimi,
+            audit,
+        };
+
+        let now = Utc::now();
+        for (uid, active) in [("p50-u1", true), ("p50-u2", false)] {
+            ctx.registry
+                .upsert(Account {
+                    provider: "kimi".into(),
+                    id: AccountId(uid.into()),
+                    label: uid.into(),
+                    active,
+                    created_at: now,
+                    last_used_at: None,
+                    extra: serde_json::Map::new(),
+                })
+                .unwrap();
+            ctx.store
+                .set(
+                    "kimi",
+                    uid,
+                    "blob",
+                    &format!(r#"{{"access_token":"{uid}"}}"#),
+                )
+                .unwrap();
+        }
+        let live_dir = kimi_home.path().join("credentials");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::write(
+            live_dir.join("kimi-code.json"),
+            r#"{"access_token":"p50-u1"}"#,
+        )
+        .unwrap();
+
+        const RUNS: usize = 21;
+        for i in 0..RUNS {
+            let target = if i % 2 == 0 { "p50-u2" } else { "p50-u1" };
+            super::swap(&ctx, Some(target)).await.unwrap();
+        }
+
+        let mut durations: Vec<u64> = std::fs::read_to_string(paths.audit_log())
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+            .filter(|event| event.action == "activate")
+            .map(|event| event.duration_ms.expect("activate 记录应含 duration_ms"))
+            .collect();
+        durations.sort_unstable();
+        assert_eq!(
+            durations.len(),
+            RUNS,
+            "每次切换都应写入一条含 duration_ms 的 activate 记录"
+        );
+        let p50 = durations[RUNS / 2];
+        println!(
+            "activate duration_ms samples={:?}\nP50={p50}ms（设计预算 200ms，spec #152 决策 4）",
+            durations
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // on-quota-failure / install-hook（issue #162）
+    // -----------------------------------------------------------------------
+
+    mod passive_env {
+        //! 端到端被动切换测试的双隔离夹具：`KIMI_SWITCH_HOME` 收口 registry / 凭证 /
+        //! 审计 / 快照 / 状态文件，`KIMI_CODE_HOME` 收口 live 登录文件。进程级 env
+        //! 变量在并行测试间共享一把锁；Drop 先恢复 env 再放锁。
+
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+
+        fn env_lock() -> &'static Mutex<()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+        }
+
+        pub struct IsolatedHomes {
+            pub kimi_home: PathBuf,
+            previous: (Option<OsString>, Option<OsString>),
+            _guard: MutexGuard<'static, ()>,
+        }
+
+        impl Drop for IsolatedHomes {
+            fn drop(&mut self) {
+                let (switch_prev, kimi_prev) = self.previous.clone();
+                match kimi_prev {
+                    Some(value) => std::env::set_var("KIMI_CODE_HOME", value),
+                    None => std::env::remove_var("KIMI_CODE_HOME"),
+                }
+                match switch_prev {
+                    Some(value) => std::env::set_var("KIMI_SWITCH_HOME", value),
+                    None => std::env::remove_var("KIMI_SWITCH_HOME"),
+                }
+            }
+        }
+
+        pub fn isolate() -> IsolatedHomes {
+            let guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+            // `.keep()` 让 tempdir 目录在 TempDir drop 后仍留在盘上供整个测试使用；
+            // 交换侧路径都经 `AppPaths::resolve()`（读 KIMI_SWITCH_HOME env）取得，
+            // 因此结构体只保留需要直接读的 kimi_home。
+            let switch_home = tempfile::tempdir().unwrap().keep();
+            let kimi_home = tempfile::tempdir().unwrap().keep();
+            let previous = (
+                std::env::var_os("KIMI_SWITCH_HOME"),
+                std::env::var_os("KIMI_CODE_HOME"),
+            );
+            std::env::set_var("KIMI_SWITCH_HOME", &switch_home);
+            std::env::set_var("KIMI_CODE_HOME", &kimi_home);
+            IsolatedHomes {
+                kimi_home,
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    /// 被动切换端到端夹具：registry 账号 + store blob + live 登录文件。
+    /// blob 带 `label` 供 live 身份辨认（official_identity 回退 label），全零网络。
+    fn seed_passive_fixture(
+        env: &passive_env::IsolatedHomes,
+        accounts: &[(&str, bool)],
+    ) -> super::AppContext {
+        use kimi_switch_core::paths::AppPaths;
+        use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, FileStore};
+
+        let paths = AppPaths::resolve().unwrap();
+        let store: std::sync::Arc<dyn CredentialStore> =
+            std::sync::Arc::new(FileStore::new(paths.credentials_file()));
+        let registry = std::sync::Arc::new(AccountRegistry::new(paths.registry_file()));
+        let kimi = std::sync::Arc::new(kimi_switch_kimi::new(store.clone(), registry.clone()));
+        let audit = super::AuditLog::new(paths.audit_log());
+
+        let now = Utc::now();
+        for (id, active) in accounts {
+            registry
+                .upsert(Account {
+                    provider: "kimi".into(),
+                    id: AccountId((*id).into()),
+                    label: (*id).into(),
+                    active: *active,
+                    created_at: now,
+                    // 当前账号锚在当下：默认 60s 安顿宽限必命中，断言被动路径不被阻挡。
+                    last_used_at: if *active { Some(now) } else { None },
+                    extra: Default::default(),
+                })
+                .unwrap();
+            store
+                .set(
+                    "kimi",
+                    id,
+                    "blob",
+                    &format!(r#"{{"label":"{id}","access_token":"tok-{id}"}}"#),
+                )
+                .unwrap();
+        }
+        let live_dir = env.kimi_home.join("credentials");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let current = accounts
+            .iter()
+            .find(|(_, active)| *active)
+            .map(|(id, _)| *id)
+            .unwrap();
+        std::fs::write(
+            live_dir.join("kimi-code.json"),
+            format!(r#"{{"label":"{current}","access_token":"tok-{current}"}}"#),
+        )
+        .unwrap();
+
+        super::AppContext {
+            store,
+            registry,
+            kimi,
+            audit,
+        }
+    }
+
+    /// 种额度缓存（被动路径的唯一快照来源，零网络）。
+    fn seed_quota_cache(entries: &[(&str, u64, u64)]) {
+        use kimi_switch_core::paths::AppPaths;
+        use kimi_switch_core::{Quota, QuotaCache};
+
+        let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
+        let mut cache = QuotaCache::load(&cache_path);
+        for (id, used, limit) in entries {
+            cache.set(
+                "kimi",
+                id,
+                vec![Quota {
+                    provider: "kimi".into(),
+                    account_id: kimi_switch_core::AccountId((*id).into()),
+                    window: QuotaWindow::FiveHour,
+                    used: *used,
+                    limit: *limit,
+                    reset_at: None,
+                    status: kimi_switch_core::QuotaStatus::Ok,
+                    note: None,
+                    membership: None,
+                }],
+            );
+        }
+        cache.save(&cache_path);
+    }
+
+    fn passive_settings() -> kimi_switch_core::settings::AutoSwap {
+        kimi_switch_core::settings::AutoSwap {
+            enabled: true,
+            ..kimi_switch_core::settings::AutoSwap::default()
+        }
+    }
+
+    fn event_403_5h() -> String {
+        r#"{"hook_event_name":"StopFailure","session_id":"s-1","client_type":"kimi_code_cli","error":{"status":403,"message":"You have reached your 5-hour usage limit"}}"#.into()
+    }
+
+    fn live_blob(env: &passive_env::IsolatedHomes) -> String {
+        std::fs::read_to_string(env.kimi_home.join("credentials").join("kimi-code.json")).unwrap()
+    }
+
+    fn auto_swap_audits() -> Vec<AuditEvent> {
+        use kimi_switch_core::paths::AppPaths;
+        let path = AppPaths::resolve().unwrap().audit_log();
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+            .filter(|event| event.action == "auto_swap")
+            .collect()
+    }
+
+    /// 端到端：403 usage limit 事件 → 与耗尽路径语义一致的自动切换。当前账号缓存
+    /// 明明未达阈值（80/100）也被权威证据覆写触发；安顿宽限与手动保持期不阻挡；
+    /// 切换走真实 activate（live 变为 bob、registry active 翻转、冷却落盘、审计
+    /// detail 带 trigger=passive）。
+    #[tokio::test]
+    async fn passive_403_swaps_via_real_activate_despite_grace_and_hold() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        // 手动保持期写入（只约束回驻，不该挡被动耗尽切换）。
+        {
+            use kimi_switch_core::paths::AppPaths;
+            let state = AppPaths::resolve().unwrap().auto_swap_state_file();
+            kimi_switch_core::set_manual_hold_until(
+                &state,
+                Utc::now() + chrono::Duration::hours(1),
+            );
+        }
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+        super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#
+        );
+        assert!(
+            ctx.registry
+                .list_by_provider("kimi")
+                .unwrap()
+                .iter()
+                .any(|a| a.id.0 == "bob" && a.active),
+            "registry active 应翻转为 bob"
+        );
+        use kimi_switch_core::paths::AppPaths;
+        let state = AppPaths::resolve().unwrap().auto_swap_state_file();
+        assert!(
+            kimi_switch_core::read_last_auto_swap_at(&state).is_some(),
+            "冷却应落盘"
+        );
+        let audits = auto_swap_audits();
+        assert_eq!(audits.len(), 1, "恰好一条 auto_swap 审计");
+        assert_eq!(audits[0].result, "ok");
+        assert_eq!(audits[0].account.as_deref(), Some("bob"));
+        // issue #153 续跑：被动路径审计同样携带 activate 段耗时。
+        assert!(
+            audits[0].duration_ms.is_some(),
+            "被动切换成功审计应含 duration_ms（activate 段耗时）"
+        );
+        let detail = audits[0].detail.as_deref().unwrap();
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("trigger=passive"), "{detail}");
+    }
+
+    /// 无合格候选：唯一停泊账号已达阈值 → 不切换、live 不动、记 no-candidate 审计。
+    #[tokio::test]
+    async fn passive_no_eligible_candidate_keeps_live() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 99, 100)]);
+
+        super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
+            .await
+            .unwrap();
+
+        assert!(live_blob(&env).contains("alice"), "无候选不得切换");
+        let audits = auto_swap_audits();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].result, "error");
+        assert_eq!(audits[0].detail.as_deref(), Some("no eligible candidate"));
+    }
+
+    /// 被动触发对额度缓存只读（reviewer 补钉）：命中（发生切换）与落空（无候选）
+    /// 两种路径跑完后，quota_cache.json 文件字节保持不变——403 权威证据只在内存
+    /// 经 overlay 合成进判定，不回写缓存，缓存写权仍只属于真实额度查询路径。
+    #[tokio::test]
+    async fn passive_trigger_leaves_quota_cache_bytes_untouched() {
+        use kimi_switch_core::paths::AppPaths;
+
+        // 命中路径：403 → 真实切换发生。
+        {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+            let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
+            let before = std::fs::read(&cache_path).unwrap();
+
+            super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                live_blob(&env),
+                r#"{"label":"bob","access_token":"tok-bob"}"#,
+                "先证明命中路径确实发生了切换，断言才有意义"
+            );
+            assert_eq!(
+                std::fs::read(&cache_path).unwrap(),
+                before,
+                "命中路径不得回写额度缓存"
+            );
+        }
+
+        // 落空路径：无合格候选，只记 no-candidate 审计。
+        {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 99, 100)]);
+            let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
+            let before = std::fs::read(&cache_path).unwrap();
+
+            super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                auto_swap_audits().len(),
+                1,
+                "先证明落空路径确实走到了无候选分支"
+            );
+            assert_eq!(
+                std::fs::read(&cache_path).unwrap(),
+                before,
+                "落空路径不得回写额度缓存"
+            );
+        }
+    }
+
+    /// 冷却收敛：第一次切换完成后，后续触发（新当前账号健康 + 冷却未过）自然落空，
+    /// 不再产生任何切换或审计。
+    #[tokio::test]
+    async fn passive_second_trigger_after_swap_falls_through() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+        super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
+            .await
+            .unwrap();
+        assert_eq!(auto_swap_audits().len(), 1);
+
+        // 同一会话紧接着又撞 403：bob 才切过来（冷却 5 分钟内），不得再切。
+        super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
+            .await
+            .unwrap();
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#
+        );
+        assert_eq!(auto_swap_audits().len(), 1, "冷却期内不得再次切换");
+    }
+
+    /// 429 过载 / 畸形 stdin / 总开关关闭：全部静默放行，零副作用
+    /// （无审计、无状态文件、live 不动）。
+    #[tokio::test]
+    async fn passive_429_malformed_and_disabled_are_silent() {
+        let event_429 = r#"{"hook_event_name":"StopFailure","error":{"status":429,"message":"engine overloaded, retry later"}}"#;
+        for (raw, settings) in [
+            (event_429, passive_settings()),
+            ("not json at all", passive_settings()),
+            ("", passive_settings()),
+            (&event_403_5h(), {
+                let mut off = passive_settings();
+                off.enabled = false;
+                off
+            }),
+        ] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+            super::run_on_quota_failure_with(&ctx, raw, &settings)
+                .await
+                .unwrap();
+
+            assert!(live_blob(&env).contains("alice"), "不得切换：{raw}");
+            assert!(auto_swap_audits().is_empty(), "不得写审计：{raw}");
+            use kimi_switch_core::paths::AppPaths;
+            assert!(
+                !AppPaths::resolve().unwrap().auto_swap_state_file().exists(),
+                "不得写状态文件：{raw}"
+            );
+        }
+    }
+
+    /// 并发多触发收敛（锁 + 冷却）：5 个触发同时命中，被动串行化锁把
+    /// 「读状态 → 判定 → activate → 写冷却」排队；第一触发完成后，后续触发在
+    /// 锁内看到冷却即自然落空——全程恰好一次切换、稳定在 bob，不来回抖动。
+    #[tokio::test]
+    async fn passive_concurrent_triggers_converge_without_oscillation() {
+        let env = passive_env::isolate();
+        let ctx = std::sync::Arc::new(seed_passive_fixture(
+            &env,
+            &[("alice", true), ("bob", false), ("carol", false)],
+        ));
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100), ("carol", 20, 100)]);
+
+        const TRIGGERS: usize = 5;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(TRIGGERS));
+        let mut handles = Vec::with_capacity(TRIGGERS);
+        for _ in 0..TRIGGERS {
+            let ctx = ctx.clone();
+            let barrier = barrier.clone();
+            let event = event_403_5h();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                super::run_on_quota_failure_with(&ctx, &event, &passive_settings())
+                    .await
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#,
+            "并发触发后应稳定在排序最优的 bob（已用最低）"
+        );
+        let audits = auto_swap_audits();
+        assert_eq!(audits.len(), 1, "只产生必要次数的切换：{audits:?}");
+        assert_eq!(audits[0].result, "ok");
+        assert_eq!(audits[0].account.as_deref(), Some("bob"));
+        assert!(audits[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("trigger=passive"));
+
+        // 全部完成后：冷却期内再触发，落空。
+        super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
+            .await
+            .unwrap();
+        assert_eq!(auto_swap_audits().len(), 1, "冷却收敛后的触发不得再切换");
+    }
+
+    // -----------------------------------------------------------------------
+    // install-hook（tempdir 假 config，绝不碰真机 Kimi Code 配置）
+    // -----------------------------------------------------------------------
+
+    fn hook_config_seed() -> &'static str {
+        // 含用户注释、普通键、既有 [[hooks]] 条目：断言全部保留。
+        "# user comment line\nmodel = \"kimi-k2\"\n\n# keep my hooks here\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"echo pre\"\n"
+    }
+
+    fn count_our_hook_entries(raw: &str) -> usize {
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        value
+            .get("hooks")
+            .and_then(|hooks| hooks.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.get("event").and_then(|v| v.as_str()) == Some("StopFailure")
+                            && entry
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|c| c.contains("on-quota-failure"))
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// 幂等安装：重复执行无重复条目；注释与用户既有条目原样保留。
+    #[test]
+    fn install_hook_is_idempotent_and_preserves_user_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(&config, hook_config_seed()).unwrap();
+        let exe = tmp.path().join("kimi-switch-cli.exe");
+
+        super::install_hook_into(&config, &exe, false).unwrap();
+        let once = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(count_our_hook_entries(&once), 1, "{once}");
+        assert!(once.contains("# user comment line"), "{once}");
+        assert!(once.contains("model = \"kimi-k2\""), "{once}");
+        assert!(once.contains("\"PreToolUse\""), "{once}");
+        assert!(once.contains("echo pre"), "{once}");
+
+        super::install_hook_into(&config, &exe, false).unwrap();
+        let twice = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            count_our_hook_entries(&twice),
+            1,
+            "重复安装不得追加重复条目：{twice}"
+        );
+
+        // 条目内容核对：事件、command 指向本工具、timeout 写入。
+        let value: toml::Value = toml::from_str(&twice).unwrap();
+        let ours = value["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("StopFailure"))
+            .unwrap();
+        let command = ours.get("command").unwrap().as_str().unwrap();
+        assert!(command.contains("on-quota-failure"), "{command}");
+        assert!(command.contains("kimi-switch-cli.exe"), "{command}");
+        assert!(
+            command.starts_with('"'),
+            "可执行路径须加引号防空格：{command}"
+        );
+    }
+
+    /// 可执行文件移动后重装：条目刷新到新路径，仍只一条。
+    #[test]
+    fn install_hook_refreshes_moved_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(&config, hook_config_seed()).unwrap();
+        let exe_a = tmp.path().join("bin_a").join("kimi-switch-cli.exe");
+        let exe_b = tmp.path().join("bin b").join("kimi-switch-cli.exe");
+
+        super::install_hook_into(&config, &exe_a, false).unwrap();
+        super::install_hook_into(&config, &exe_b, false).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(count_our_hook_entries(&raw), 1, "{raw}");
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        let command = value["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("StopFailure"))
+            .unwrap()
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            command.contains("bin b"),
+            "command 应刷新到新路径：{command}"
+        );
+        assert!(!command.contains("bin_a"), "{command}");
+    }
+
+    /// 卸载：只删自己的条目；用户自己的 StopFailure hook（不含我们的标记）与注释保留；
+    /// 无条目可删时不重写文件（字节不变）。
+    #[test]
+    fn uninstall_hook_removes_only_ours_and_leaves_file_untouched_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let seed = "# user comment line\n\n[[hooks]]\nevent = \"StopFailure\"\ncommand = \"node my-failure-handler.mjs\"\n";
+        std::fs::write(&config, seed).unwrap();
+        let exe = tmp.path().join("kimi-switch-cli.exe");
+
+        // 未安装过 → 无可删除，文件不动。
+        super::install_hook_into(&config, &exe, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), seed);
+
+        // 安装 → 卸载：我们的条目消失，用户的 StopFailure hook 保留。
+        super::install_hook_into(&config, &exe, false).unwrap();
+        super::install_hook_into(&config, &exe, true).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(count_our_hook_entries(&raw), 0, "{raw}");
+        assert!(raw.contains("my-failure-handler.mjs"), "{raw}");
+        assert!(raw.contains("# user comment line"), "{raw}");
+        assert!(!raw.contains("kimi-switch-cli.exe"), "{raw}");
+
+        // 再卸载一次：无条目可删，文件保持字节不变。
+        let before = std::fs::read_to_string(&config).unwrap();
+        super::install_hook_into(&config, &exe, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    }
+
+    /// 无 hooks 段的干净 config：安装 → 卸载一轮后还原到无 hooks 段的形态。
+    #[test]
+    fn uninstall_hook_restores_config_without_hooks_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let clean = "# just a comment\nmodel = \"kimi-k2\"\n";
+        std::fs::write(&config, clean).unwrap();
+        let exe = tmp.path().join("kimi-switch-cli.exe");
+
+        super::install_hook_into(&config, &exe, false).unwrap();
+        let installed = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(count_our_hook_entries(&installed), 1, "{installed}");
+
+        super::install_hook_into(&config, &exe, true).unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(count_our_hook_entries(&raw), 0, "{raw}");
+        assert!(!raw.contains("hooks"), "空 hooks 段应一并移除：{raw}");
+        assert!(raw.contains("# just a comment"), "{raw}");
+        assert!(raw.contains("model = \"kimi-k2\""), "{raw}");
+    }
+
+    /// 损坏的 config.toml：报错退出，绝不覆写。
+    #[test]
+    fn install_hook_refuses_corrupt_config() {
+        use std::path::Path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let corrupt = "not [ valid toml =\n";
+        std::fs::write(&config, corrupt).unwrap();
+
+        assert!(super::install_hook_into(&config, &Path::new("x.exe"), false).is_err());
+        assert!(super::install_hook_into(&config, &Path::new("x.exe"), true).is_err());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), corrupt);
+    }
+
+    /// `hooks` 存在但不是 [[hooks]] 数组（如被写成普通表）：拒绝触碰，报错不改写。
+    #[test]
+    fn install_hook_refuses_non_array_hooks_table() {
+        use std::path::Path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let bad = "[hooks]\nevent = \"StopFailure\"\n";
+        std::fs::write(&config, bad).unwrap();
+
+        assert!(super::install_hook_into(&config, &Path::new("x.exe"), false).is_err());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), bad);
+    }
+
+    /// clap 解析：子命令命名与 --uninstall 旗标。
+    #[test]
+    fn hook_subcommands_parse() {
+        use super::{Cli, Cmd};
+        use clap::Parser as _;
+
+        let cli = Cli::try_parse_from(["kimi-switch", "on-quota-failure"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::OnQuotaFailure)));
+
+        let cli = Cli::try_parse_from(["kimi-switch", "install-hook"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::InstallHook { uninstall: false })
+        ));
+
+        let cli = Cli::try_parse_from(["kimi-switch", "install-hook", "--uninstall"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::InstallHook { uninstall: true })
+        ));
+    }
+
+    /// config.toml 尚不存在（Kimi Code 未配置过 hooks）：安装时新建文件与目录。
+    #[test]
+    fn install_hook_creates_missing_config_file() {
+        use std::path::Path;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("nested").join("config.toml");
+
+        super::install_hook_into(&config, &Path::new("C:/tools/kimi-switch-cli.exe"), false)
+            .unwrap();
+        let raw = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(count_our_hook_entries(&raw), 1, "{raw}");
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        let command = value["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("StopFailure"))
+            .unwrap()
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            command.contains("C:/tools/kimi-switch-cli.exe"),
+            "{command}"
+        );
+    }
+
+    /// 帮助文本把两个新子命令写进命令面（用户要手动执行 install-hook）。
+    #[test]
+    fn help_documents_hook_subcommands() {
+        use clap::CommandFactory as _;
+
+        let help = super::Cli::command().render_long_help().to_string();
+        assert!(help.contains("on-quota-failure"), "{help}");
+        assert!(help.contains("install-hook"), "{help}");
+        assert!(help.contains("Always exits 0"), "{help}");
+        assert!(help.contains("--uninstall"), "{help}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 启动一致性自检（issue #155，spec #152 决策 8）
+    // -----------------------------------------------------------------------
+
+    use kimi_switch_core::StartupCheckOutcome;
+
+    /// 测试用 base64url（无填充），与 `kimi_files::base64url_decode` 互逆。
+    fn base64url(bytes: &[u8]) -> String {
+        const CHARS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(CHARS[(n >> 18) as usize & 63] as char);
+            out.push(CHARS[(n >> 12) as usize & 63] as char);
+            if chunk.len() > 1 {
+                out.push(CHARS[(n >> 6) as usize & 63] as char);
+            }
+            if chunk.len() > 2 {
+                out.push(CHARS[n as usize & 63] as char);
+            }
+        }
+        out
+    }
+
+    /// 带 JWT 的合成 live blob。Kimi 身份辨认只认 access_token JWT 的 `user_id`
+    /// claim（引擎 `parse_metadata` → `official_identity`），与 #154 回读校验同一套；
+    /// 合成 token 无任何真实凭证，全程零网络。
+    fn jwt_user_blob(id: &str) -> String {
+        let payload = base64url(format!(r#"{{"user_id":"{id}"}}"#).as_bytes());
+        format!(r#"{{"access_token":"eyJhbGciOiJFUzI1NiJ9.{payload}.sig"}}"#)
+    }
+
+    /// 一致 / 无法判定：零可见输出（None 即调用方什么都不打印）。
+    #[test]
+    fn startup_check_notice_consistent_is_none() {
+        assert!(super::startup_check_notice(&StartupCheckOutcome::Consistent).is_none());
+    }
+
+    /// 纠正与工具外身份两条提示的文案要点（简洁中文；不含任何凭证）。
+    #[test]
+    fn startup_check_notice_texts_cover_correction_and_import_hint() {
+        let corrected = super::startup_check_notice(&StartupCheckOutcome::CorrectedActive {
+            account: kimi_switch_core::AccountId("bob".into()),
+            previous: Some(kimi_switch_core::AccountId("alice".into())),
+        })
+        .expect("纠正应有提示");
+        assert!(corrected.contains("纠正"), "{corrected}");
+        assert!(corrected.contains("kimi/bob"), "{corrected}");
+        assert!(corrected.contains("alice"), "{corrected}");
+
+        let untracked = super::startup_check_notice(&StartupCheckOutcome::UntrackedLiveIdentity {
+            live: kimi_switch_core::AccountId("carol".into()),
+        })
+        .expect("工具外身份应有导入提示");
+        assert!(untracked.contains("工具外身份"), "{untracked}");
+        assert!(untracked.contains("kimi-switch login kimi"), "{untracked}");
+        assert!(untracked.contains("导入"), "{untracked}");
+    }
+
+    /// 端到端：live 与注册表 active 不一致（用户在工具外重新登回了库内旧账号）
+    /// → 真实 live 身份辨认（引擎 parse_metadata → official_identity）+ 自动纠正
+    /// + 审计留痕。身份经 blob 的 label 字段辨认（与被动切换测试同一零网络夹具）。
+    #[tokio::test]
+    async fn startup_check_corrects_stale_marker_via_real_live_identity() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        // 用户在工具外把 Kimi Code 重新登到库内的 bob：live 变了，注册表还标着 alice。
+        std::fs::write(
+            env.kimi_home.join("credentials").join("kimi-code.json"),
+            jwt_user_blob("bob"),
+        )
+        .unwrap();
+
+        let outcome = super::startup_check(&ctx);
+
+        assert_eq!(
+            outcome,
+            StartupCheckOutcome::CorrectedActive {
+                account: kimi_switch_core::AccountId("bob".into()),
+                previous: Some(kimi_switch_core::AccountId("alice".into())),
+            }
+        );
+        let actives: Vec<_> = ctx
+            .registry
+            .load()
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.active)
+            .map(|a| a.id.0)
+            .collect();
+        assert_eq!(actives, vec!["bob".to_string()]);
+        let audits: Vec<AuditEvent> = std::fs::read_to_string(ctx.audit.path())
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+            .filter(|event| event.action == "startup_check")
+            .collect();
+        assert_eq!(audits.len(), 1, "纠正恰留一条审计");
+        assert_eq!(audits[0].account.as_deref(), Some("bob"));
+    }
+
+    /// 端到端：live 身份不在账号库（工具外登录了新身份）→ 清除 active 标记 +
+    /// 审计留痕 + CLI 出现导入提示。
+    #[tokio::test]
+    async fn startup_check_untracked_live_clears_marker_and_prompts_import() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        std::fs::write(
+            env.kimi_home.join("credentials").join("kimi-code.json"),
+            jwt_user_blob("carol"),
+        )
+        .unwrap();
+
+        let outcome = super::startup_check(&ctx);
+
+        assert_eq!(
+            outcome,
+            StartupCheckOutcome::UntrackedLiveIdentity {
+                live: kimi_switch_core::AccountId("carol".into()),
+            }
+        );
+        let actives: Vec<_> = ctx
+            .registry
+            .load()
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.active)
+            .collect();
+        assert!(actives.is_empty(), "active 标记应被清除: {actives:?}");
+        let audits: Vec<AuditEvent> = std::fs::read_to_string(ctx.audit.path())
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+            .filter(|event| event.action == "startup_check")
+            .collect();
+        assert_eq!(audits.len(), 1);
+        assert!(
+            audits[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("carol"),
+            "审计应记录 live 身份: {:?}",
+            audits[0].detail
+        );
+        assert!(
+            super::startup_check_notice(&outcome)
+                .expect("应有导入提示")
+                .contains("导入"),
+            "CLI 导入提示必须出现"
+        );
+    }
+
+    /// 端到端：状态一致 → 零副作用（不新增审计）+ 零可见输出（提示为 None）。
+    #[tokio::test]
+    async fn startup_check_consistent_is_zero_side_effect_and_zero_output() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        // 用可辨认的 JWT 身份落在 active 账号上，钉住「真一致」而非「无法辨认被跳过」。
+        std::fs::write(
+            env.kimi_home.join("credentials").join("kimi-code.json"),
+            jwt_user_blob("alice"),
+        )
+        .unwrap();
+
+        let outcome = super::startup_check(&ctx);
+
+        assert_eq!(outcome, StartupCheckOutcome::Consistent);
+        assert!(
+            !ctx.audit.path().exists(),
+            "一致时不得新增审计记录（文件都不应创建）"
+        );
+        assert!(
+            super::startup_check_notice(&outcome).is_none(),
+            "一致时不得有任何可见输出"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // swap 死卡警告（issue #156，spec #152 决策 9）
+    // -----------------------------------------------------------------------
+
+    /// 种拒止指纹文件：写入给定 refresh token（合成占位值）的 SHA-256 指纹。
+    fn seed_dead_refresh_fingerprints(env: &passive_env::IsolatedHomes, refresh_tokens: &[&str]) {
+        let dir = env.kimi_home.join("credentials");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = refresh_tokens
+            .iter()
+            .map(|token| kimi_switch_core::refresh_fingerprint(token))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join(".kimi-switch-dead-refresh"), format!("{body}\n")).unwrap();
+    }
+
+    /// 端到端：切到本地已确认失效（invalid_grant 指纹命中）的卡 → 切换照常成功
+    /// （live 翻转、stdout 成功行不变），stderr 补一行中文警告且只此一行。
+    #[tokio::test]
+    async fn swap_dead_credential_target_still_swaps_and_warns() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        // bob 的 blob 带 refresh_token（合成占位值），其指纹进拒止文件。
+        ctx.store
+            .set(
+                "kimi",
+                "bob",
+                "blob",
+                r#"{"label":"bob","access_token":"tok-bob","refresh_token":"refresh-bob"}"#,
+            )
+            .unwrap();
+        seed_dead_refresh_fingerprints(&env, &["refresh-bob"]);
+
+        let bob = super::resolve_account(&ctx, "bob").unwrap();
+        assert_eq!(
+            super::dead_credential_warning(&bob),
+            Some(super::DEAD_CREDENTIAL_WARNING),
+            "指纹命中应给出警告行"
+        );
+
+        // 切换照常成功：警告机制不得影响切换结果本身。
+        super::swap(&ctx, Some("bob")).await.unwrap();
+        assert!(
+            live_blob(&env).contains("tok-bob"),
+            "live 应翻转到 bob（合成占位 token，非真实凭证）"
+        );
+
+        // stderr 警告行（writer seam 与 emit_status_output_to 同款）。
+        let mut stderr = Vec::new();
+        super::write_dead_credential_warning(
+            super::dead_credential_warning(&bob).as_deref(),
+            &mut stderr,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "该账号凭证已失效，建议重新授权\n"
+        );
+    }
+
+    /// 端到端负例：切到健康卡（指纹文件缺失 → 信号未知 fail-open）→ 零警告输出。
+    #[tokio::test]
+    async fn swap_healthy_credential_target_has_no_warning() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+
+        super::swap(&ctx, Some("bob")).await.unwrap();
+        assert!(
+            live_blob(&env).contains("tok-bob"),
+            "切换本身必须照常成功"
+        );
+
+        let bob = super::resolve_account(&ctx, "bob").unwrap();
+        assert!(
+            super::dead_credential_warning(&bob).is_none(),
+            "健康卡（含指纹文件缺失的 fail-open）不得有警告"
+        );
+        let mut stderr = Vec::new();
+        super::write_dead_credential_warning(None, &mut stderr).unwrap();
+        assert!(stderr.is_empty(), "无警告 → stderr 零输出");
     }
 }

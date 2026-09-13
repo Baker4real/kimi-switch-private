@@ -293,26 +293,41 @@ mod tests {
         assert!(!h.audit.path().exists());
     }
 
-    /// issue #76：删掉的当前账号有墓碑，默认入口不得再自动导入。
+    /// issue #76 / #155：删掉的当前账号有墓碑，启动自检不得把它复活——不导入、
+    /// 不动其他账号的 active 标记、不提示导入（旧自动导入路径已被启动自检取代）。
     #[test]
-    fn remove_account_prevents_reimport_of_deleted_live_account() {
+    fn remove_account_prevents_resurrection_of_deleted_live_account() {
         let h = Harness::new();
         h.registry.upsert(account("alice")).unwrap();
+        h.registry.upsert(account("bob")).unwrap();
         h.remove("alice", "auth_json").unwrap();
 
-        crate::sync_active::sync_local_active(
+        let outcome = crate::startup_check::startup_consistency_check(
             "kimi",
             &h.removed_path,
             &h.registry,
+            &h.audit,
             || Ok(AccountId("alice".into())),
-            || panic!("墓碑命中时不得把已删的当前账号再导入"),
         );
 
+        assert_eq!(
+            outcome,
+            crate::startup_check::StartupCheckOutcome::Consistent,
+            "墓碑命中的 live 身份必须整体跳过"
+        );
         assert!(h
             .registry
             .find("kimi", &AccountId("alice".into()))
             .unwrap()
             .is_none());
         assert!(RemovedAccounts::load(&h.removed_path).contains("kimi", "alice"));
+        // rm 自身的审计可在；墓碑跳过不得新增 startup_check 审计。
+        let startup_events: Vec<_> = std::fs::read_to_string(h.audit.path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+            .filter(|event| event.action == "startup_check")
+            .collect();
+        assert!(startup_events.is_empty(), "跳过时不得留自检审计");
     }
 }

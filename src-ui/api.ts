@@ -64,12 +64,27 @@ export interface Snapshot {
   auto_swap_resident_lower_tier: boolean;
   /** 「重置前抢用」子开关（issue #150）：与 CLI 同源，来自 config.toml。 */
   auto_swap_pre_reset_burn: boolean;
+  /** 「pace 预切换」子开关（issue #159，ADR-0013）：与 CLI 同源，来自 config.toml。 */
+  auto_swap_pace_pre_swap: boolean;
   message: UiMessage | null;
 }
 
 export interface AuthLink {
   url: string;
   user_code: string;
+}
+
+/** 手动切换的立即返回载荷（issue #157）：activate（含审计、保持期）已提交的成功背书。
+ * 前端据 account_id 立即把所点卡片标记为当前账号；额度数字沿用既有缓存值，
+ * 后台快照到齐后整体刷新。 */
+export interface SwapOutcome {
+  account_id: string;
+  display_name: string;
+  message: UiMessage;
+  /** 目标凭证本地已确认失效（invalid_grant 指纹命中，issue #156）：切换已照常
+   * 成功，附加的警告文本（叠加在成功提示之后呈现）；null = 无提示（健康卡或
+   * 信号未知，判定 fail-open）。 */
+  credential_warning: string | null;
 }
 
 /** Tauri 命令字符串的唯一存放地；对外只暴露类型化动词。 */
@@ -114,13 +129,26 @@ export function createApi(invokeFn: InvokeFn) {
     run(() => (args === undefined ? invokeFn<T>(cmd) : invokeFn<T>(cmd, args)));
 
   return {
-    // Tauri v2 命令参数键为 camelCase（userInitiated），多词参数不得用 snake_case 键。
-    listAccounts: (userInitiated = false) =>
-      userInitiated
-        ? call<Snapshot>("list_accounts", { userInitiated: true })
-        : call<Snapshot>("list_accounts"),
+    // Tauri v2 命令参数键为 camelCase（userInitiated / currentOnly），多词参数不得用 snake_case 键。
+    // currentOnly（issue #161 适应性轮询加密轮）：true = 只对当前账号发真实额度
+    // 查询，停泊账号以缓存行组装；缺省 false = 全量收集。
+    listAccounts: (userInitiated = false, currentOnly = false) => {
+      const args: Record<string, boolean> = {};
+      if (userInitiated) {
+        args.userInitiated = true;
+      }
+      if (currentOnly) {
+        args.currentOnly = true;
+      }
+      const hasArgs = Object.keys(args).length > 0;
+      return hasArgs
+        ? call<Snapshot>("list_accounts", args)
+        : call<Snapshot>("list_accounts");
+    },
     importCurrent: () => call<Snapshot>("import_current"),
-    swapAccount: (id: string) => call<Snapshot>("swap_account", { id }),
+    // swap_account 返回轻量 SwapOutcome（issue #157）：activate 后立即返回，
+    // 不等额度快照重列；额度由前端随后触发的 list_accounts 后台刷新。
+    swapAccount: (id: string) => call<SwapOutcome>("swap_account", { id }),
     removeAccount: (id: string) => call<Snapshot>("remove_account", { id }),
     renameAccount: (id: string, label: string) =>
       call<Snapshot>("rename_account", { id, label }),
@@ -141,6 +169,8 @@ export function createApi(invokeFn: InvokeFn) {
       call<boolean>("set_auto_swap_resident_lower_tier", { enabled }),
     setAutoSwapPreResetBurn: (enabled: boolean) =>
       call<boolean>("set_auto_swap_pre_reset_burn", { enabled }),
+    setAutoSwapPacePreSwap: (enabled: boolean) =>
+      call<boolean>("set_auto_swap_pace_pre_swap", { enabled }),
     setAutoSwapOptOut: (id: string, enabled: boolean) =>
       call<Snapshot>("set_auto_swap_opt_out", { id, enabled }),
   };

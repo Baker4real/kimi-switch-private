@@ -17,11 +17,28 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use kimi_switch_core::error::{Error, Result};
-use kimi_switch_core::swap::{swap_with_snapshot, SwapTarget};
+use kimi_switch_core::swap::{swap_with_snapshot_protected, SwapTarget};
 use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, Provider, Quota};
 
 use crate::json::{extract_access_token, extract_refresh_token};
 use crate::runtime::{BlobMetadata, FileBlobRuntime, RefreshOutcome};
+
+// 测试 seam（issue #153）：让下一次 `write_blob` 的 live fsync 失败（一次性），
+// 覆盖「fsync 失败进入既有回滚路径而非静默成功」。
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_LIVE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn take_fail_next_live_sync() -> bool {
+    FAIL_NEXT_LIVE_SYNC.with(|cell| cell.replace(false))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_live_sync() {
+    FAIL_NEXT_LIVE_SYNC.with(|cell| cell.set(true));
+}
 
 /// 文件型 OAuth 账号切换引擎：接一个 [`FileBlobRuntime`] adapter 即可获得完整 [`Provider`] 实现。
 pub struct FileBlobProvider<A: FileBlobRuntime> {
@@ -60,7 +77,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         self.runtime.live_cred_path(&self.home)
     }
 
-    /// 原子写 live 凭证：tmp + rename + 0o600。
+    /// 原子写 live 凭证：tmp + rename + 0o600 + 文件级 fsync（issue #153）。
+    /// fsync 失败如实上抛：切换路径由快照回滚兜底，不静默成功。
     pub(crate) fn write_blob(path: &Path, contents: &str) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -73,6 +91,11 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
         }
         fs::rename(&tmp, path)?;
+        #[cfg(test)]
+        if take_fail_next_live_sync() {
+            return Err(Error::provider("injected live fsync failure"));
+        }
+        kimi_switch_core::swap::sync_file(path)?;
         Ok(())
     }
 
@@ -220,35 +243,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         self.store_account(raw, label_hint, Some(true))
     }
 
-    /// 只对齐当前 live 的元数据 active 标记，不写凭证（默认入口用，避免弹钥匙串）。
-    pub fn sync_active_metadata(&self, label_hint: Option<String>) -> Result<Account> {
-        let raw = fs::read_to_string(self.live_path())
-            .map_err(|e| Error::provider(format!("read live credentials failed: {e}")))?;
-        // 复用 store_account，但不覆盖 store 里已有的可切换 blob：仅当 store 尚无该账号时才写。
-        let meta = self.runtime.parse_metadata(&raw);
-        if let Some(pid) = Self::official_identity(&meta) {
-            let has_blob = self
-                .store
-                .get(self.runtime.id(), pid, self.runtime.store_field())
-                .ok()
-                .flatten()
-                .is_some();
-            if has_blob {
-                // 已有可切换副本：只更新 active 标记，不重写 blob。
-                let id = AccountId(pid.to_string());
-                self.registry.set_active(self.runtime.id(), &id)?;
-                return self.registry.find(self.runtime.id(), &id)?.ok_or_else(|| {
-                    Error::AccountNotFound {
-                        provider: self.runtime.id().into(),
-                        id: id.to_string(),
-                    }
-                });
-            }
-        }
-        self.store_account(raw, label_hint, Some(true))
-    }
-
-    /// 当前 live 凭证对应的 registry id。默认入口用它对照墓碑，避免 `rm` 后被自动导入加回。
+    /// 当前 live 凭证对应的 registry id。启动一致性自检（issue #155）用它辨认
+    /// live 身份并对照墓碑；身份口径 = `parse_metadata` → `official_identity`。
     pub fn live_account_id(&self) -> Result<AccountId> {
         let raw = fs::read_to_string(self.live_path())
             .map_err(|e| Error::provider(format!("read live credentials failed: {e}")))?;
@@ -329,6 +325,86 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         let raw = fs::read_to_string(self.live_path()).ok()?;
         let meta = self.runtime.parse_metadata(&raw);
         Self::metadata_matches(&meta, account, self.runtime.dedup_extra_key()).then_some(raw)
+    }
+
+    /// 写后回读身份校验（issue #154，spec #152 实现决策 6）：activate 把目标 blob
+    /// 写进 live 并落盘后，立即重读 live、解析官方身份、与目标账号比对。不一致 →
+    /// 返回错误，由 `swap_with_snapshot` 的既有 commit 失败路径回滚——此刻 registry
+    /// 尚未提交，live 恢复切换前内容、registry 保持原状，对外语义「要么切对、
+    /// 要么回到原状」，绝不停留在半切换中间态还报告成功。
+    ///
+    /// 比对口径与切换路径既有身份辨认同源（不另造第二套）：live 经
+    /// `parse_metadata` 解析（对 Kimi 即 access_token JWT 的 `user_id` claim），
+    /// 官方身份取 [`Self::official_identity`]（primary_id 回退 label），
+    /// 命中判定复用 [`Self::metadata_matches`]（账号 id / label / 去重键任一命中即一致）。
+    ///
+    /// 身份无法辨认（live 读失败、blob 解析不出任何身份）≠ 不一致：只记 warn 放行。
+    /// 写入内容来自账号库，解析不出身份是账号数据自身的问题而非切换写错；
+    /// 校验只拦「写入结果身份与目标确证不符」，宁可漏报也不把可用切换误回滚
+    /// （unknown ≠ mismatch，与凭证健康判定 ADR-0009 的「无法确证不算失效」同向）。
+    /// 纯本地读 + 解析，零网络、成本可忽略。
+    ///
+    /// 凭证安全护栏（issue #154 reviewer P2）：回读到的身份恰为**切换前 live 身份**
+    /// （`pre_swap_identity`）时，视为「官方客户端并发写回旧账号」特征——此刻 live
+    /// 可能携带旧账号新轮换的一次性 refresh token 的唯一副本（refresh token 一次性
+    /// 轮换，被备份覆盖即不可逆销毁）。回滚恢复备份**之前**，先经既有 capture-on-leave
+    /// 通道把**当前 live 内容**抢救进其 owner 账号的 store，绝不让一次性 token 只存在
+    /// 于即将被覆盖的 live 里；抢救失败如实并入错误并明示该账号可能需重新授权。
+    /// 其他 mismatch（既非旧身份也非目标，如第三方身份）维持纯回滚语义：无证据表明
+    /// live 携带任何账号的新凭证，按快照原样恢复即可。
+    fn verify_live_identity_after_swap(
+        runtime: &A,
+        store: &dyn CredentialStore,
+        registry: &AccountRegistry,
+        home: &Path,
+        account: &Account,
+        pre_swap_identity: Option<&str>,
+    ) -> Result<()> {
+        let raw = match fs::read_to_string(runtime.live_cred_path(home)) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!(
+                    account = %account.id,
+                    err = %e,
+                    "post-swap identity verify skipped: cannot re-read live credentials"
+                );
+                return Ok(());
+            }
+        };
+        let meta = runtime.parse_metadata(&raw);
+        let Some(observed) = Self::official_identity(&meta) else {
+            tracing::warn!(
+                account = %account.id,
+                "post-swap identity verify skipped: live credentials carry no identity"
+            );
+            return Ok(());
+        };
+        if Self::metadata_matches(&meta, account, runtime.dedup_extra_key()) {
+            return Ok(());
+        }
+        if pre_swap_identity == Some(observed) {
+            // 官方并发写回旧账号：先把当前 live（可能含新一次性 refresh token 的
+            // 唯一副本）经 capture-on-leave 通道抢救进 owner store，再返回 mismatch
+            // 让骨架回滚恢复备份。
+            if let Err(e) = Self::capture_live_into_store_with(runtime, store, registry, home) {
+                // 抢救失败如实并入错误，不静默销毁线索；live 仍按备份恢复，
+                // 维持「要么切对、要么回到原状」语义。
+                tracing::error!(account = %observed, err = %e, "salvage capture failed");
+                return Err(Error::provider(format!(
+                    "切换后回读校验失败：登录文件身份 {observed} 与目标账号 {} 不一致（检测到官方客户端并发写回该账号）；已回滚到切换前状态，但抢救其新凭证进账号库失败（{e}），该账号可能需要重新授权",
+                    account.id
+                )));
+            }
+            tracing::warn!(
+                account = %observed,
+                target = %account.id,
+                "post-swap verify: official client wrote the previous account back; salvaged live credentials into store before rollback"
+            );
+        }
+        Err(Error::provider(format!(
+            "切换后回读校验失败：登录文件身份 {observed} 与目标账号 {} 不一致，已回滚到切换前状态",
+            account.id
+        )))
     }
 
     /// 覆盖 live 前把 live 凭证回灌进其 owner 账号 store。
@@ -449,6 +525,11 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
         let store = self.store.clone();
         let registry = self.registry.clone();
         let id_owned = id.clone();
+        // 写后回读身份校验（issue #154）用：切换目标账号（registry 侧权威定义）。
+        let verify_account = account.clone();
+        // registry.toml 纳入切换备份/回滚集（issue #153 续跑，reviewer P1-2）：
+        // commit 阶段 set_active 的写入（含其 fsync 失败）与 live 同生命周期回滚。
+        let registry_file = registry.path().to_path_buf();
 
         tokio::task::spawn_blocking(move || {
             // capture-on-leave：覆盖 live 前，先把当前 live 凭证回灌进它所属账号的 store。
@@ -462,6 +543,16 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
                 tracing::warn!(err = %e, "capture-on-leave failed; continuing swap");
             }
 
+            // 切换前 live 身份快照（issue #154 reviewer P2）：此刻 writer 尚未运行，
+            // live 仍是切换前内容；mismatch 回滚前用它识别「官方客户端并发写回
+            // 旧账号」特征。读失败/解析不出 → None（无法确证，不做抢救判定）。
+            let pre_swap_identity = fs::read_to_string(runtime.live_cred_path(&home))
+                .ok()
+                .and_then(|raw| {
+                    let meta = runtime.parse_metadata(&raw);
+                    Self::official_identity(&meta).map(str::to_string)
+                });
+
             let blob = target_raw;
             let targets = vec![SwapTarget {
                 snapshot_name: "credentials",
@@ -473,9 +564,27 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| home.clone());
-            swap_with_snapshot(provider_id, &home, &lock_dir, targets, || {
-                registry.set_active(provider_id, &id_owned)
-            })
+            swap_with_snapshot_protected(
+                provider_id,
+                &home,
+                &lock_dir,
+                targets,
+                vec![registry_file],
+                || {
+                    // 写后回读身份校验（issue #154，spec #152 实现决策 6）：live 已落盘、
+                    // registry 尚未提交。此刻校验失败走既有 commit 失败回滚——live 恢复
+                    // 切换前内容、registry 从未变更，对外即「要么切对、要么回到原状」。
+                    FileBlobProvider::<A>::verify_live_identity_after_swap(
+                        runtime.as_ref(),
+                        store.as_ref(),
+                        registry.as_ref(),
+                        &home,
+                        &verify_account,
+                        pre_swap_identity.as_deref(),
+                    )?;
+                    registry.set_active(provider_id, &id_owned)
+                },
+            )
         })
         .await
         .map_err(|e| Error::provider(format!("spawn_blocking join failed: {e}")))?
@@ -681,6 +790,11 @@ mod tests {
         proactive_wanted: bool,
         /// 模拟官方在判定期间抢先改写 live：wanted 判定时把 live 改成这份 blob。
         official_live_during_wanted: Option<String>,
+        /// 官方并发写回模拟（issue #154 reviewer P2）：live 内容恰好等于 `after`
+        /// （即 writer 刚写入的目标 blob）时，把它覆写为 `with`（官方为旧账号
+        /// 轮换出的新 token 版本）。条件按内容匹配、覆写后自失效，天然只触发
+        /// 一次，不依赖对 `live_cred_path` 的调用计数。
+        official_overwrite_when_live_is: Option<(String, String)>,
         /// 这些 uid 的 refresh 一律 DeadToken，便于同一 runtime 里混测「当前号轮换 / 停泊死号」。
         dead_uids: HashSet<String>,
     }
@@ -700,6 +814,7 @@ mod tests {
                 dedup_extra_key: "dedup_key",
                 proactive_wanted: false,
                 official_live_during_wanted: None,
+                official_overwrite_when_live_is: None,
                 dead_uids: HashSet::new(),
             }
         }
@@ -735,6 +850,15 @@ mod tests {
             self.home.clone()
         }
         fn live_cred_path(&self, home: &Path) -> PathBuf {
+            // 测试 seam（issue #154 reviewer P2）：模拟官方客户端在采纳窗口内把
+            // 旧账号新轮换的一次性 token 写回 live——恰在读路径解析前、live 已是
+            // writer 写入的目标 blob 时覆写。真实时序注入：写入后、回读前。
+            if let Some((after, with)) = &self.official_overwrite_when_live_is {
+                let live = home.join("live.json");
+                if fs::read_to_string(&live).ok().as_deref() == Some(after.as_str()) {
+                    fs::write(&live, with).unwrap();
+                }
+            }
             home.join("live.json")
         }
         fn dedup_extra_key(&self) -> &'static str {
@@ -2090,5 +2214,272 @@ mod tests {
             .unwrap();
         let failed_at = Utc::now() - chrono::Duration::seconds(90);
         assert!(!p.credential_changed_since(&active.id, failed_at));
+    }
+
+    /// issue #153：live 凭证原子写之后的文件级 fsync 失败必须进入既有回滚路径——
+    /// 切换报错且 live 恢复为切换前内容，不静默成功。
+    ///
+    /// 注入旗标是线程本地：`activate` 把写入搬进 `spawn_blocking` 线程，测试线程
+    /// 注入不可达，因此这里在测试线程直接以真实 `write_blob` 作为 SwapTarget 的
+    /// writer 驱动 `swap_with_snapshot`（与 activate 内部同一结构），线程本地注入
+    /// 可见。快照根目录经 `KIMI_SWITCH_HOME` 收口到 tempdir，不触碰真实配置目录。
+    #[test]
+    fn live_write_fsync_failure_rolls_back_swap() {
+        use kimi_switch_core::swap::{swap_with_snapshot, SwapTarget};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("KIMI_SWITCH_HOME");
+        std::env::set_var("KIMI_SWITCH_HOME", tmp.path());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("KIMI_SWITCH_HOME", value),
+                    None => std::env::remove_var("KIMI_SWITCH_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(previous);
+
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+        let live = p.test_live_path();
+        let u1_live = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        fs::write(&live, u1_live).unwrap();
+
+        // 一次性注入：rename 成功后、fsync 之前失败。
+        fail_next_live_sync();
+        let blob = r#"{"uid":"u2","refresh_token":"R2","access_token":"A2"}"#.to_string();
+        let err = swap_with_snapshot(
+            "fake",
+            &p.test_home(),
+            tmp.path(),
+            vec![SwapTarget {
+                snapshot_name: "credentials",
+                live_path: live.clone(),
+                writer: Box::new(move |path: &Path| {
+                    FileBlobProvider::<FakeRuntime>::write_blob(path, &blob)
+                }),
+            }],
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("injected live fsync failure"),
+            "live fsync 失败必须上抛: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&live).unwrap(),
+            u1_live,
+            "fsync 失败应触发快照回滚，live 恢复为切换前内容"
+        );
+
+        // 注入解除后同一目标可正常切换（fsync 实际执行）。
+        let blob2 = r#"{"uid":"u2","refresh_token":"R2","access_token":"A2"}"#.to_string();
+        swap_with_snapshot(
+            "fake",
+            &p.test_home(),
+            tmp.path(),
+            vec![SwapTarget {
+                snapshot_name: "credentials",
+                live_path: live.clone(),
+                writer: Box::new(move |path: &Path| {
+                    FileBlobProvider::<FakeRuntime>::write_blob(path, &blob2)
+                }),
+            }],
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&live).unwrap().contains("u2"));
+    }
+
+    // --- issue #154：切换写后回读身份校验与自动回滚 ---
+
+    /// 零网络证明（沿用引擎零 HTTP 红线模式）：FakeRuntime 仅有的两个网络入口是
+    /// `refresh` 与 `fetch_quota`，分别由 `refresh_calls` / `last_access_token` 观测。
+    /// activate（含写后回读校验）全程零调用即证明校验纯本地、切换零网络。
+    fn assert_activate_made_no_network_calls(p: &FileBlobProvider<FakeRuntime>) {
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            0,
+            "activate 全程不得调用 refresh（网络入口之一）"
+        );
+        assert!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .is_none(),
+            "activate 全程不得调用 fetch_quota（网络入口之一）"
+        );
+    }
+
+    /// 正常切换：回读校验通过，对外行为无变化——live 换成目标 blob、active 标记
+    /// 移到目标账号；且全程零网络调用。
+    #[tokio::test]
+    async fn activate_passes_post_swap_identity_verify_with_unchanged_behavior() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        let u1_live = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let u2_blob = r#"{"uid":"u2","refresh_token":"R2","access_token":"A2"}"#;
+        let u1 = p.import_raw(u1_live.into(), None, Some(true)).unwrap();
+        let u2 = p.import_raw(u2_blob.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), u1_live).unwrap();
+
+        p.activate(&u2.id).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            u2_blob,
+            "校验通过时 live 应为目标账号 blob，行为与既有切换一致"
+        );
+        let accounts = p.test_list_accounts().unwrap();
+        let u1_after = accounts.iter().find(|a| a.id == u1.id).unwrap();
+        let u2_after = accounts.iter().find(|a| a.id == u2.id).unwrap();
+        assert!(!u1_after.active, "切走的账号应取消 active: {accounts:?}");
+        assert!(u2_after.active, "目标账号应标 active: {accounts:?}");
+        assert_activate_made_no_network_calls(&p);
+    }
+
+    /// 构造写入结果与目标身份不符：账号库 u2 的库存 blob 实际属于 u9（数据错乱
+    /// 场景）。切换必须返回错误，且 live 文件与注册表均恢复/保持切换前状态。
+    /// observed 是第三方身份（≠ 切换前 live 身份 u1）→ 不触发抢救（reviewer P2）：
+    /// store 保持 capture-on-leave 回灌的切换前副本，错误按普通 mismatch 报告。
+    #[tokio::test]
+    async fn activate_rolls_back_live_and_registry_on_identity_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        let u1_live = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let stranger_blob = r#"{"uid":"u9","refresh_token":"R9","access_token":"A9"}"#;
+        let u1 = p.import_raw(u1_live.into(), None, Some(true)).unwrap();
+        // 直接布置「id 为 u2 的账号卡 + 身份实为 u9 的库存 blob」：写入后回读
+        // 解析出的官方身份 u9 与目标账号 u2 确证不符。
+        p.test_registry_upsert(fake_account("u2")).unwrap();
+        FileStore::new(tmp.path().join("creds.json"))
+            .set("fake", "u2", "blob", stranger_blob)
+            .unwrap();
+        fs::write(p.test_live_path(), u1_live).unwrap();
+
+        let err = p.activate(&AccountId("u2".into())).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不一致"), "错误应说明身份不一致: {msg}");
+        assert!(msg.contains("回滚"), "错误应说明已回滚到切换前状态: {msg}");
+        assert!(
+            !msg.contains("并发写回"),
+            "第三方身份 mismatch 不应声称检测到官方并发写回: {msg}"
+        );
+        assert!(
+            !msg.contains("rollback failed"),
+            "回滚成功时错误不应声称回滚失败: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            u1_live,
+            "live 必须恢复为切换前内容"
+        );
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            u1_live,
+            "第三方身份 mismatch 不触发抢救覆写，store 保持 capture-on-leave 回灌的切换前副本"
+        );
+        let accounts = p.test_list_accounts().unwrap();
+        let u1_after = accounts.iter().find(|a| a.id == u1.id).unwrap();
+        let u2_after = accounts.iter().find(|a| a.id.0 == "u2").unwrap();
+        assert!(
+            u1_after.active,
+            "registry 必须保持切换前 active 标记（仍在 u1）: {accounts:?}"
+        );
+        assert!(!u2_after.active, "目标账号不得被标 active: {accounts:?}");
+        assert_activate_made_no_network_calls(&p);
+    }
+
+    /// 身份无法辨认（写入的 blob 解析不出任何身份）≠ 不一致：校验放行、切换照常
+    /// 成功——写入内容来自账号库，解析不出身份是账号数据自身的问题，不是切换写错。
+    #[tokio::test]
+    async fn activate_skips_verify_when_written_identity_is_unidentifiable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        let u1_live = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let opaque_blob = r#"{"opaque":"no-identity-here"}"#;
+        p.import_raw(u1_live.into(), None, Some(true)).unwrap();
+        p.test_registry_upsert(fake_account("u2")).unwrap();
+        FileStore::new(tmp.path().join("creds.json"))
+            .set("fake", "u2", "blob", opaque_blob)
+            .unwrap();
+        fs::write(p.test_live_path(), u1_live).unwrap();
+
+        p.activate(&AccountId("u2".into())).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            opaque_blob,
+            "无法辨认身份时不得误回滚"
+        );
+        let accounts = p.test_list_accounts().unwrap();
+        let u2_after = accounts.iter().find(|a| a.id.0 == "u2").unwrap();
+        assert!(u2_after.active, "无法辨认身份时切换照常成功: {accounts:?}");
+        assert_activate_made_no_network_calls(&p);
+    }
+
+    /// reviewer P2：官方客户端在写入与回读之间把旧账号（u1）新轮换的一次性
+    /// refresh token 写回 live（注入 seam：live 恰为 writer 刚写入的目标 blob 时
+    /// 覆写为旧账号新 token 版本）。mismatch 回滚前必须先把**当前 live 内容**
+    /// 抢救进 u1 的 store（保留新 token，而非 capture-on-leave 早先灌入的切换前
+    /// 副本），再恢复备份；错误仍按 mismatch 报告，live 与注册表恢复切换前状态。
+    #[tokio::test]
+    async fn activate_mismatch_salvages_official_rotated_live_of_previous_account_before_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime = FakeRuntime::new(tmp.path().join("home"));
+        let u1_live = r#"{"uid":"u1","refresh_token":"T1","access_token":"A1"}"#;
+        let u2_blob = r#"{"uid":"u2","refresh_token":"RT-TARGET","access_token":"A2"}"#;
+        // 官方为 u1 轮换出的新一次性 refresh token 版本（合成占位值）。
+        let u1_rotated = r#"{"uid":"u1","refresh_token":"RT-ROTATED","access_token":"A1-NEW"}"#;
+        runtime.official_overwrite_when_live_is = Some((u2_blob.to_string(), u1_rotated.to_string()));
+        let p = provider_with(tmp.path(), runtime);
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        p.import_raw(u1_live.into(), None, Some(true)).unwrap();
+        p.test_registry_upsert(fake_account("u2")).unwrap();
+        FileStore::new(tmp.path().join("creds.json"))
+            .set("fake", "u2", "blob", u2_blob)
+            .unwrap();
+        fs::write(p.test_live_path(), u1_live).unwrap();
+
+        let err = p.activate(&AccountId("u2".into())).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不一致"), "错误仍应按身份不一致报告: {msg}");
+        assert!(msg.contains("回滚"), "错误应说明已回滚: {msg}");
+        assert!(
+            !msg.contains("可能需要重新授权"),
+            "抢救成功时不得声称需要重新授权: {msg}"
+        );
+        assert!(
+            !msg.contains("rollback failed"),
+            "回滚成功时错误不应声称回滚失败: {msg}"
+        );
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            u1_rotated,
+            "回滚前必须把官方并发写回的当前 live（含新一次性 refresh token 唯一副本）\
+             抢救进旧账号 store，而不是停留在 capture-on-leave 灌入的切换前副本"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            u1_live,
+            "抢救后 live 仍须恢复为切换前内容（备份字节）"
+        );
+        let accounts = p.test_list_accounts().unwrap();
+        let u1_after = accounts.iter().find(|a| a.id.0 == "u1").unwrap();
+        let u2_after = accounts.iter().find(|a| a.id.0 == "u2").unwrap();
+        assert!(u1_after.active, "registry 保持切换前标记: {accounts:?}");
+        assert!(!u2_after.active, "目标账号不得被标 active: {accounts:?}");
+        assert_activate_made_no_network_calls(&p);
     }
 }

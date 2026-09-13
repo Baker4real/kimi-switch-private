@@ -10,20 +10,21 @@ use chrono::{DateTime, Utc};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
     auto_swap_opt_out_from_extra, decide_auto_swap_from_state, decide_resident_return_from_state,
-    display_name, earliest_reset_at, membership_expiry_from_extra, membership_period_days,
-    membership_remaining_days, membership_start_from_extra, official_nickname_known,
-    persist_auto_swap_opt_out, prettify_membership, read_last_auto_swap_at, read_manual_hold_until,
-    record_auto_swap_success, set_manual_hold_until, write_last_auto_swap_at, Account, AccountId,
-    AccountRegistry, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn,
-    AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota,
+    display_name, earliest_reset_at, locally_invalid_accounts, membership_expiry_from_extra,
+    membership_period_days, membership_remaining_days, membership_start_from_extra,
+    official_nickname_known, persist_auto_swap_opt_out, prettify_membership,
+    read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
+    set_manual_hold_until, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
+    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason,
+    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota,
     QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState,
-    QuotaWindow, RemovedAccounts, WEB_STORE_FIELD,
+    QuotaWindow, RemovedAccounts, StartupCheckOutcome, WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
 use kimi_switch_kimi::KimiProvider;
 
-use crate::dto::{AccountRow, AuthLink, QuotaView, Snapshot, UiMessage};
+use crate::dto::{AccountRow, AuthLink, QuotaView, Snapshot, SwapOutcome, UiMessage};
 
 pub struct Backend {
     store: Arc<dyn CredentialStore>,
@@ -34,6 +35,9 @@ pub struct Backend {
     web_membership: Arc<LiveWebMembershipRefresh>,
     /// 进行中的设备码授权（含世代号与设备码有效期）。
     pending_auth: Mutex<Option<PendingAuth>>,
+    /// 启动自检的一次性提示（issue #155）：live 身份不在账号库时的导入引导，
+    /// 由首个快照带出一次后即消费。
+    startup_notice: Mutex<Option<UiMessage>>,
 }
 
 /// 进行中的设备码授权。完成阶段只清匹配的世代，避免跨世代误清。
@@ -99,6 +103,7 @@ impl Backend {
             audit,
             web_membership,
             pending_auth: Mutex::new(None),
+            startup_notice: Mutex::new(None),
         })
     }
 
@@ -192,6 +197,24 @@ impl Backend {
         Ok(settings.auto_swap.pre_reset_burn)
     }
 
+    /// 直读 config.toml 里的「pace 预切换」子开关；文件缺失/损坏都回落默认关。
+    pub fn load_auto_swap_pace_pre_swap() -> bool {
+        AppPaths::resolve()
+            .and_then(|p| {
+                Ok(kimi_switch_core::settings::load_from(&p.config_file())?
+                    .auto_swap
+                    .pace_pre_swap)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 持久化子开关到 config.toml（保注释原子写），返回落盘后的生效值。
+    pub fn save_auto_swap_pace_pre_swap(enabled: bool) -> Result<bool> {
+        let settings = kimi_switch_core::settings::set_auto_swap_pace_pre_swap(enabled)
+            .context("写入设置失败")?;
+        Ok(settings.auto_swap.pace_pre_swap)
+    }
+
     fn has_pending_auth(&self) -> bool {
         has_live_pending(
             self.pending_auth
@@ -258,19 +281,31 @@ impl Backend {
         .await
     }
 
-    /// 扫本地 Kimi Code；当前激活账号没记录过就入库（已删除的有墓碑，跳过）。
-    pub fn sync_local_active(&self) {
+    /// 启动一致性自检（issue #155，spec #152 决策 8）：以 live 为准比对并纠正
+    /// active 标记（记审计）；live 身份不在账号库（工具外登录）时清除标记并留
+    /// 一次性导入提示。一致时零副作用；纯本地读，零网络。
+    pub fn startup_check(&self) {
         let Ok(paths) = AppPaths::resolve() else {
             return;
         };
-        let removed_path = paths.removed_file();
-        kimi_switch_core::sync_local_active(
+        let outcome = kimi_switch_core::startup_consistency_check(
             "kimi",
-            &removed_path,
+            &paths.removed_file(),
             self.registry.as_ref(),
+            &self.audit,
             || self.kimi.live_account_id(),
-            || self.kimi.sync_active_metadata(None),
         );
+        if let Some(message) = startup_notice_message(&outcome) {
+            *self.startup_notice.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+        }
+    }
+
+    /// 取走启动提示（一次性）；无提示返回 `None`。
+    fn take_startup_notice(&self) -> Option<UiMessage> {
+        self.startup_notice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// 导入/授权后顺带打 `/me` 缓存官方昵称；失败忽略，不挡主流程。
@@ -294,14 +329,32 @@ impl Backend {
         message: Option<UiMessage>,
         reason: QuotaCollectReason,
     ) -> Snapshot {
-        let (accounts, rows, stats, snapshots) = self.load_rows(reason).await;
+        self.snapshot_scoped(message, reason, false).await
+    }
+
+    /// 带收集范围的快照（issue #161）：`current_only = true` 时额度收集聚焦当前账号
+    /// ——只对当前账号做真实查询、成功节流窗放宽到 10s 档位下限，停泊账号一律以
+    /// 缓存行组装（请求节奏仍由 90s 全量轮决定）；自动切换判定照常在本快照上运行，
+    /// 加密档把「耗尽 → 被发现」的检测间隙压到档位间隔。`false` 与 [`Backend::snapshot`]
+    /// 等价。
+    pub async fn snapshot_scoped(
+        &self,
+        message: Option<UiMessage>,
+        reason: QuotaCollectReason,
+        current_only: bool,
+    ) -> Snapshot {
+        let (accounts, rows, stats, snapshots) = self.load_rows(reason, current_only).await;
         let effect = self
             .maybe_run_snapshot_auto_swap(&accounts, &snapshots)
             .await;
         let (rows, stats) = if effect.swapped {
-            self.sync_local_active();
-            // 判定只用第一次 collect 的 snapshot；第二次组装走 Scheduled，避免用户点刷新后再打 www.kimi.com。
-            let (_, rows, stats, _) = self.load_rows(QuotaCollectReason::Scheduled).await;
+            // 自动切换后再对齐一次（issue #155：activate 已保证一致，正常零副作用的
+            // 自检兜底）；判定只用第一次 collect 的 snapshot，第二次组装走 Scheduled，
+            // 避免用户点刷新后再打 www.kimi.com。
+            self.startup_check();
+            let (_, rows, stats, _) = self
+                .load_rows(QuotaCollectReason::Scheduled, current_only)
+                .await;
             (rows, stats)
         } else {
             (rows, stats)
@@ -322,13 +375,22 @@ impl Backend {
             auto_swap_prefer_lower_tier: Self::load_auto_swap_prefer_lower_tier(),
             auto_swap_resident_lower_tier: Self::load_auto_swap_resident_lower_tier(),
             auto_swap_pre_reset_burn: Self::load_auto_swap_pre_reset_burn(),
-            message: attach_auto_swap_message(message, reason, &stats, effect.message),
+            auto_swap_pace_pre_swap: Self::load_auto_swap_pace_pre_swap(),
+            // 启动自检的一次性提示（issue #155）只在无更显式消息时顶上，
+            // 不与自动切换 / 节流提示抢位。
+            message: attach_auto_swap_message(
+                message.or_else(|| self.take_startup_notice()),
+                reason,
+                &stats,
+                effect.message,
+            ),
         }
     }
 
     async fn load_rows(
         &self,
         reason: QuotaCollectReason,
+        current_only: bool,
     ) -> (
         Vec<Account>,
         Vec<AccountRow>,
@@ -339,12 +401,13 @@ impl Backend {
         accounts.sort_by_key(|a| !a.active);
         let cache_path =
             quota_cache_path(AppPaths::resolve()).unwrap_or_else(skipped_quota_cache_path);
-        let (rows, stats, snapshots) = collect_account_rows(
+        let (rows, stats, snapshots) = collect_account_rows_scoped(
             self.kimi.clone(),
             Some(self.web_membership.clone()),
             &accounts,
             &cache_path,
             reason,
+            current_only,
         )
         .await;
         (accounts, rows, stats, snapshots)
@@ -374,41 +437,50 @@ impl Backend {
             .await)
     }
 
-    pub async fn swap(&self, id: &str) -> Result<Snapshot> {
+    pub async fn swap(&self, id: &str) -> Result<SwapOutcome> {
         let id = AccountId(id.to_string());
         let account = self
             .registry
             .find("kimi", &id)?
             .ok_or_else(|| anyhow::anyhow!("账号 {id} 不存在"))?;
-        self.kimi
-            .activate(&id)
-            .await
-            .map_err(anyhow::Error::from)
-            .with_context(|| swap_failure_message(&account))?;
-        self.audit
-            .append(AuditEvent::ok("activate", "kimi", Some(id.0.as_str())));
-        // 手动切换写回驻保持期（issue #95 / ADR-0008）：紧跟其后的快照判定不会把
-        // 用户刚选的账号又被回驻改掉；耗尽被迫切换不受保持期影响。
-        if let Ok(paths) = AppPaths::resolve() {
-            let hold_ms = Self::load_auto_swap_settings().manual_hold_ms;
-            set_manual_hold_until(
-                &paths.auto_swap_state_file(),
-                Utc::now() + chrono::Duration::milliseconds(hold_ms),
-            );
-        }
-        let plan = AppPaths::resolve().ok().and_then(|paths| {
-            let cache = kimi_switch_core::QuotaCache::load(&paths.quota_cache_file());
-            cached_membership_plan(&cache, &id.0)
-        });
-        Ok(self
-            .snapshot(
-                Some(UiMessage::ok(swap_success_message(
-                    &account,
-                    plan.as_deref(),
-                ))),
-                QuotaCollectReason::Scheduled,
-            )
-            .await)
+        // 手动切换保持期（issue #95 / ADR-0008）与会员档位都只在返回前读/写本地：
+        // 保持期必须先于后台重列落盘，重列里的回驻判定才不会把用户刚选的账号
+        // 又改掉；档位来自本地额度缓存，不打网。
+        let write_manual_hold = || {
+            if let Ok(paths) = AppPaths::resolve() {
+                let hold_ms = Self::load_auto_swap_settings().manual_hold_ms;
+                set_manual_hold_until(
+                    &paths.auto_swap_state_file(),
+                    Utc::now() + chrono::Duration::milliseconds(hold_ms),
+                );
+            }
+        };
+        let cached_plan = || {
+            AppPaths::resolve().ok().and_then(|paths| {
+                let cache = kimi_switch_core::QuotaCache::load(&paths.quota_cache_file());
+                cached_membership_plan(&cache, &id.0)
+            })
+        };
+        // 切换与额度快照重列解耦（issue #157 / spec #152 决策 1）：activate 提交
+        // （含审计、保持期）后立即返回，不再同步等待快照重列；重列由前端随后
+        // 触发既有列出命令在后台完成，切换路径零网络等待。
+        // 死卡快检（issue #156 / 决策 9）：目标凭证本地已确认失效（指纹命中）
+        // 时切换照常成功，只在返回载荷上附加警告；纯本地读、fail-open。
+        swap_after_activate(
+            &account,
+            || self.kimi.activate(&id),
+            &self.audit,
+            write_manual_hold,
+            cached_plan,
+            || {
+                AppPaths::resolve()
+                    .map(|paths| credential_locally_dead(&paths, &account))
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| swap_failure_message(&account))
     }
 
     pub async fn remove(&self, id: &str) -> Result<Snapshot> {
@@ -660,6 +732,74 @@ impl Backend {
 /// 允许用系统浏览器打开的官方主机（仅 https）。
 const ALLOWED_OPEN_URL_HOSTS: &[&str] = &["auth.kimi.com", "api.kimi.com", "www.kimi.com"];
 
+/// 手动切换死卡提示文案（issue #156，spec #152 决策 9）：目标凭证本地已确认
+/// 失效（invalid_grant 指纹命中）时切换照常成功，附加这行警告语义；与 CLI
+/// stderr 警告行同文。
+pub(crate) const DEAD_CREDENTIAL_WARNING: &str = "该账号凭证已失效，建议重新授权";
+
+/// 手动切换死卡快检（issue #156，spec #152 决策 9）：目标凭证 refresh token
+/// 指纹命中本地 invalid_grant 拒止集合 → 判死（切换照常执行，只附加警告）。
+/// 复用 core 共享原语 [`locally_invalid_accounts`]（#158 裁定口径：只认指纹、
+/// 不认 JWT exp——access 过期但 refresh 有效的账号激活后自愈，不是死卡）。
+/// 纯本地只读 `credentials.json` 与拒止指纹文件，零网络、零写副作用；任何
+/// 读取/解析失败 fail-open 判活，不因提示机制破坏切换。
+pub(crate) fn credential_locally_dead(paths: &AppPaths, account: &Account) -> bool {
+    locally_invalid_accounts(
+        &paths.auto_swap_state_file(),
+        std::slice::from_ref(account),
+        Utc::now(),
+    )
+    .contains(&account.id)
+}
+
+/// 手动切换编排（issue #157，spec #152 决策 1–2）：activate（计时入审计）、
+/// 手动保持期写入、本地档位读取完成后**立即**组装轻量结果返回——不等待、也不
+/// 发起额度快照重列（重列由前端随后触发既有列出命令在后台完成，切换路径零
+/// 网络等待）。activate 失败原样上抛，由调用方映射「切换到 X 失败」文案。
+/// `credential_dead` 是目标死卡快检（issue #156 / 决策 9）：只在成功路径上取用，
+/// 命中也只附加警告载荷，绝不改变切换结果本身。
+pub(crate) async fn swap_after_activate<F, Fut, H, P, D>(
+    account: &Account,
+    activate: F,
+    audit: &AuditLog,
+    write_manual_hold: H,
+    cached_plan: P,
+    credential_dead: D,
+) -> kimi_switch_core::Result<SwapOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = kimi_switch_core::Result<()>>,
+    H: FnOnce(),
+    P: FnOnce() -> Option<String>,
+    D: FnOnce() -> bool,
+{
+    // activate 段计时（issue #153）：纯本地原子写 + 快照回滚 + 文件锁，零网络；
+    // 耗时写入审计 duration_ms，预算对照 P50 < 200ms（spec #152 决策 4）。
+    let activate_started = std::time::Instant::now();
+    activate().await?;
+    audit.append(
+        AuditEvent::ok("activate", "kimi", Some(account.id.0.as_str()))
+            .with_duration_ms(activate_started.elapsed().as_millis() as u64),
+    );
+    // 保持期先于返回落盘：后台重列的回驻判定看到它，不会把用户刚选的账号改掉；
+    // 耗尽被迫切换不受保持期影响。
+    write_manual_hold();
+    let plan = cached_plan();
+    // 死卡快检（issue #156）：纯本地读 blob + 拒止指纹，命中只是附加警告文本，
+    // 成功提示 `message` 原样保留，由前端叠加呈现。
+    let credential_warning = if credential_dead() {
+        Some(DEAD_CREDENTIAL_WARNING.to_string())
+    } else {
+        None
+    };
+    Ok(SwapOutcome {
+        account_id: account.id.0.clone(),
+        display_name: display_name(account),
+        message: UiMessage::ok(swap_success_message(account, plan.as_deref())),
+        credential_warning,
+    })
+}
+
 /// 拒绝非官方 URL，避免 rundll32 打开任意协议或主机。
 fn assert_allowed_open_url(url: &str) -> Result<()> {
     anyhow::ensure!(is_allowed_open_url(url), "不允许打开该链接");
@@ -782,6 +922,9 @@ fn skipped_quota_cache_path() -> std::path::PathBuf {
 /// 加载 / 静默收集 / swap / import / 绑定等操作后再列）完全不发网页请求。会员
 /// 刷新失败只降级为行内绑定提示（日期 + hint 共存），不影响额度行、不计告急、
 /// 不置凭证待续期。后端快照不写会员 toast；GUI 用户点刷新后自行聚合瞬时提示。
+/// 既有全量收集入口（兼容形态）：等价于 [`collect_account_rows_scoped`] 传
+/// `current_only = false`。生产路径已改走 scoped 版本，本 wrapper 只服务既有测试。
+#[cfg(test)]
 pub(crate) async fn collect_account_rows<P>(
     provider: Arc<P>,
     membership: Option<Arc<dyn WebMembershipRefresh>>,
@@ -792,7 +935,32 @@ pub(crate) async fn collect_account_rows<P>(
 where
     P: Provider + 'static,
 {
+    collect_account_rows_scoped(provider, membership, accounts, cache_path, reason, false).await
+}
+
+/// 带收集范围的 [`collect_account_rows`]（issue #161）：`current_only = true` 时聚焦
+/// 当前账号（active 行）——只对它做真实额度查询，停泊账号以缓存行组装，快照仍
+/// 覆盖全部账号；找不到 active 行时退化为全量收集。
+pub(crate) async fn collect_account_rows_scoped<P>(
+    provider: Arc<P>,
+    membership: Option<Arc<dyn WebMembershipRefresh>>,
+    accounts: &[Account],
+    cache_path: &std::path::Path,
+    reason: QuotaCollectReason,
+    current_only: bool,
+) -> (Vec<AccountRow>, QuotaCollectStats, Vec<QuotaSnapshot>)
+where
+    P: Provider + 'static,
+{
     let ids: Vec<AccountId> = accounts.iter().map(|account| account.id.clone()).collect();
+    let focus: Option<AccountId> = current_only
+        .then(|| {
+            accounts
+                .iter()
+                .find(|account| account.active)
+                .map(|account| account.id.clone())
+        })
+        .flatten();
 
     // 会员刷新与额度收集并行发起（账号序即结果序），额度结果语义不被会员拖慢。
     let membership_jobs = match (&membership, reason) {
@@ -808,8 +976,8 @@ where
         _ => Vec::new(),
     };
 
-    let outcome = kimi_switch_core::quota_snapshot::collect_detailed(
-        provider, "kimi", &ids, cache_path, reason,
+    let outcome = kimi_switch_core::quota_snapshot::collect_detailed_focused(
+        provider, "kimi", &ids, cache_path, reason, focus.as_ref(),
     )
     .await;
 
@@ -859,6 +1027,22 @@ pub(crate) fn account_for_notice(registry: &AccountRegistry, account: Account) -
         .ok()
         .flatten()
         .unwrap_or(account)
+}
+
+/// 启动自检的界面提示（issue #155）：工具外身份 → 导入引导；纠正 → 确认提示。
+pub(crate) fn startup_notice_message(outcome: &StartupCheckOutcome) -> Option<UiMessage> {
+    match outcome {
+        StartupCheckOutcome::Consistent => None,
+        StartupCheckOutcome::CorrectedActive { account, previous } => Some(UiMessage::info(
+            match previous {
+                Some(prev) => format!("已按登录文件纠正当前账号：{prev} → {account}"),
+                None => format!("已按登录文件标记当前账号：{account}"),
+            },
+        )),
+        StartupCheckOutcome::UntrackedLiveIdentity { live } => Some(UiMessage::info(format!(
+            "检测到工具外身份 {live}，不在账号库；可在账号库导入收进账号库"
+        ))),
+    }
 }
 
 pub(crate) fn import_success_message(account: &Account) -> String {
@@ -1041,12 +1225,18 @@ where
                     if pending_auth() || current_active().as_ref() != Some(&target.from) {
                         return AutoSwapSnapshotEffect::none();
                     }
+                    // activate 段计时（issue #153 续跑）：自动切换与手动切换同口径，
+                    // 只覆盖 activate 段，耗时写入审计 duration_ms。
+                    let activate_started = std::time::Instant::now();
                     match activate(target.to.clone()).await {
                         Ok(()) => {
                             write_last_auto_swap_at(state_path, Utc::now());
                             audit.append(
                                 AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
-                                    .with_detail(resident_return_audit_detail(&target)),
+                                    .with_detail(resident_return_audit_detail(&target))
+                                    .with_duration_ms(
+                                        activate_started.elapsed().as_millis() as u64,
+                                    ),
                             );
                             let text = accounts
                                 .iter()
@@ -1078,12 +1268,16 @@ where
             if pending_auth() || current_active().as_ref() != Some(&target.from) {
                 return AutoSwapSnapshotEffect::none();
             }
+            // activate 段计时（issue #153 续跑）：耗尽 / pace / 抢用 / 回程共用，
+            // 与手动切换同口径写入审计 duration_ms。
+            let activate_started = std::time::Instant::now();
             match activate(target.to.clone()).await {
                 Ok(()) => {
                     record_auto_swap_success(state_path, Utc::now(), &target, snapshots);
                     audit.append(
                         AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
-                            .with_detail(auto_swap_audit_detail(&target)),
+                            .with_detail(auto_swap_audit_detail(&target))
+                            .with_duration_ms(activate_started.elapsed().as_millis() as u64),
                     );
                     let found = accounts.iter().find(|account| account.id == target.to);
                     // issue #150：抢用 / 回程 toast 与普通耗尽、pace 区分开，仍走 AutoSwapSuccess。

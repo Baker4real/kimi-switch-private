@@ -32,6 +32,10 @@ pub struct AuditEvent {
     /// 可选附加信息：错误消息、上一个 active 账号等。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// activate 段耗时（毫秒，issue #153）。旧格式记录无此字段，读取侧兼容为
+    /// `None`（serde 对缺失的 Option 字段自动取 None），序列化时 `None` 不输出。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl AuditEvent {
@@ -43,6 +47,7 @@ impl AuditEvent {
             account: account.map(str::to_string),
             result: "ok".into(),
             detail: None,
+            duration_ms: None,
         }
     }
 
@@ -54,11 +59,19 @@ impl AuditEvent {
             account: account.map(str::to_string),
             result: "error".into(),
             detail: Some(detail.into()),
+            duration_ms: None,
         }
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    /// 记录 activate 段耗时（毫秒，issue #153）：手动切换审计在 activate 完成后
+    /// 以真实耗时调用；预算对照见 spec #152 决策 4（P50 < 200ms，本地实测）。
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
         self
     }
 }
@@ -127,5 +140,45 @@ mod tests {
         let e1: AuditEvent = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(e1.result, "error");
         assert!(e1.detail.is_some());
+    }
+
+    // --- issue #153：activate 段耗时 duration_ms ---
+
+    /// 新记录：含 duration_ms 字段，写盘与读回往返保持数值。
+    #[test]
+    fn activate_event_roundtrips_duration_ms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::new(tmp.path().join("audit.log"));
+        log.append(
+            AuditEvent::ok("activate", "kimi", Some("alice")).with_duration_ms(37),
+        );
+        let raw = std::fs::read_to_string(log.path()).unwrap();
+        assert!(
+            raw.contains("\"duration_ms\":37"),
+            "切换记录应含 duration_ms 字段: {raw}"
+        );
+        let event: AuditEvent = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(event.duration_ms, Some(37));
+    }
+
+    /// 旧格式记录（无 duration_ms 字段）读取侧向后兼容：解析不报错，取值为 None。
+    #[test]
+    fn legacy_event_without_duration_ms_still_parses() {
+        let legacy = concat!(
+            r#"{"timestamp":"2026-09-13T00:00:00Z","action":"activate","#,
+            r#""provider":"kimi","account":"alice","result":"ok"}"#
+        );
+        let event: AuditEvent = serde_json::from_str(legacy)
+            .expect("旧格式记录（无 duration_ms）必须能继续解析");
+        assert_eq!(event.action, "activate");
+        assert_eq!(event.duration_ms, None);
+    }
+
+    /// 未设置耗时的记录序列化时不输出该字段，保持与旧格式一致的形状。
+    #[test]
+    fn event_without_duration_ms_omits_field() {
+        let event = AuditEvent::ok("refresh", "kimi", Some("alice"));
+        let raw = serde_json::to_string(&event).unwrap();
+        assert!(!raw.contains("duration_ms"), "{raw}");
     }
 }

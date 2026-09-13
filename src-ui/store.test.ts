@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import type { AccountRow, Snapshot } from "./api";
+import type { QuotaView } from "./quota";
 import {
   accountFocusAttr,
   controlDisabledByBusy,
@@ -15,6 +17,7 @@ import {
   pickRestoredFocus,
   setListedActionsBusy,
   shouldArmToastDismiss,
+  snapshotWithSwitchedCurrent,
 } from "./store";
 
 describe("列表保焦", () => {
@@ -123,6 +126,72 @@ describe("空闲 pill 与总览空态（issue #127）", () => {
     expect(overviewCurrentEmptyCopy(0)).toBe("请先添加或导入");
     expect(overviewCurrentEmptyCopy(1)).toBe("请到「账号库」切换");
     expect(overviewCurrentEmptyCopy(4)).toBe("请到「账号库」切换");
+  });
+});
+
+describe("手动切换立即视图（issue #157）", () => {
+  const quota = (text: string): QuotaView => ({
+    window: "5小时",
+    ratio: 0.1,
+    text,
+    reset: null,
+    tone: "ok",
+  });
+
+  const row = (id: string, active: boolean, quotaText: string): AccountRow => ({
+    id,
+    label: id,
+    active,
+    membership: null,
+    membership_expiry: null,
+    membership_remaining_days: null,
+    membership_period_days: null,
+    membership_expiry_hint: false,
+    quotas: [quota(quotaText)],
+    error: null,
+    credential_expired: false,
+    cached_at: "更新于 09-12 10:00",
+    display_name: id,
+    official_nickname_known: false,
+    auto_swap_opt_out: false,
+  });
+
+  const snapshot = (): Snapshot => ({
+    accounts: [row("alice", true, "10% (10/100)"), row("bob", false, "50% (50/100)")],
+    current_label: "alice",
+    account_count: 2,
+    urgent_count: 0,
+    proactive_renewal: false,
+    auto_swap: false,
+    auto_swap_prefer_lower_tier: false,
+    auto_swap_resident_lower_tier: false,
+    auto_swap_pre_reset_burn: false,
+    auto_swap_pace_pre_swap: false,
+    message: { text: "旧的提示", tone: "ok", kind: "generic" },
+  });
+
+  it("切换成功后所点卡片立即成为当前账号，额度区显示该账号既有缓存值", () => {
+    const before = snapshot();
+    const next = snapshotWithSwitchedCurrent(before, "bob");
+    expect(next.accounts.map((r) => [r.id, r.active])).toEqual([
+      ["alice", false],
+      ["bob", true],
+    ]);
+    expect(next.current_label).toBe("bob");
+    // 额度区不空白、不错配账号数字：每行额度仍是各自的缓存值。
+    expect(next.accounts[1].quotas[0].text).toBe("50% (50/100)");
+    expect(next.accounts[0].quotas[0].text).toBe("10% (10/100)");
+    expect(next.accounts[1].cached_at).toBe("更新于 09-12 10:00");
+    // 不重放上一份快照的旧 toast（成功文案由切换流单独弹）。
+    expect(next.message).toBeNull();
+    // 原快照不被就地改写。
+    expect(before.accounts[0].active).toBe(true);
+    expect(before.message).not.toBeNull();
+  });
+
+  it("目标账号不在既有快照中时原样返回同一对象，交给后台快照纠正", () => {
+    const before = snapshot();
+    expect(snapshotWithSwitchedCurrent(before, "ghost")).toBe(before);
   });
 });
 

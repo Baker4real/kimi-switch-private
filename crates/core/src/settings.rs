@@ -435,6 +435,14 @@ pub fn set_auto_swap_pre_reset_burn(enabled: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_pre_reset_burn(&path, enabled)
 }
 
+/// 把「pace 预切换」写入 `<config_dir>/config.toml`，返回新快照。
+///
+/// 只落盘，不改全局当前值；写序与 [`set_auto_swap_enabled`] 相同。
+pub fn set_auto_swap_pace_pre_swap(enabled: bool) -> Result<Arc<Settings>> {
+    let path = AppPaths::resolve()?.config_file();
+    upsert_auto_swap_pace_pre_swap(&path, enabled)
+}
+
 /// 读-改-写指定配置文件里的 `auto_swap.enabled`。
 fn upsert_auto_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_bool(path, "enabled", enabled)
@@ -453,6 +461,11 @@ fn upsert_auto_swap_resident_lower_tier(path: &Path, enabled: bool) -> Result<Ar
 /// 读-改-写指定配置文件里的 `auto_swap.pre_reset_burn`（issue #150）。
 fn upsert_auto_swap_pre_reset_burn(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
     upsert_auto_swap_bool(path, "pre_reset_burn", enabled)
+}
+
+/// 读-改-写指定配置文件里的 `auto_swap.pace_pre_swap`（issue #159）。
+fn upsert_auto_swap_pace_pre_swap(path: &Path, enabled: bool) -> Result<Arc<Settings>> {
+    upsert_auto_swap_bool(path, "pace_pre_swap", enabled)
 }
 
 /// 读-改-写指定配置文件里的一个 `auto_swap` 布尔键。
@@ -980,6 +993,29 @@ usage_cache_max_age_ms = 4000
         assert!(raw.contains("enabled = true # 续期别动"), "{raw}");
         let s = load_from(&path).unwrap();
         assert!(s.auto_swap.pre_reset_burn);
+        assert!(s.auto_swap.enabled);
+        assert_eq!(s.auto_swap.threshold, 0.5);
+        assert!(s.proactive_renewal.enabled);
+    }
+
+    /// issue #159：写回只动 `auto_swap.pace_pre_swap`：手写注释、其它键与其它段原样保留。
+    #[test]
+    fn upsert_auto_swap_pace_pre_swap_preserves_comments_and_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# 我的调优\n[auto_swap]\nthreshold = 0.5 # 别动\nenabled = true # 开关别动\n[proactive_renewal]\nenabled = true # 续期别动\n",
+        )
+        .unwrap();
+        upsert_auto_swap_pace_pre_swap(&path, true).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# 我的调优"), "{raw}");
+        assert!(raw.contains("threshold = 0.5 # 别动"), "{raw}");
+        assert!(raw.contains("enabled = true # 开关别动"), "{raw}");
+        assert!(raw.contains("enabled = true # 续期别动"), "{raw}");
+        let s = load_from(&path).unwrap();
+        assert!(s.auto_swap.pace_pre_swap);
         assert!(s.auto_swap.enabled);
         assert_eq!(s.auto_swap.threshold, 0.5);
         assert!(s.proactive_renewal.enabled);

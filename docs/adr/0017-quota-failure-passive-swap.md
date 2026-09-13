@@ -1,0 +1,134 @@
+---
+type: adr
+title: 配额失败被动切换：StopFailure hook 秒级唤起，403 原文即权威耗尽证据
+status: accepted
+tags: [auto-swap, passive-swap, stop-failure-hook, install-hook, credential-health]
+intent: Record the quota-failure passive swap trigger (spec #152 decisions 14-17): Kimi Code 0.42.0 provides the official StopFailure hook channel, reversing CONTEXT.md's old avoidance of "swap on 403"; an observer-only CLI subcommand always exits 0, classifies 403 plus "usage limit" with word-boundary rules, overlays the authoritative exhaustion evidence without touching quota cache, inherits the exhaustion decision semantics via a dedicated serialization lock, installs the hook only through an idempotent install-hook subcommand, and narrows the local credential health check to invalid_grant fingerprints only (JWT exp excluded by an explicit, reversible ruling).
+documents:
+  symbols:
+    - classify_stop_failure
+    - overlay_exhausted_snapshot
+    - decide_auto_swap_passive_from_state
+    - PassiveSwapLock
+    - install_hook_into
+    - locally_invalid_accounts
+---
+# 配额失败被动切换：StopFailure hook 秒级唤起，403 原文即权威耗尽证据
+
+CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回避词：历史上仓库明确不做这件事，
+当时的理由是 Kimi Code 尚无官方 hook 通道——工具无从得知「此刻真的撞了 403」，只能靠轮询
+被动发现，自己拦截请求做被动换号既无官方依据也违背「判定只读已收集快照」。**这一回避现在
+反转**：Kimi Code 0.42.0 起官方支持 hooks（事件 JSON 走 stdin、可执行任意外部命令），其中
+`StopFailure` 在本轮因错误失败时触发，观察型、不可阻断。官方通道使「403 即时唤起切换」从
+无据抓取变成官方支持的观察路径。规范词定为「配额失败被动切换」（CONTEXT.md 词条），取代
+旧回避词。spec #152 决策 14–17（实现 #158 / #162）。
+
+关键事实（spec 已核实）：配额耗尽 = HTTP 403，5 小时窗 / 7 天窗 / 月度各有明确
+"usage limit" 文案，官方明示重试无意义、会话不销毁；429 仅为瞬时限流/引擎过载，与配额无关。
+
+## 决策
+
+1. **触发链路：官方 `StopFailure` hook 唤起 CLI 观察型子命令（#162，spec 决策 14）。**
+   新子命令 `on-quota-failure`：从 stdin 读事件 JSON → 分类 → 命中 403 配额耗尽时按耗尽
+   路径语义复用既有自动切换判定与 `activate`。**恒以退出码 0 结束**——观察型 hook 绝不
+   阻断用户会话；任何内部错误（含上下文构建失败、stdin 读失败）只写日志。stdin 畸形静默
+   放行。hook 唤起的是独立 CLI 进程，顺带覆盖「GUI 没开」场景：用户在 Kimi Code 活跃会话
+   期间即使没开 GUI 也有兜底。
+
+2. **总开关沿用既有语义。** `auto_swap.enabled` 关闭时被动路径同闸、零副作用——被动切换是
+   自动切换的触发源，不是独立功能。
+
+3. **分类：403 ∧ "usage limit"，词边界防误报（#162）。** 纯函数 `classify_stop_failure`
+   对整份事件 JSON 递归扫描：任一字符串含 "usage limit"（大小写不敏感）**且**存在 403
+   信号——数值 403，或任一字符串含**作为独立 token** 的 "403"（前后均非 ASCII 字母数字才
+   算边界；时间戳、request id、行号等数字串里的 "403" 子串不算）。两者缺一归其他：429
+   过载/瞬时限流绝不匹配。官方未枚举事件 JSON 的错误字段，因此不依赖 hook 的 matcher 做
+   过滤，而是在子命令内部对 stdin 原文分类——hook schema 变化最坏只会**漏**触发，不会
+   **误**触发。非合法 JSON 一律归其他。
+
+4. **窗口辨认是尽力而为。** 从含 "usage limit" 的字符串辨认耗尽窗口（"month" → 月度；
+   "5"+"hour" → 5 小时；"7"+"day" → 7 天），辨认不出为 None——只影响权威证据标注哪个
+   窗口，不影响切换与否。
+
+5. **403 原文 = 权威耗尽证据，overlay 不回写缓存（#162）。** `overlay_exhausted_snapshot`
+   以快照形态把「当前账号已耗尽」证据送进判定：缓存快照可用（`Ready` / 非 stale
+   `Cached`）时以其为底，把目标窗口覆写为已用 = 上限，其余窗口保留缓存真值；底上没有该
+   窗口则追加一条合成窗口；无可用缓存时整条合成（缺省 5 小时、`reset_at` 未知）。纯函数、
+   不落盘、**不写 `quota_cache.json`**——被动路径零新增网络查询，被切走账号的真实额度仍由
+   后续快照照常跟踪。
+
+6. **耗尽路径语义继承，单点保证（#162）。** `decide_auto_swap_passive_from_state` 与轮询
+   路径进同一判定实现（触发来源只影响安顿宽限是否放行）：冷却、合格线、防抖边际、摘出、
+   回驻确认期、往返记忆、候选本地凭证快检（见决策 9）全部继承，不另写一套。与轮询路径的
+   唯一差异是**安顿宽限不阻挡**——403 原文是「此刻已耗尽」的权威证据，等宽限期过去只会
+   多失败几轮请求；手动保持期本就只约束回驻、不约束耗尽路径（ADR-0008）。本应触发但无
+   合格候选时记审计（与轮询同口径）；冷却、无当前账号等其余 Stay 静默落空（观察型不打扰
+   会话）。activate 段计时同口径写入审计 `duration_ms`（ADR-0015）；成功审计 detail 带
+   `trigger=passive`。
+
+7. **决定之后、activate 之前重读防线 + 被动串行化锁收敛并发（#162）。** 决策返回 Swap 后、
+   真正 activate 前重读当前账号与冷却：并发的 GUI/CLI 轮询切换已完成时放弃，不重复
+   activate、不审计。多个会话同时撞 403 由 `<state_dir>/passive-swap.lock` 排他文件锁
+   串行化（独立于交换锁 `registry 目录/.kimi-switch.lock`，二者无嵌套；等待上限对齐
+   3 秒，等不到视为另一触发处理中、观察型放弃）：锁把「读状态 → 判定 → activate → 写
+   冷却」整段排成队列，后到者在锁内重读状态，看到冷却或新当前账号健康即自然落空——没有
+   这把锁时，[提交, 写冷却] 间隙里迟到的触发会把 403 证据错按在新当前账号上再切一跳。
+
+8. **hook 安装只经 CLI `install-hook` 子命令，幂等、可卸载（#162，spec 决策 16）。** 向
+   Kimi Code 工作目录（`KIMI_CODE_HOME` > `~/.kimi-code`）的 `config.toml` 写入 `[[hooks]]`
+   条目：`event = "StopFailure"`、`command = "<当前 exe> on-quota-failure"`、
+   `timeout = 10`（官方默认 30s；被动切换纯本地毫秒级，10s 兜底即可，不让 hook 拖慢会话）。
+   工具任何其他路径不得隐式修改 Kimi Code 配置——hook 只通过用户显式执行安装命令写入。
+   幂等与卸载：识别标记是 `event = StopFailure` 且 `command` 含 `on-quota-failure` 的条目
+   视为本工具条目；重复安装只刷新 command（可执行文件可能移动过）与 timeout，并把多余的
+   重复条目收敛成一个；`--uninstall` 只删自己的条目，数组清空时连 `hooks` 键一起移除、
+   还原到没有 hooks 段的原始形态，用户其它 hooks 条目与注释、顺序经 toml_edit 保留；
+   解析失败报错退出、绝不覆写；无变化时不重写文件（字节不变）。
+
+9. **候选本地凭证快检：只认 invalid_grant 指纹（#158，spec 决策 15；口径经 #158 续跑裁定
+   收紧）。** 自动切换候选过滤新增纯本地快检：refresh token SHA-256 指纹命中本地拒止集合
+   文件 `<kimi_home>/credentials/.kimi-switch-dead-refresh`（invalid_grant 被官方拒止时由
+   token 刷新协调写入，ADR-0009 同族）的停泊账号，直接排除出全部自动触发路径（耗尽 /
+   pace / 回驻 / 重置前抢用与回程 / 被动），避免切到死卡。**裁定（偏离 spec 决策 15 原措辞
+   「JWT 已过期或有 invalid_grant 指纹」，明示可推翻）：只认指纹命中，不认 JWT exp 已过**，
+   理由：
+   - 停泊账号 access token 只在额度轮询时轮换保鲜，GUI 长期关闭后全部自然过期——恰是
+     被动切换的主场景，exp 口径会把全部候选排空、被动切换静默落空；
+   - access 过期但 refresh 有效的账号激活后下次额度查询自愈，不是真死卡；
+   - 与 ADR-0009「无法确证不算失效」同向：unknown ≠ 失效，任何读取/解析失败 fail-open。
+   手动切换死卡提示（ADR-0015 决策 10）复用同一口径与共享原语（core `credential_health`）。
+   口径记录在 `crates/core/src/credential_health.rs` 模块 doc；若未来恢复时间依赖口径，
+   门面参数已保留决策基准时刻，可重开本裁定。
+
+10. **不引入第二触发源（spec 决策 17）。** SessionHeartbeat 等常驻信号不做：hook 已覆盖
+    「工具未运行」场景，第二个触发源只增加状态机复杂度。官方客户端采纳段（切换何时被
+    Kimi Code 会话真正使用）不进保证范围、不设计观测，至多由写后回读校验
+    （ADR-0015 决策 5）间接压缩风险。
+
+## 真机验收（待实机回填）
+
+发布前在真机完整走一遍，结果回填本节：
+
+1. `cargo build --release -p kimi-switch-cli` 构建 release CLI；
+2. 确认 `[auto_swap] enabled = true`；
+3. `kimi-switch-cli install-hook`，检查 `~/.kimi-code/config.toml` 新增 `[[hooks]]`
+   StopFailure 条目、其余内容（注释/顺序/既有条目）未动；
+4. 烧到真实 403 "usage limit"，观察 live 秒级切换与 `audit.log` 的
+   `trigger=passive`；
+5. 负向验证：429 不触发切换；
+6. 多会话并发撞 403 只切一次（锁 + 冷却收敛）；
+7. `install-hook --uninstall` 还原 config.toml。
+
+## Considered Options
+
+- **维持回避（不反转）**：官方已提供 hook 通道，回避的理由（无官方依据）不复存在；而
+  403 是官方明示「重试无意义」的终态，被动切换是唯一正确的即时响应，轮询加密
+  （ADR-0016）再快也有秒到分钟级的残余间隙。
+- **依赖 hook 的 matcher 在 Kimi Code 配置里预过滤**：官方未枚举 StopFailure 错误类型的
+  matcher 取值，依赖它等于把分类建立在未核实的行为上；分类放子命令内部对 stdin 原文做，
+  schema 变化最坏漏触发不误触发。
+- **并发收敛靠冷却单独兜住**：冷却写在 activate 返回之后，[提交, 写冷却] 间隙里迟到的并发
+  触发会把 403 证据错按在新当前账号上再切一跳；被动锁把整段排成队列，冷却才有干净的
+  判定起点。
+- **快检认 JWT exp（spec 原措辞）**：见决策 9 裁定——exp 口径会在被动切换主场景排空全部
+  候选，把新功能变静默空转；裁定可推翻，推翻时须先解停泊账号自然过期问题。

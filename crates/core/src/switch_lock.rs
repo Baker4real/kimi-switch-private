@@ -3,16 +3,27 @@
 //! 锁文件为 `<lock_dir>/.kimi-switch.lock`。`fs2` 排他锁通常不可重入，
 //! 因此本模块按线程记录持锁深度：`swap_with_snapshot` 持锁期间
 //! `commit` → `AccountRegistry::set_active` → `save` 不得再抢同一把锁。
+//!
+//! 等待上限（issue #153）：获取排他锁最多等 [`LOCK_WAIT_LIMIT`]（3 秒），
+//! 超时返回 [`Error::SwitchLockTimeout`]（「另一切换操作未完成，请重试」），
+//! 不再无限阻塞并发操作。
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
 use crate::error::{Error, Result};
 
 pub const LOCK_FILE_NAME: &str = ".kimi-switch.lock";
+
+/// 排他锁等待上限：超时视为另一处切换卡住，返回明确错误而非无限等待。
+const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(3);
+/// 等待期间的轮询间隔；总等待最多超出一个间隔。
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 thread_local! {
     static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
@@ -78,8 +89,7 @@ fn enter(path: &Path) -> Result<()> {
             .write(true)
             .truncate(false)
             .open(path)?;
-        file.lock_exclusive()
-            .map_err(|e| Error::provider(format!("lock {} failed: {e}", path.display())))?;
+        acquire_exclusive(&file, path)?;
         *slot.borrow_mut() = Some(Held {
             path: path.to_path_buf(),
             file,
@@ -87,6 +97,39 @@ fn enter(path: &Path) -> Result<()> {
         });
         Ok(())
     })
+}
+
+/// 以 [`LOCK_WAIT_LIMIT`] 为上限获取排他锁：锁被他人持有时轮询等待，
+/// 超时返回 [`Error::SwitchLockTimeout`]；非竞争类错误（权限、IO 故障）如实上抛。
+fn acquire_exclusive(file: &File, path: &Path) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(e) if is_lock_contention(&e) => {
+                if started.elapsed() >= LOCK_WAIT_LIMIT {
+                    tracing::warn!(
+                        lock = %path.display(),
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "swap lock wait exceeded limit; giving up"
+                    );
+                    return Err(Error::SwitchLockTimeout);
+                }
+                std::thread::sleep(LOCK_POLL_INTERVAL);
+            }
+            Err(e) => {
+                return Err(Error::provider(format!("lock {} failed: {e}", path.display())))
+            }
+        }
+    }
+}
+
+/// fs2 `try_lock_exclusive` 的竞争信号：Unix flock 返回 `EWOULDBLOCK`
+/// （std 映射为 `WouldBlock`），Windows `LockFileEx` 返回 `ERROR_LOCK_VIOLATION`
+/// （raw os error 33）。其余错误视为真实故障，不参与等待循环。
+fn is_lock_contention(err: &io::Error) -> bool {
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(ERROR_LOCK_VIOLATION)
 }
 
 fn exit() {

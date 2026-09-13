@@ -2,13 +2,15 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   evaluateBindSubmit,
   evaluateRenameSubmit,
   paintActionRetry,
+  runSwapFlow,
 } from "./main";
+import type { Snapshot } from "./api";
 
 const html = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "index.html"),
@@ -255,5 +257,191 @@ describe("操作失败重试面板（issue #84）", () => {
     paintActionRetry(panel, text, null);
     expect(text.textContent).toBe("");
     expect(classes.has("hidden")).toBe(true);
+  });
+});
+
+/** 切换流测试夹具（issue #157）：记录宿主调用顺序的假宿主 + 两账号快照。 */
+function swapFlowFixture(currentSnapshot: Snapshot | null) {
+  const calls: string[] = [];
+  const busy = { value: false };
+  const host = {
+    isBusy: () => busy.value,
+    setBusy(next: boolean, label?: string) {
+      busy.value = next;
+      calls.push(`busy:${next}:${label ?? ""}`);
+    },
+    reserveGeneration: () => {
+      calls.push("reserve");
+      return 7;
+    },
+    currentSnapshot: () => currentSnapshot,
+    applySnapshot(next: Snapshot, generation: number) {
+      const active = next.accounts.find((row) => row.active);
+      calls.push(`apply:${generation}:${active ? active.id : "none"}`);
+    },
+    showToast(text: string, isError = false) {
+      calls.push(`toast:${isError}:${text}`);
+    },
+    reportError(message: string) {
+      calls.push(`error:${message}`);
+    },
+    refreshInBackground() {
+      calls.push("refresh");
+    },
+  };
+  return { calls, busy, host };
+}
+
+function twoAccountSnapshot(): Snapshot {
+  const row = (id: string, active: boolean) => ({
+    id,
+    label: id,
+    active,
+    membership: null,
+    membership_expiry: null,
+    membership_remaining_days: null,
+    membership_period_days: null,
+    membership_expiry_hint: false,
+    quotas: [
+      { window: "5小时", ratio: 0.1, text: `${id} 用量`, reset: null, tone: "ok" as const },
+    ],
+    error: null,
+    credential_expired: false,
+    cached_at: "更新于 09-12 10:00",
+    display_name: id,
+    official_nickname_known: false,
+    auto_swap_opt_out: false,
+  });
+  return {
+    accounts: [row("alice", true), row("bob", false)],
+    current_label: "alice",
+    account_count: 2,
+    urgent_count: 0,
+    proactive_renewal: false,
+    auto_swap: false,
+    auto_swap_prefer_lower_tier: false,
+    auto_swap_resident_lower_tier: false,
+    auto_swap_pre_reset_burn: false,
+    auto_swap_pace_pre_swap: false,
+    message: null,
+  };
+}
+
+const swapOutcome = {
+  account_id: "bob",
+  display_name: "bob",
+  message: { text: "已切换到 bob", tone: "ok" as const, kind: "generic" as const },
+  credential_warning: null,
+};
+
+describe("手动切换与额度快照重列解耦（issue #157）", () => {
+  it("切换成功立即应用当前账号标记并弹成功 toast，先于忙碌释放触发后台刷新", async () => {
+    const { calls, busy, host } = swapFlowFixture(twoAccountSnapshot());
+    const swapAccount = vi.fn().mockResolvedValue(swapOutcome);
+
+    const ok = await runSwapFlow("bob", host, swapAccount);
+
+    expect(ok).toBe(true);
+    expect(swapAccount).toHaveBeenCalledWith("bob");
+    expect(calls).toEqual([
+      "busy:true:正在切换…",
+      "reserve",
+      "apply:7:bob",
+      "toast:false:已切换到 bob",
+      "refresh",
+      "busy:false:",
+    ]);
+    expect(busy.value).toBe(false);
+  });
+
+  it("切到本地已确认失效的卡（issue #156）：切换照常成功，警告叠加在成功 toast 上按错误样式弹出", async () => {
+    const { calls, busy, host } = swapFlowFixture(twoAccountSnapshot());
+    const swapAccount = vi.fn().mockResolvedValue({
+      ...swapOutcome,
+      credential_warning: "该账号凭证已失效，建议重新授权",
+    });
+
+    const ok = await runSwapFlow("bob", host, swapAccount);
+
+    expect(ok).toBe(true);
+    // 成功提示不被顶掉：单条 toast 同时承载「已切换到」与「建议重新授权」。
+    expect(calls).toEqual([
+      "busy:true:正在切换…",
+      "reserve",
+      "apply:7:bob",
+      "toast:true:已切换到 bob；该账号凭证已失效，建议重新授权",
+      "refresh",
+      "busy:false:",
+    ]);
+    expect(busy.value).toBe(false);
+  });
+
+  it("后台刷新未完成时再次切换正常工作：忙碌已释放，第二次流程照常进行", async () => {
+    // refreshInBackground 只发通知、不持有任何闸门：模拟一个永不完成的后台刷新，
+    // 第二次切换仍应完整走完并成功。
+    let refreshes = 0;
+    const first = swapFlowFixture(twoAccountSnapshot());
+    const host = {
+      ...first.host,
+      refreshInBackground() {
+        refreshes += 1;
+      },
+    };
+    const ok1 = await runSwapFlow("bob", host, vi.fn().mockResolvedValue(swapOutcome));
+    expect(ok1).toBe(true);
+    expect(refreshes).toBe(1);
+    expect(first.busy.value).toBe(false);
+
+    const ok2 = await runSwapFlow("alice", host, vi.fn().mockResolvedValue(swapOutcome));
+    expect(ok2).toBe(true);
+    expect(refreshes).toBe(2);
+    expect(first.busy.value).toBe(false);
+  });
+
+  it("忙碌时直接失败：不发切换命令、不占世代", async () => {
+    const { calls, host } = swapFlowFixture(twoAccountSnapshot());
+    host.setBusy(true, "处理中…");
+    calls.length = 0;
+    const swapAccount = vi.fn();
+
+    const ok = await runSwapFlow("bob", host, swapAccount);
+
+    expect(ok).toBe(false);
+    expect(swapAccount).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it("切换失败走 reportError 并释放忙碌，不应用视图、不触发后台刷新", async () => {
+    const { calls, busy, host } = swapFlowFixture(twoAccountSnapshot());
+    const swapAccount = vi
+      .fn()
+      .mockRejectedValue({ kind: "switch_lock_timeout", message: "另一切换操作未完成，请重试" });
+
+    const ok = await runSwapFlow("bob", host, swapAccount);
+
+    expect(ok).toBe(false);
+    expect(calls).toEqual([
+      "busy:true:正在切换…",
+      "reserve",
+      "error:另一切换操作未完成，请重试",
+      "busy:false:",
+    ]);
+    expect(busy.value).toBe(false);
+  });
+
+  it("无既有快照时不做本地翻转，仍弹成功 toast 并触发后台刷新", async () => {
+    const { calls, host } = swapFlowFixture(null);
+    const swapAccount = vi.fn().mockResolvedValue(swapOutcome);
+
+    const ok = await runSwapFlow("bob", host, swapAccount);
+
+    expect(ok).toBe(true);
+    expect(calls).toEqual([
+      "busy:true:正在切换…",
+      "reserve",
+      "toast:false:已切换到 bob",
+      "refresh",
+      "busy:false:",
+    ]);
   });
 });

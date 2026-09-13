@@ -173,6 +173,27 @@ export function controlDisabledByBusy(busy: boolean, viewDisabled: boolean): boo
   return busy || viewDisabled;
 }
 
+/** 手动切换成功后的立即视图（issue #157）：据后端成功响应把所点账号标记为当前
+ * 账号、其余卡取消当前标记；每行的额度数字、会员档位等沿用既有快照缓存值，
+ * 界面不空白、不错配账号。message 置 null——切换成功的 toast 由切换流单独弹，
+ * 不重放上一份快照的旧消息。目标账号不在既有快照（界面数据已过期等）时原样
+ * 返回，当前标记交给随后的后台快照纠正。 */
+export function snapshotWithSwitchedCurrent(
+  snapshot: Snapshot,
+  accountId: string,
+): Snapshot {
+  const target = snapshot.accounts.find((row) => row.id === accountId);
+  if (!target) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    accounts: snapshot.accounts.map((row) => ({ ...row, active: row.id === accountId })),
+    current_label: target.display_name,
+    message: null,
+  };
+}
+
 /** 对话框开着时错误 toast 不自动收起；成功 toast 仍按原计时。 */
 export function shouldArmToastDismiss(isError: boolean, dialogOpen: boolean): boolean {
   return !(isError && dialogOpen);

@@ -179,6 +179,11 @@ pub enum Error {
     #[error("account not found: provider={provider} id={id}")]
     AccountNotFound { provider: String, id: String },
 
+    /// 交换排他文件锁等待超过 3 秒上限（issue #153）：另一处切换未及时完成。
+    /// 用户可见文案即 Display 本身；GUI/CLI 经既有错误链透传呈现。
+    #[error("另一切换操作未完成，请重试")]
+    SwitchLockTimeout,
+
     #[error("credential store: {0}")]
     Credential(String),
 
