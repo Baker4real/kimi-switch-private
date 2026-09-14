@@ -3,7 +3,7 @@ type: adr
 title: 配额失败被动切换：StopFailure hook 秒级唤起，403 原文即权威耗尽证据
 status: accepted
 tags: [auto-swap, passive-swap, stop-failure-hook, install-hook, credential-health]
-intent: Record the quota-failure passive swap trigger (spec #152 decisions 14-17): Kimi Code 0.42.0 provides the official StopFailure hook channel, reversing CONTEXT.md's old avoidance of "swap on 403"; an observer-only CLI subcommand always exits 0, classifies 403 plus "usage limit" with word-boundary rules, overlays the authoritative exhaustion evidence without touching quota cache, inherits the exhaustion decision semantics via a dedicated serialization lock, installs the hook only through an idempotent install-hook subcommand, and narrows the local credential health check to invalid_grant fingerprints only (JWT exp excluded by an explicit, reversible ruling).
+intent: Record the quota-failure passive swap trigger (spec #152 decisions 14-17): Kimi Code 0.42.0 provides the official StopFailure hook channel, reversing CONTEXT.md's old avoidance of "swap on 403"; an observer-only CLI subcommand always exits 0, classifies "usage limit" as a case-insensitive substring plus a word-boundary 403 token (official copy is "You've reached your ... usage limit"), overlays the authoritative exhaustion evidence without touching quota cache, inherits the exhaustion decision semantics via a dedicated serialization lock, installs the hook only through an idempotent install-hook subcommand, and narrows the local credential health check to invalid_grant fingerprints only (JWT exp excluded by an explicit, reversible ruling). Live 403 is manual acceptance and does not block release.
 documents:
   symbols:
     - classify_stop_failure
@@ -23,8 +23,8 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
 无据抓取变成官方支持的观察路径。规范词定为「配额失败被动切换」（CONTEXT.md 词条），取代
 旧回避词。spec #152 决策 14–17（实现 #158 / #162）。
 
-关键事实（spec 已核实）：配额耗尽 = HTTP 403，5 小时窗 / 7 天窗 / 月度各有明确
-"usage limit" 文案，官方明示重试无意义、会话不销毁；429 仅为瞬时限流/引擎过载，与配额无关。
+关键事实（spec 已核实）：配额耗尽 = HTTP 403，5 小时窗 / 7 天窗 / 月度各有
+"You've reached your ... usage limit" 文案，官方明示重试无意义、会话不销毁；429 仅为瞬时限流/引擎过载，与配额无关。
 
 ## 决策
 
@@ -38,13 +38,15 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
 2. **总开关沿用既有语义。** `auto_swap.enabled` 关闭时被动路径同闸、零副作用——被动切换是
    自动切换的触发源，不是独立功能。
 
-3. **分类：403 ∧ "usage limit"，词边界防误报（#162）。** 纯函数 `classify_stop_failure`
-   对整份事件 JSON 递归扫描：任一字符串含 "usage limit"（大小写不敏感）**且**存在 403
-   信号——数值 403，或任一字符串含**作为独立 token** 的 "403"（前后均非 ASCII 字母数字才
-   算边界；时间戳、request id、行号等数字串里的 "403" 子串不算）。两者缺一归其他：429
-   过载/瞬时限流绝不匹配。官方未枚举事件 JSON 的错误字段，因此不依赖 hook 的 matcher 做
-   过滤，而是在子命令内部对 stdin 原文分类——hook schema 变化最坏只会**漏**触发，不会
-   **误**触发。非合法 JSON 一律归其他。
+3. **分类：403 ∧ "usage limit" 子串，词边界只防 403 误报（#162）。** 纯函数
+   `classify_stop_failure` 对整份事件 JSON 递归扫描：任一字符串含 "usage limit"
+   （大小写不敏感**子串**，不是词边界）**且**存在 403 信号——数值 403，或任一字符串含
+   **作为独立 token** 的 "403"（前后均非 ASCII 字母数字才算边界；时间戳、request id、
+   行号等数字串里的 "403" 子串不算）。词边界只约束 "403"，不约束 "usage limit"。官方现役
+   配额 403 文案形如 `You've reached your 5-hour usage limit...`，仍含该子串；匹配器
+   不另认 `You've reached` 前缀。两者缺一归其他：429 过载/瞬时限流绝不匹配。官方未枚举
+   事件 JSON 的错误字段，因此不依赖 hook 的 matcher 做过滤，而是在子命令内部对 stdin
+   原文分类——hook schema 变化最坏只会**漏**触发，不会**误**触发。非合法 JSON 一律归其他。
 
 4. **窗口辨认是尽力而为。** 从含 "usage limit" 的字符串辨认耗尽窗口（"month" → 月度；
    "5"+"hour" → 5 小时；"7"+"day" → 7 天），辨认不出为 None——只影响权威证据标注哪个
@@ -107,9 +109,12 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
 
 ## 真机验收
 
-发布前在真机完整走一遍，结果回填本节。2026-09-13 发布链与 2026-09-14 复验如下。
+真机 403 正路径按 2026-09-14 用户决定改为**手动验收，不阻塞** #162 / #163 关闭。
+其余项在 2026-09-13 发布链与 2026-09-14 复验中已回填。自动化正路径与并发以 tempdir
+端到端测试为可观察背书。
+
 **未做**：向真机会话或真机 `KIMI_SWITCH_HOME` 注入合成 403（会真实换号）；也未烧配额
-制造 403。正路径与并发仍以 tempdir 端到端测试为可观察背书，真机会话 403 尚未自然发生。
+制造 403。真机会话 403 尚未自然发生，留待之后手动验收。
 
 1. **release CLI（通过）**：`target/release/kimi-switch-cli.exe` 存在（2026-09-13 发布链
    重建；2026-09-14 复验文件仍在，约 7.0 MiB）。hook `command` 指向该绝对路径。
