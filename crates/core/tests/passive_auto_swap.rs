@@ -78,6 +78,11 @@ fn classify_matches_403_usage_limit_and_extracts_window() {
             Some(QuotaWindow::FiveHour),
         ),
         (
+            // 2026-09-11 真机会话 WARN 原文（You've，不是 You have）。
+            r#"{"hook_event_name":"StopFailure","error":{"status":403,"message":"You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends."}}"#,
+            Some(QuotaWindow::FiveHour),
+        ),
+        (
             r#"{"error":{"status_code":403,"message":"7-day usage limit exceeded"}}"#,
             Some(QuotaWindow::SevenDay),
         ),

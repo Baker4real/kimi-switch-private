@@ -105,19 +105,32 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
     Kimi Code 会话真正使用）不进保证范围、不设计观测，至多由写后回读校验
     （ADR-0015 决策 5）间接压缩风险。
 
-## 真机验收（待实机回填）
+## 真机验收
 
-发布前在真机完整走一遍，结果回填本节：
+发布前在真机完整走一遍，结果回填本节。2026-09-13 发布链与 2026-09-14 复验如下。
+**未做**：向真机会话或真机 `KIMI_SWITCH_HOME` 注入合成 403（会真实换号）；也未烧配额
+制造 403。正路径与并发仍以 tempdir 端到端测试为可观察背书，真机会话 403 尚未自然发生。
 
-1. `cargo build --release -p kimi-switch-cli` 构建 release CLI；
-2. 确认 `[auto_swap] enabled = true`；
-3. `kimi-switch-cli install-hook`，检查 `~/.kimi-code/config.toml` 新增 `[[hooks]]`
-   StopFailure 条目、其余内容（注释/顺序/既有条目）未动；
-4. 烧到真实 403 "usage limit"，观察 live 秒级切换与 `audit.log` 的
-   `trigger=passive`；
-5. 负向验证：429 不触发切换；
-6. 多会话并发撞 403 只切一次（锁 + 冷却收敛）；
-7. `install-hook --uninstall` 还原 config.toml。
+1. **release CLI（通过）**：`target/release/kimi-switch-cli.exe` 存在（2026-09-13 发布链
+   重建；2026-09-14 复验文件仍在，约 7.0 MiB）。hook `command` 指向该绝对路径。
+2. **总开关（通过）**：`%APPDATA%\kimi-switch\kimi-switch\config\config.toml` 为
+   `auto_swap = { enabled = true, ... }`。
+3. **install-hook（通过，保持安装）**：`~/.kimi-code/config.toml` 在既有三条用户 hook
+   之后新增一条 `[[hooks]]`：`event = "StopFailure"`、`command` 指向 release CLI 的
+   `on-quota-failure`、`timeout = 10`。2026-09-13 记录原有 90 行配置零改动、重复安装
+   幂等；2026-09-14 复验条目仍在，未执行 `--uninstall`（避免卸掉已武装的兜底）。
+4. **真机 403 正路径（未发生）**：`audit.log` 共 31 条 `auto_swap`、**0** 条
+   `trigger=passive`。126 份会话日志里 "usage limit" + 403 共 32 行，最新一条
+   `2026-09-11T13:45:33Z`（hook 安装于 2026-09-13 之前）。tempdir 正路径：
+   `passive_403_swaps_via_real_activate_despite_grace_and_hold`（live 切到候选、
+   审计 `trigger=passive`、安顿宽限与手动保持期不挡）。
+5. **负向 429 / 畸形 stdin（通过）**：2026-09-13 与 2026-09-14 均向**已安装** release
+   CLI 喂 429 事件与畸形/空 stdin，退出码 0、stdout/stderr 空、`audit.log` 字节与
+   SHA-256 不变。
+6. **并发（测试背书，未做真机多会话）**：
+   `passive_concurrent_triggers_converge_without_oscillation`（5 触发恰 1 切）。
+7. **uninstall（未在真机执行）**：tempdir 覆盖卸载与保留用户其它 hook；真机保持
+   安装，待 403 正路径发生后再考虑还原。
 
 ## Considered Options
 
