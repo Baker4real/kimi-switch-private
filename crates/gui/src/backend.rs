@@ -308,15 +308,17 @@ impl Backend {
             .take()
     }
 
-    /// 导入/授权后顺带打 `/me` 缓存官方昵称；失败忽略，不挡主流程。
-    async fn cache_official_nickname(&self, account: &Account) {
+    /// 导入/授权后顺带打 `/me` 缓存官方资料（昵称 + 会员档位）；失败忽略，不挡主流程。
+    /// 额度查询路径的成功后台 `/me`（见 kimi provider）与这里共同保证
+    /// `official_membership` 缓存新鲜，快照组装经 `apply_cached_membership` 补章。
+    async fn cache_official_profile(&self, account: &Account) {
         let Ok(Some(blob)) = self
             .store
             .get("kimi", account.id.0.as_str(), self.kimi.store_field())
         else {
             return;
         };
-        kimi_switch_kimi::cache_official_nickname_from_blob(
+        kimi_switch_kimi::cache_official_profile_from_blob(
             self.registry.as_ref(),
             &account.id,
             &blob,
@@ -420,7 +422,7 @@ impl Backend {
             .map_err(anyhow::Error::from)
             .context("导入失败：请先在 Kimi Code 里登录账号")?;
         self.registry.set_active("kimi", &account.id)?;
-        self.cache_official_nickname(&account).await;
+        self.cache_official_profile(&account).await;
         let account = account_for_notice(self.registry.as_ref(), account);
         if let Ok(mut removed) =
             AppPaths::resolve().map(|p| RemovedAccounts::load(&p.removed_file()))
@@ -626,7 +628,7 @@ impl Backend {
                 .import_raw(blob, None, Some(false))
                 .map_err(anyhow::Error::from)
                 .context("授权成功但入库失败")?;
-            self.cache_official_nickname(&account).await;
+            self.cache_official_profile(&account).await;
             let account = account_for_notice(self.registry.as_ref(), account);
             self.audit
                 .append(AuditEvent::ok("login", "kimi", Some(account.id.0.as_str())));
@@ -641,7 +643,7 @@ impl Backend {
         // GUI 只把 ReauthError 映成文案，不重解析凭证。
         match self.kimi.replace_account_blob(&target, blob) {
             Ok(account) => {
-                self.cache_official_nickname(&account).await;
+                self.cache_official_profile(&account).await;
                 let account = account_for_notice(self.registry.as_ref(), account);
                 self.audit.append(AuditEvent::ok(
                     "reauth",
@@ -976,10 +978,13 @@ where
         _ => Vec::new(),
     };
 
-    let outcome = kimi_switch_core::quota_snapshot::collect_detailed_focused(
+    let mut outcome = kimi_switch_core::quota_snapshot::collect_detailed_focused(
         provider, "kimi", &ids, cache_path, reason, focus.as_ref(),
     )
     .await;
+    // 官方 `/usages` 移除 `user` 对象（2026-09-14）后查询结果不带档位：用账号
+    // extra 的 `/me` 缓存补章。rows 与自动切换判定共用这批快照，此处一次覆盖。
+    kimi_switch_core::quota_snapshot::apply_cached_membership(&mut outcome.snapshots, accounts);
 
     let mut refreshed: Vec<Option<kimi_switch_core::Result<WebBinding>>> =
         Vec::with_capacity(membership_jobs.len());
@@ -1827,5 +1832,79 @@ mod quota_cache_path_tests {
                 "不得在工作目录写下 quota-cache-missing.json"
             );
         }
+    }
+
+    /// 2026-09-14 官方 `/usages` 移除 `user` 对象后：额度查询结果不带档位，
+    /// 行列组装用账号 extra 的 `/me` 缓存补章——档位名、会员到期轨道所需的
+    /// `membership` 非空链路整条恢复。
+    #[tokio::test]
+    async fn collect_rows_stamp_membership_from_extra_when_quota_lacks_tier() {
+        struct BareQuotaProvider;
+        #[async_trait::async_trait]
+        impl Provider for BareQuotaProvider {
+            async fn activate(&self, _: &AccountId) -> kimi_switch_core::Result<()> {
+                panic!("本测试不切换");
+            }
+            async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
+                // 新形态 /usages：窗口数值照常、membership 恒 None。
+                Ok(vec![Quota {
+                    provider: "kimi".into(),
+                    account_id: id.clone(),
+                    window: QuotaWindow::SevenDay,
+                    used: 1,
+                    limit: 100,
+                    reset_at: None,
+                    status: kimi_switch_core::QuotaStatus::Ok,
+                    note: None,
+                    membership: None,
+                }])
+            }
+        }
+
+        let now = Utc::now();
+        let mut account = Account {
+            provider: "kimi".into(),
+            id: AccountId("alice".into()),
+            label: "alice".into(),
+            active: true,
+            created_at: now,
+            last_used_at: None,
+            extra: serde_json::Map::new(),
+        };
+        // `/me` 后台缓存已落键（档位归一值 + 绑定写入的到期瞬间）。
+        kimi_switch_core::write_official_membership_extra(&mut account.extra, Some("Allegretto"));
+        kimi_switch_core::membership_expiry::write_membership_extra(
+            &mut account.extra,
+            None,
+            Some("2026-09-21T00:00:00Z".parse().unwrap()),
+            Some("2026-09-20T15:12:42Z".parse().unwrap()),
+        );
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let (rows, _stats, snapshots) = collect_account_rows(
+            Arc::new(BareQuotaProvider),
+            None,
+            &[account],
+            &cache_dir.path().join("quota_cache.json"),
+            QuotaCollectReason::Scheduled,
+        )
+        .await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].membership.as_deref(),
+            Some("Allegretto"),
+            "档位来自 extra 缓存补章，展示名照常映射"
+        );
+        assert_eq!(rows[0].membership_expiry.as_deref(), Some("2026-09-20"));
+        assert!(
+            rows[0].membership_remaining_days.is_some(),
+            "会员轨道三要素齐备（membership / expiry / remaining）"
+        );
+        assert_eq!(
+            snapshots[0].membership.as_deref(),
+            Some("LEVEL_INTERMEDIATE"),
+            "快照带归一档位，自动切换档位排序同链恢复"
+        );
     }
 }

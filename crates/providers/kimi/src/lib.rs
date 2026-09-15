@@ -9,7 +9,7 @@ mod paths;
 pub mod device_flow;
 pub mod web_membership;
 
-pub use kimi_usage::cache_official_nickname_from_blob;
+pub use kimi_usage::cache_official_profile_from_blob;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -12,6 +12,12 @@ use crate::model::AccountId;
 /// extra 键：官方昵称（`GET api.kimi.com/coding/v1/me` 的 `nickname`）。
 pub const EXTRA_OFFICIAL_NICKNAME: &str = "official_nickname";
 
+/// extra 键：官方会员档位（`/me` 的 `user_level_name`，或 GetSubscription 的
+/// `membershipLevel`），存 [`crate::membership_expiry::normalize_membership_level`]
+/// 归一后的 `LEVEL_*` 串。2026-09-14 官方 `/usages` 移除 `user` 对象后，这是
+/// 档位的唯一缓存来源。
+pub const EXTRA_OFFICIAL_MEMBERSHIP: &str = "official_membership";
+
 /// 把官方昵称写入 extra：只动 [`EXTRA_OFFICIAL_NICKNAME`]，其它键原样保留。
 pub fn write_official_nickname_extra(extra: &mut Map<String, Value>, nickname: &str) {
     extra.insert(
@@ -57,6 +63,33 @@ pub fn persist_official_nickname(
     })
 }
 
+/// 把官方会员档位写入 extra：先经 [`normalize_membership_level`] 归一，
+/// `Some` 覆写、`None`（含空串）移除该键（降档到免费 / 无档位时旧值不残留）。
+/// 只动 [`EXTRA_OFFICIAL_MEMBERSHIP`]，其它键原样保留。
+pub fn write_official_membership_extra(extra: &mut Map<String, Value>, level: Option<&str>) {
+    match level.and_then(crate::membership_expiry::normalize_membership_level) {
+        Some(normalized) => {
+            extra.insert(
+                EXTRA_OFFICIAL_MEMBERSHIP.to_string(),
+                Value::String(normalized),
+            );
+        }
+        None => {
+            extra.remove(EXTRA_OFFICIAL_MEMBERSHIP);
+        }
+    }
+}
+
+/// 读出归一后的官方会员档位；缺键、非字符串、空/空白都视为未知。
+pub fn official_membership_from_extra(extra: &Map<String, Value>) -> Option<String> {
+    extra
+        .get(EXTRA_OFFICIAL_MEMBERSHIP)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +99,43 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_string(), Value::String((*value).to_string())))
             .collect()
+    }
+
+    #[test]
+    fn membership_extra_normalizes_overwrites_and_removes() {
+        let mut extra = extra_with(&[
+            ("dedup_key", "stable-id"),
+            (EXTRA_OFFICIAL_NICKNAME, "Baker"),
+        ]);
+        // 官网名归一成 LEVEL_* 存档，只动档位键。
+        write_official_membership_extra(&mut extra, Some("Allegretto"));
+        assert_eq!(
+            extra
+                .get(EXTRA_OFFICIAL_MEMBERSHIP)
+                .and_then(Value::as_str),
+            Some("LEVEL_INTERMEDIATE")
+        );
+        assert_eq!(
+            extra.get("dedup_key").and_then(Value::as_str),
+            Some("stable-id")
+        );
+        assert_eq!(
+            extra.get(EXTRA_OFFICIAL_NICKNAME).and_then(Value::as_str),
+            Some("Baker")
+        );
+        assert_eq!(
+            official_membership_from_extra(&extra).as_deref(),
+            Some("LEVEL_INTERMEDIATE")
+        );
+        // None / 空串 → 移除（降档免费不留旧值），读取回到未知。
+        write_official_membership_extra(&mut extra, None);
+        assert!(extra.get(EXTRA_OFFICIAL_MEMBERSHIP).is_none());
+        assert_eq!(official_membership_from_extra(&extra), None);
+        write_official_membership_extra(&mut extra, Some("  "));
+        assert!(extra.get(EXTRA_OFFICIAL_MEMBERSHIP).is_none());
+        // 缺键读取 = 未知。
+        let empty = Map::new();
+        assert_eq!(official_membership_from_extra(&empty), None);
     }
 
     #[test]

@@ -14,8 +14,9 @@
 //! 3. 请求一次 `GetSubscription`；
 //! 4. 只读 `subscription.currentEndTime` / `subscription.nextBillingTime`，
 //!    **忽略 `balances[].expireTime` 与一切月度周期字段**——它们是额度余额
-//!    的有效期，不是会员到期（ADR-0004）；`goods.title` / `membershipLevel`
-//!    仅核对，不落库、不覆盖 `/usages` 档位展示；
+//!    的有效期，不是会员到期（ADR-0004）；`goods.title` 仍仅核对；`membershipLevel`
+//!    自 2026-09-14 起升格为档位缓存来源（`/usages` 移除 `user` 对象后），
+//!    归一后落 extra `official_membership`（见 `write_official_membership_extra`）；
 //! 5. 按 #49 schema 写 extra：读出 Account → 只动三个 membership 键 →
 //!    registry upsert（保留 dedup / scope 等既有键，绝不整体重建）；
 //! 6. 返回展示用到期日（`format_membership_expiry`，东八区日历日）。
@@ -122,6 +123,12 @@ pub(crate) async fn bind_web_at(
     let current_start = read_instant(&payload, "/subscription/currentStartTime");
     let current_end = read_instant(&payload, "/subscription/currentEndTime");
     let next_billing = read_instant(&payload, "/subscription/nextBillingTime");
+    // membershipLevel 从「仅核对」升格为档位缓存来源（2026-09-14 `/usages` 移除
+    // user 对象后，订阅接口与 `/me` 是仅有的官方档位出处），归一后落
+    // `official_membership`；缺失按免费移除旧值。
+    let membership_level = payload
+        .pointer("/subscription/membershipLevel")
+        .and_then(|value| value.as_str());
 
     // 写 extra：网络往返后重读 registry 行再改写，缩小并发窗口；行被并发删除
     // 则清掉刚写的网页 field 再报账号不存在（不留孤儿凭证）。
@@ -136,6 +143,7 @@ pub(crate) async fn bind_web_at(
         }
     };
     write_membership_extra(&mut fresh.extra, current_start, current_end, next_billing);
+    kimi_switch_core::write_official_membership_extra(&mut fresh.extra, membership_level);
     registry.upsert(fresh)?;
 
     let expiry_text = format_membership_expiry(current_end, next_billing);
@@ -192,6 +200,10 @@ pub(crate) async fn refresh_web_membership_at(
     let current_start = read_instant(&payload, "/subscription/currentStartTime");
     let current_end = read_instant(&payload, "/subscription/currentEndTime");
     let next_billing = read_instant(&payload, "/subscription/nextBillingTime");
+    // membershipLevel 与绑定同口径升格为档位缓存来源（`/usages` 已不携带档位）。
+    let membership_level = payload
+        .pointer("/subscription/membershipLevel")
+        .and_then(|value| value.as_str());
 
     // 成功才写 extra：网络往返后重读 registry 行再改写（与绑定同一写序）；
     // 行被并发删除按账号不存在失败——网页凭证是绑定管道写的，不在这里清理。
@@ -202,6 +214,7 @@ pub(crate) async fn refresh_web_membership_at(
             id: target.to_string(),
         })?;
     write_membership_extra(&mut fresh.extra, current_start, current_end, next_billing);
+    kimi_switch_core::write_official_membership_extra(&mut fresh.extra, membership_level);
     registry.upsert(fresh)?;
 
     let expiry_text = format_membership_expiry(current_end, next_billing);
@@ -480,7 +493,12 @@ mod tests {
         );
         assert!(
             !extra_json.contains("membershipLevel"),
-            "档位不落库：{extra_json}"
+            "membershipLevel 原字面量不落库（落的是归一值）：{extra_json}"
+        );
+        // membershipLevel 升格为档位缓存来源：归一成 LEVEL_* 存 extra。
+        assert_eq!(
+            kimi_switch_core::official_membership_from_extra(&bound.extra).as_deref(),
+            Some("LEVEL_INTERMEDIATE")
         );
         assert_eq!(
             membership_expiry_from_extra(&bound.extra).as_deref(),

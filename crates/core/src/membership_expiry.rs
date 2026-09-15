@@ -56,6 +56,30 @@ pub fn prettify_membership(level: &str) -> String {
     }
 }
 
+/// 会员等级串归一化：把 `/me` 的 `user_level_name`（或 GetSubscription 的
+/// `membershipLevel`）统一成决策与展示共用的 `LEVEL_*` 形态。
+///
+/// 背景：官方 `/usages` 于 2026-09-14 移除 `user` 对象（`user.membership.level`
+/// 落空），档位来源迁到 `/me`；官网两处接口对同一档位可能给出 `LEVEL_X`、裸 `X`
+/// 或官网名（Allegretto / Allegro）三种形态，这里收口成一种。未识别的非空值
+/// 原样透传（排序按未知档位靠后、展示按首字母大写），空串返回 `None`（无档位）。
+pub fn normalize_membership_level(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed.strip_prefix("LEVEL_").unwrap_or(trimmed);
+    let canonical = match stripped.to_ascii_uppercase().as_str() {
+        "ANDANTE" => "LEVEL_ANDANTE",
+        "MODERATO" => "LEVEL_MODERATO",
+        "INTERMEDIATE" | "ALLEGRETTO" => "LEVEL_INTERMEDIATE",
+        "ADVANCED" | "ALLEGRO" => "LEVEL_ADVANCED",
+        "TEAM" => "LEVEL_TEAM",
+        _ => return Some(trimmed.to_string()),
+    };
+    Some(canonical.to_string())
+}
+
 /// 会员到期展示日（东八区 `YYYY-MM-DD`）。
 ///
 /// 规则（与官网展示一致，钉 2026-08-31 实抓样例）：
@@ -309,6 +333,45 @@ mod tests {
         assert_eq!(prettify_membership("intermediate"), "Allegretto");
         assert_eq!(prettify_membership("LEVEL_TEAM"), "Team");
         assert_eq!(prettify_membership(""), "");
+    }
+
+    /// `/me` user_level_name 三种形态归一到同一 `LEVEL_*` 串；未识别透传、空串 None。
+    #[test]
+    fn normalize_membership_level_accepts_enum_bare_and_website_names() {
+        // 枚举形态（GetSubscription membershipLevel、旧 /usages 值）
+        assert_eq!(
+            normalize_membership_level("LEVEL_INTERMEDIATE").as_deref(),
+            Some("LEVEL_INTERMEDIATE")
+        );
+        // 裸枚举名与官网名都指向同一档位（Allegretto=INTERMEDIATE、Allegro=ADVANCED）。
+        assert_eq!(
+            normalize_membership_level("Allegretto").as_deref(),
+            Some("LEVEL_INTERMEDIATE")
+        );
+        assert_eq!(
+            normalize_membership_level("allegro").as_deref(),
+            Some("LEVEL_ADVANCED")
+        );
+        assert_eq!(
+            normalize_membership_level("Moderato").as_deref(),
+            Some("LEVEL_MODERATO")
+        );
+        assert_eq!(
+            normalize_membership_level("Andante").as_deref(),
+            Some("LEVEL_ANDANTE")
+        );
+        assert_eq!(
+            normalize_membership_level("Team").as_deref(),
+            Some("LEVEL_TEAM")
+        );
+        // 未识别的非空值原样透传（排序按未知靠后、展示首字母大写），不做猜测。
+        assert_eq!(
+            normalize_membership_level("Ultra Plan").as_deref(),
+            Some("Ultra Plan")
+        );
+        // 空 / 空白 = 无档位。
+        assert_eq!(normalize_membership_level(""), None);
+        assert_eq!(normalize_membership_level("  "), None);
     }
 
     fn extra_with(pairs: &[(&str, &str)]) -> serde_json::Map<String, serde_json::Value> {

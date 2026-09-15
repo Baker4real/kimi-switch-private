@@ -43,8 +43,9 @@ pub use credential_health::{
     locally_invalid_accounts, refresh_fingerprint,
 };
 pub use display_name::{
-    display_name, official_nickname_from_extra, official_nickname_known, persist_official_nickname,
-    write_official_nickname_extra, EXTRA_OFFICIAL_NICKNAME,
+    display_name, official_membership_from_extra, official_nickname_from_extra,
+    official_nickname_known, persist_official_nickname, write_official_membership_extra,
+    write_official_nickname_extra, EXTRA_OFFICIAL_MEMBERSHIP, EXTRA_OFFICIAL_NICKNAME,
 };
 pub use error::{
     BindWebError, Error, ProviderFailure, ProviderKind, QuotaFailure, QuotaFailureKind,
@@ -52,17 +53,17 @@ pub use error::{
 };
 pub use membership_expiry::{
     format_membership_expiry, membership_expiry_from_extra, membership_period_days,
-    membership_remaining_days, membership_start_from_extra, prettify_membership,
-    write_membership_extra, EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME,
-    EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
+    membership_remaining_days, membership_start_from_extra, normalize_membership_level,
+    prettify_membership, write_membership_extra, EXTRA_CURRENT_END_TIME,
+    EXTRA_CURRENT_START_TIME, EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
 };
 pub use model::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
 pub use provider::Provider;
 pub use quota_cache::{CachedEntry, QuotaCache, ValidEntry};
 pub use quota_query::query_quota_with_retry;
 pub use quota_snapshot::{
-    earliest_reset_at, QuotaCollectOutcome, QuotaCollectReason, QuotaCollectStats, QuotaSnapshot,
-    QuotaState,
+    apply_cached_membership, earliest_reset_at, QuotaCollectOutcome, QuotaCollectReason,
+    QuotaCollectStats, QuotaSnapshot, QuotaState,
 };
 pub use remove_account::remove_account;
 pub use removed::RemovedAccounts;

@@ -820,7 +820,8 @@ fn compare_soonest_reset(a_quotas: &[Quota], b_quotas: &[Quota]) -> Ordering {
 /// 未知档位序号：`None` 与未识别枚举。耗尽路径按「排最后」用；回驻干脆不比较（ADR-0008）。
 const UNKNOWN_TIER_RANK: u8 = 5;
 
-/// `/usages` 快照 `membership` 原始字符串的档位优先级。
+/// 快照 `membership` 串（归一 `LEVEL_*` 枚举，2026-09-14 起由 extra 的 `/me`
+/// 缓存补章而来，见 `apply_cached_membership`）的档位优先级。
 /// 序号越小越优先被选中；`None` 与未列出的字符串同为最低优先级（宁晚烧、不错烧高档）。
 ///
 /// 全序按官网档位从低到高。`LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 已与本机

@@ -365,6 +365,26 @@ fn membership_of(quotas: &[Quota]) -> Option<String> {
     })
 }
 
+/// 给缺档位的快照补上账号 extra 缓存的官方档位（`official_membership`）。
+///
+/// 背景：官方 `/usages` 于 2026-09-14 移除 `user` 对象，查询结果不再携带
+/// `user.membership.level`；档位来源迁到 `/me`（缓存在 extra）。快照自带档位
+/// （旧缓存行 / 未来接口回补）仍然优先，缺失时才回退 extra——GUI 档位行、
+/// 会员轨道与自动切换档位排序经此不断档。纯函数、不发网络。
+pub fn apply_cached_membership(snapshots: &mut [QuotaSnapshot], accounts: &[crate::model::Account]) {
+    for snapshot in snapshots.iter_mut() {
+        if snapshot.membership.is_some() {
+            continue;
+        }
+        let Some(account) = accounts.iter().find(|a| a.id == snapshot.account_id) else {
+            continue;
+        };
+        if let Some(level) = crate::display_name::official_membership_from_extra(&account.extra) {
+            snapshot.membership = Some(level);
+        }
+    }
+}
+
 /// 可用快照窗口里最早的 `reset_at`。
 ///
 /// Ready 一律计入；Cached 仅非 stale 计入；Failed 与 stale Cached 不算可用。
@@ -1964,6 +1984,52 @@ mod tests {
 
     fn ready_at(id: &str, reset_at: Option<DateTime<Utc>>) -> QuotaSnapshot {
         snap(id, false, QuotaState::Ready(vec![quota_at(id, reset_at)]))
+    }
+
+    fn account_with_extra(id: &str, extra_pairs: &[(&str, &str)]) -> crate::model::Account {
+        let extra = extra_pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
+            .collect();
+        crate::model::Account {
+            provider: "kimi".into(),
+            id: AccountId(id.into()),
+            label: id.into(),
+            active: false,
+            created_at: utc("2026-09-03T12:00:00Z"),
+            last_used_at: None,
+            extra,
+        }
+    }
+
+    /// 官方 /usages 移除 user 对象后（2026-09-14）：缺档位快照回退 extra 缓存，
+    /// 自带档位（旧缓存行）优先，未知账号 / 无缓存保持 None。
+    #[test]
+    fn apply_cached_membership_fills_missing_tier_from_extra() {
+        let mut with_cache = ready_at("alice", None);
+        with_cache.membership = None;
+        let mut with_own = ready_at("bob", None);
+        with_own.membership = Some("LEVEL_ADVANCED".into());
+        let mut unknown = ready_at("carol", None);
+        unknown.membership = None;
+        let mut snapshots = vec![with_cache, with_own.clone(), unknown];
+        let accounts = vec![
+            account_with_extra("alice", &[("official_membership", "LEVEL_INTERMEDIATE")]),
+            account_with_extra("bob", &[("official_membership", "LEVEL_ANDANTE")]),
+            account_with_extra("carol", &[]),
+        ];
+        apply_cached_membership(&mut snapshots, &accounts);
+        assert_eq!(
+            snapshots[0].membership.as_deref(),
+            Some("LEVEL_INTERMEDIATE"),
+            "缺档位回退 extra 缓存"
+        );
+        assert_eq!(
+            snapshots[1].membership.as_deref(),
+            Some("LEVEL_ADVANCED"),
+            "快照自带档位优先，不被 extra 覆盖"
+        );
+        assert_eq!(snapshots[2].membership, None, "无缓存保持未知");
     }
 
     /// 可用窗口取 `reset_at` 最小值；Failed / stale Cached 不计入。

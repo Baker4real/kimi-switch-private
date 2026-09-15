@@ -290,7 +290,7 @@ async fn status(ctx: &AppContext, json: bool) -> Result<ExitCode> {
     // 2. 额度快照（节流 / 退避 / 并发 / 陈旧回退收口在 core）。
     let cache_path = AppPaths::resolve()?.quota_cache_file();
     let ids: Vec<_> = accounts.iter().map(|account| account.id.clone()).collect();
-    let snapshots = kimi_switch_core::quota_snapshot::collect(
+    let mut snapshots = kimi_switch_core::quota_snapshot::collect(
         ctx.kimi.clone(),
         "kimi",
         &ids,
@@ -298,6 +298,9 @@ async fn status(ctx: &AppContext, json: bool) -> Result<ExitCode> {
         kimi_switch_core::QuotaCollectReason::Scheduled,
     )
     .await;
+    // `/usages` 移除 user 对象（2026-09-14）后查询不带档位：用 extra 的 /me 缓存
+    // 补章（下方渲染与自动切换判定共用这批快照）。
+    kimi_switch_core::apply_cached_membership(&mut snapshots, &accounts);
 
     // 3. 自动切换：开关关闭则短路（零判定、不读冷却文件）。触发时走既有 activate。
     let auto_swap = maybe_run_status_auto_swap(ctx, &accounts, &snapshots).await;
@@ -904,7 +907,7 @@ async fn login(ctx: &AppContext, provider: &str) -> Result<()> {
                 ctx.store
                     .get("kimi", account.id.0.as_str(), ctx.kimi.store_field())
             {
-                kimi_switch_kimi::cache_official_nickname_from_blob(
+                kimi_switch_kimi::cache_official_profile_from_blob(
                     ctx.registry.as_ref(),
                     &account.id,
                     &blob,
@@ -1230,6 +1233,9 @@ async fn run_on_quota_failure_with(
         .iter()
         .filter_map(|account| cached_quota_snapshot(&cache, &account.id))
         .collect();
+    // 缓存行不带档位（/usages 已移除 user 对象）：同样用 extra 的 /me 缓存补章，
+    // 保住被动判定的档位排序与回驻资格。
+    kimi_switch_core::apply_cached_membership(&mut snapshots, &accounts);
 
     // 5. 403 原文 = 当前账号耗尽的权威证据：合成/覆盖当前账号快照后进既有判定。
     //    耗尽语义（冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆、候选本地

@@ -98,22 +98,44 @@ fn quota_from(
     })
 }
 
-/// 从 `/me` JSON 抽取官方昵称。只读 `nickname` 字符串；缺字段、空串、非字符串都视为未知。
-pub fn parse_official_nickname(body: &str) -> Option<String> {
+/// `/me` 里除昵称外还值得缓存的官方资料（原始串，归一在写侧统一做）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfficialProfile {
+    /// 官网昵称；缺字段 / 空串 → `None`（不覆盖既有缓存）。
+    pub nickname: Option<String>,
+    /// 会员档位（`user_level_name`，2026-09-14 起 `/usages` 不再携带档位，
+    /// 这里是档位缓存来源）；空串 → `None`（写侧按降档免费移除缓存）。
+    pub membership_level: Option<String>,
+}
+
+/// 从 `/me` JSON 抽取官方资料（昵称 + 会员档位）。
+///
+/// 与官方 0.43 客户端同口径：缺 `user_id` 视为畸形响应，整体返回 `None`
+/// （不缓存、不清缓存），避免网关错误体把 extra 里的既有档位误清掉。
+pub fn parse_official_profile(body: &str) -> Option<OfficialProfile> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    let raw = value.get("nickname").and_then(|item| item.as_str())?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+    let user_id = value.get("user_id").and_then(|item| item.as_str())?;
+    if user_id.trim().is_empty() {
+        return None;
     }
+    let non_empty = |key: &str| {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(OfficialProfile {
+        nickname: non_empty("nickname"),
+        membership_level: non_empty("user_level_name"),
+    })
 }
 
 /// `/me` 独立短超时：对齐会员 join 预算，远小于 20s 额度超时。超时 = 未知。
 const OFFICIAL_NICKNAME_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn fetch_official_nickname(access_token: &str, api_base: &str) -> Option<String> {
+async fn fetch_official_profile(access_token: &str, api_base: &str) -> Option<OfficialProfile> {
     let url = format!("{}/me", api_base.trim_end_matches('/'));
     let resp = crate::net::send(
         Some(OFFICIAL_NICKNAME_HTTP_TIMEOUT),
@@ -131,11 +153,13 @@ async fn fetch_official_nickname(access_token: &str, api_base: &str) -> Option<S
         return None;
     }
     let body = resp.text().await.ok()?;
-    parse_official_nickname(&body)
+    parse_official_profile(&body)
 }
 
-/// 额度查询或导入成功后顺带缓存官方昵称。`/me` 失败不改变 extra、不失败主流程。
-async fn cache_official_nickname(
+/// 额度查询或导入成功后顺带缓存官方资料（昵称 + 会员档位）。
+/// `/me` 失败或畸形不改变 extra、不失败主流程；成功时昵称缺失保留旧缓存、
+/// 档位缺失（免费）移除旧值。一次 `update_extra` 同时落两键。
+async fn cache_official_profile(
     access_token: &str,
     account_id: &AccountId,
     api_base: &str,
@@ -144,14 +168,22 @@ async fn cache_official_nickname(
     let Some(registry) = registry else {
         return;
     };
-    let Some(nickname) = fetch_official_nickname(access_token, api_base).await else {
+    let Some(profile) = fetch_official_profile(access_token, api_base).await else {
         return;
     };
-    let _ = kimi_switch_core::persist_official_nickname(registry, "kimi", account_id, &nickname);
+    let _ = registry.update_extra("kimi", account_id, |extra| {
+        if let Some(nickname) = &profile.nickname {
+            kimi_switch_core::write_official_nickname_extra(extra, nickname);
+        }
+        kimi_switch_core::write_official_membership_extra(
+            extra,
+            profile.membership_level.as_deref(),
+        );
+    });
 }
 
-/// 导入/授权拿到 blob 后若能取出 access_token，顺带缓存官方昵称。失败忽略。
-pub async fn cache_official_nickname_from_blob(
+/// 导入/授权拿到 blob 后若能取出 access_token，顺带缓存官方资料。失败忽略。
+pub async fn cache_official_profile_from_blob(
     registry: &kimi_switch_core::AccountRegistry,
     account_id: &AccountId,
     blob: &str,
@@ -159,10 +191,13 @@ pub async fn cache_official_nickname_from_blob(
     let Some(access_token) = kimi_switch_engine::extract_access_token(blob) else {
         return;
     };
-    cache_official_nickname(&access_token, account_id, &base_url(), Some(registry)).await;
+    cache_official_profile(&access_token, account_id, &base_url(), Some(registry)).await;
 }
 
 /// 解析 /usages 响应为多窗口 Quota。会员等级写入 `Quota.membership`，并双写 `note`。
+/// 2026-09-14 官方移除响应里的 `user` 对象，生产路径该指针恒为 `None`（档位实际
+/// 来自 `/me` 缓存，见 [`parse_official_profile`] 与快照侧 `apply_cached_membership`）；
+/// 指针保留以兼容旧缓存行与旧接口形态。
 pub fn parse_usages(body: &str, provider: &str, id: &AccountId) -> Vec<Quota> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return vec![];
@@ -249,7 +284,7 @@ async fn fetch_quota_with_active_recovery_at(
         let api_base = api_base.to_string();
         let registry = kimi_switch_core::AccountRegistry::new(registry.path().clone());
         tokio::spawn(async move {
-            cache_official_nickname(&token_for_me, &account_id, &api_base, Some(&registry)).await;
+            cache_official_profile(&token_for_me, &account_id, &api_base, Some(&registry)).await;
         });
     }
     Ok(quotas)
@@ -375,25 +410,83 @@ mod tests {
         }
     }
 
+    async fn wait_official_membership(
+        registry: &kimi_switch_core::AccountRegistry,
+        expected: Option<&str>,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let stored = registry
+                .find("kimi", &AccountId("u-123".into()))
+                .unwrap()
+                .unwrap();
+            let current = kimi_switch_core::official_membership_from_extra(&stored.extra);
+            if current.as_deref() == expected {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timeout waiting for official membership {expected:?}, got {current:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// `/me` 资料解析（2026-09-14 `/usages` 移除 user 后的档位来源）：
+    /// 有 user_id 才算有效响应；昵称与档位独立降级。
     #[test]
-    fn parse_official_nickname_reads_top_level_nickname() {
-        let body = r#"{"nickname":"Forever","userId":"u1"}"#;
-        assert_eq!(parse_official_nickname(body).as_deref(), Some("Forever"));
+    fn parse_official_profile_reads_nickname_and_membership() {
+        // 官方 0.43 客户端口径：snake_case 顶层字段，user_id 是有效性门槛。
+        let body = r#"{"user_id":"u1","nickname":"Baker","user_level_name":"Allegretto","user_level":2}"#;
+        assert_eq!(
+            parse_official_profile(body),
+            Some(OfficialProfile {
+                nickname: Some("Baker".into()),
+                membership_level: Some("Allegretto".into()),
+            })
+        );
+        // 档位空串（免费账号）：档位 None（写侧移除缓存），昵称照常。
+        assert_eq!(
+            parse_official_profile(r#"{"user_id":"u1","nickname":"Baker","user_level_name":""}"#),
+            Some(OfficialProfile {
+                nickname: Some("Baker".into()),
+                membership_level: None,
+            })
+        );
+        // 两字段都缺但 user_id 在：仍是有效响应（不清缓存外的任何东西）。
+        assert_eq!(
+            parse_official_profile(r#"{"user_id":"u1"}"#),
+            Some(OfficialProfile {
+                nickname: None,
+                membership_level: None,
+            })
+        );
     }
 
     #[test]
-    fn parse_official_nickname_missing_or_blank_is_unknown() {
-        assert_eq!(parse_official_nickname(r#"{"userId":"u1"}"#), None);
-        assert_eq!(parse_official_nickname(r#"{"nickname":""}"#), None);
-        assert_eq!(parse_official_nickname(r#"{"nickname":"   "}"#), None);
-        assert_eq!(parse_official_nickname(r#"{"nickname":1}"#), None);
-        assert_eq!(parse_official_nickname("not-json"), None);
+    fn parse_official_profile_nickname_degrades_independently() {
+        // 昵称缺字段 / 空串 / 非字符串都视为未知（None），不挡档位读取。
+        for body in [
+            r#"{"user_id":"u1","user_level_name":"Allegro"}"#,
+            r#"{"user_id":"u1","nickname":"","user_level_name":"Allegro"}"#,
+            r#"{"user_id":"u1","nickname":"   ","user_level_name":"Allegro"}"#,
+            r#"{"user_id":"u1","nickname":1,"user_level_name":"Allegro"}"#,
+        ] {
+            let profile = parse_official_profile(body).expect("user_id 在即有效响应");
+            assert_eq!(profile.nickname, None, "昵称按未知降级：{body}");
+            assert_eq!(profile.membership_level.as_deref(), Some("Allegro"));
+        }
     }
 
     #[test]
-    fn parse_official_nickname_ignores_other_profile_fields() {
-        let body = r#"{"nickname":"Forever","phone":"+86","email":"a@b.c","avatar":"http://x","user_level_name":"Allegro"}"#;
-        assert_eq!(parse_official_nickname(body).as_deref(), Some("Forever"));
+    fn parse_official_profile_without_user_id_is_malformed() {
+        // 缺 user_id（网关错误体 / 形状变更）：整体 None，不进缓存路径。
+        assert_eq!(
+            parse_official_profile(r#"{"nickname":"Baker","user_level_name":"Allegro"}"#),
+            None
+        );
+        assert_eq!(parse_official_profile(r#"{"user_id":""}"#), None);
+        assert_eq!(parse_official_profile(r#"{"user_id":1}"#), None);
+        assert_eq!(parse_official_profile("not-json"), None);
     }
 
     #[tokio::test]
@@ -452,7 +545,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(4),
-            cache_official_nickname(
+            cache_official_profile(
                 "tok",
                 &AccountId("u-123".into()),
                 server.base_url(),
@@ -483,7 +576,7 @@ mod tests {
                 "200 OK",
                 r#"{"usage":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"}}"#,
             ),
-            ("200 OK", r#"{"nickname":"Forever","phone":"+86"}"#),
+            ("200 OK", r#"{"user_id":"u-123","nickname":"Forever","phone":"+86","user_level_name":"Allegro"}"#),
         ]);
 
         let quotas = fetch_quota_with_active_recovery_at(
@@ -500,6 +593,8 @@ mod tests {
         assert_eq!(quotas[0].used, 4);
         wait_received(&server, 2).await;
         wait_official_nickname(&registry, Some("Forever")).await;
+        // 同一次 /me 顺带缓存档位（官网名 Allegro 归一成 LEVEL_ADVANCED）。
+        wait_official_membership(&registry, Some("LEVEL_ADVANCED")).await;
         let stored = registry
             .find("kimi", &AccountId("u-123".into()))
             .unwrap()
@@ -568,7 +663,7 @@ mod tests {
                 "200 OK",
                 r#"{"usage":{"limit":"100","used":"7","remaining":"93","resetTime":"2026-07-24T07:52:15Z"}}"#,
             ),
-            ("200 OK", r#"{"nickname":"Forever"}"#),
+            ("200 OK", r#"{"user_id":"u-123","nickname":"Forever","user_level_name":"Allegretto"}"#),
         ]);
 
         fetch_quota_with_active_recovery_at(

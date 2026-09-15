@@ -60,7 +60,7 @@ _Avoid_: parked（仅代码内部名）, 非当前账号, 闲置账号
 _Avoid_: 昵称, folder name
 
 **官方昵称**:
-Kimi 官网账号的显示名。在导入、设备码授权、重新授权、额度查询这些既有官方流程里，额外请求一次 `GET https://api.kimi.com/coding/v1/me`，只把响应里的 `nickname` 字符串缓存到账号 extra（键 `official_nickname`）。不是 JWT claim，也不是 `/usages` 的 `user`。请求走已在白名单的 `api.kimi.com`（与额度查询同一 Code OAuth access token），不是 `www.kimi.com`。`/me` 失败保留旧缓存、不失败主流程。切换不请求。本软件内只读、不参与切换。界面上辨认账号时优先于别名。
+Kimi 官网账号的显示名。在导入、设备码授权、重新授权、额度查询这些既有官方流程里，额外请求一次 `GET https://api.kimi.com/coding/v1/me`，把响应里的 `nickname` 字符串缓存到账号 extra（键 `official_nickname`），同一次请求顺带把 `user_level_name` 归一缓存为会员档位（键 `official_membership`，见「会员等级」）。不是 JWT claim，也不是 `/usages` 的 `user`。请求走已在白名单的 `api.kimi.com`（与额度查询同一 Code OAuth access token），不是 `www.kimi.com`。`/me` 失败保留旧缓存、不失败主流程。切换不请求。本软件内只读、不参与切换。界面上辨认账号时优先于别名。
 _Avoid_: 官方名称, nickname（对用户）, 网页 /me
 
 **显示名**:
@@ -160,7 +160,7 @@ _Avoid_: OAuth 登录（对用户）, device login
 _Avoid_: 续命, 重新登录, 换绑
 
 **会员等级**:
-官网订阅档位名（如 Allegretto、Allegro）。`/usages` 给的是 `LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 等内部枚举，GUI 展示层映射成官网名。档位全序按官网从低到高（Andante → Moderato → Allegretto → Allegro → Team）；在自动切换候选排序中可作为偏好键。展示仍用官网名，决策用快照上原始 `/usages` 字符串。快照无档位（`None`）与未识别官方枚举排最后。
+官网订阅档位名（如 Allegretto、Allegro）。官方 2026-09-14 起 `/usages` 响应移除 `user` 对象、不再携带档位；档位来源迁到 `/me` 的 `user_level_name`（额度查询成功后的既有后台 `/me`、导入/授权流程、以及 GetSubscription 的 `membershipLevel` 都会写入账号 extra 键 `official_membership`，归一成 `LEVEL_INTERMEDIATE` / `LEVEL_ADVANCED` 等内部枚举串）。快照组装（GUI 行列与 CLI 列表/判定）经 `apply_cached_membership` 用该缓存补章；查询结果自带档位（旧缓存行）仍优先。GUI 展示层把枚举映射成官网名。档位全序按官网从低到高（Andante → Moderato → Allegretto → Allegro → Team）；在自动切换候选排序中可作为偏好键。展示仍用官网名，决策用归一后的枚举串。快照无档位（`None`）与未识别枚举排最后。
 _Avoid_: 套餐, plan；用户可见文案不要写 Intermediate / Advanced
 
 **会员到期**:
