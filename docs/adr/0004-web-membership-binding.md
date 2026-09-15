@@ -67,8 +67,12 @@ extra，默认列表即出现「有效期至」。展示格式化与读侧 schem
    `currentEndTime` / `nextBillingTime`，夹具含 `expireTime` 干扰项并由测试
    钉住；`currentStartTime` 为会员轨道已度过比例提供真实周期长度，月付/年付
    不按档位猜测）。同理
-   `goods.title` / `membershipLevel` 仅核对参考，不落库——档位展示仍以
-   `/usages` 的 `user.membership.level` 为准，避免两处数据源打架。
+   `goods.title` 仅核对参考，不落库。`membershipLevel` 原同样仅核对；
+   2026-09-15 起升格为档位缓存来源（官方 0.43.0 移除 `/usages` 的
+   `user` 对象、`user.membership.level` 不复存在，档位迁 `/me`
+   `user_level_name` 与本接口的 `membershipLevel` 双路写入 extra
+   `official_membership`，归一成 `LEVEL_*` 后由快照补章消费），
+   见 CONTEXT.md「会员等级」与 c337e33。
 
 ## 身份门与写序
 
