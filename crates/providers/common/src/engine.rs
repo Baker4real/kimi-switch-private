@@ -17,6 +17,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use kimi_switch_core::error::{Error, Result};
+use kimi_switch_core::membership_expiry::{
+    EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME, EXTRA_NEXT_BILLING_TIME,
+};
 use kimi_switch_core::swap::{swap_with_snapshot_protected, SwapTarget};
 use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, Provider, Quota};
 
@@ -207,6 +210,20 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                     self.runtime.store_field(),
                 );
                 self.registry.remove(self.runtime.id(), &ex.id)?;
+            }
+            // blob metadata 不含会员到期键；整表重建 extra 时把已有三键带回去，
+            // 避免 GUI 导入 / CLI login 把绑定写入的到期日清掉（ADR-0004 修订）。
+            for key in [
+                EXTRA_CURRENT_START_TIME,
+                EXTRA_CURRENT_END_TIME,
+                EXTRA_NEXT_BILLING_TIME,
+            ] {
+                if extra.contains_key(key) {
+                    continue;
+                }
+                if let Some(value) = ex.extra.get(key) {
+                    extra.insert(key.to_string(), value.clone());
+                }
             }
         }
 
@@ -1170,6 +1187,76 @@ mod tests {
         assert_eq!(account.id.0, "u1");
         assert!(account.active);
         assert!(p.test_store_get("u1").unwrap().contains("A1"));
+    }
+
+    /// 导入/登录从 blob metadata 整表重建 extra 时，必须把已有会员到期三键带回去。
+    /// 真机：当前账号走 GUI 导入 / CLI login 后轨道消失，停泊账号没走过导入所以还在。
+    #[test]
+    fn import_active_keeps_membership_expiry_extra_keys() {
+        use kimi_switch_core::membership_expiry::{
+            EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME, EXTRA_NEXT_BILLING_TIME,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(
+            p.test_live_path(),
+            r#"{"uid":"u1","access_token":"A1"}"#,
+        )
+        .unwrap();
+        p.import_active(None).unwrap();
+
+        let mut bound = p
+            .test_list_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|account| account.id.0 == "u1")
+            .expect("imported u1");
+        bound.extra.insert(
+            EXTRA_CURRENT_END_TIME.into(),
+            serde_json::Value::String("2027-08-28T00:00:00Z".into()),
+        );
+        bound.extra.insert(
+            EXTRA_NEXT_BILLING_TIME.into(),
+            serde_json::Value::String("2027-08-27T01:25:37.930341Z".into()),
+        );
+        bound.extra.insert(
+            EXTRA_CURRENT_START_TIME.into(),
+            serde_json::Value::String("2026-08-28T00:00:00Z".into()),
+        );
+        p.test_registry_upsert(bound).unwrap();
+
+        fs::write(
+            p.test_live_path(),
+            r#"{"uid":"u1","access_token":"A2"}"#,
+        )
+        .unwrap();
+        p.import_active(None).unwrap();
+
+        let extra = p
+            .test_list_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|account| account.id.0 == "u1")
+            .expect("re-imported u1")
+            .extra;
+        assert_eq!(
+            extra.get(EXTRA_CURRENT_END_TIME).and_then(|v| v.as_str()),
+            Some("2027-08-28T00:00:00Z")
+        );
+        assert_eq!(
+            extra.get(EXTRA_NEXT_BILLING_TIME).and_then(|v| v.as_str()),
+            Some("2027-08-27T01:25:37.930341Z")
+        );
+        assert_eq!(
+            extra.get(EXTRA_CURRENT_START_TIME).and_then(|v| v.as_str()),
+            Some("2026-08-28T00:00:00Z")
+        );
+        assert!(
+            p.test_store_get("u1").unwrap().contains("A2"),
+            "Code blob 仍要换成这次导入的新凭证"
+        );
     }
 
     // --- 读 blob：store 错误处理顺序（不抢先冒泡，先试 legacy）---

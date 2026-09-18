@@ -21,17 +21,17 @@
 //!    registry upsert（保留 dedup / scope 等既有键，绝不整体重建）；
 //! 6. 返回展示用到期日（`format_membership_expiry`，东八区日历日）。
 //!
-//! 网页会员请求的完整触发口径（#52，根 Agent 裁定）：只发生在两处——
-//! 绑定（[`bind_web`]，#50）与用户发起刷新（GUI 行列组装的
+//! 网页会员请求的完整触发口径（#52 + 导入补读）：发生在三处——
+//! 绑定（[`bind_web`]，#50）、用户发起刷新（GUI 行列组装的
 //! `QuotaCollectReason::UserInitiated` 路径对已绑定账号调用
-//! [`refresh_web_membership`]，缓存日历日无论新旧、含已过期都请求）。
-//! Scheduled / 静默额度收集 / 启动加载 / 操作（swap / import / 绑定等）
-//! 后再列一律 0 次网页请求。
+//! [`refresh_web_membership`]，缓存日历日无论新旧、含已过期都请求）、
+//! 以及导入 / 登录后对已绑定账号的一次补读（[`restore_membership_after_import`]）。
+//! Scheduled / 静默额度收集 / 启动加载 / swap 后再列仍是 0 次网页请求。
 //!
 //! 取消续费但 active 的订阅照常返回到期日，不产生「已取消」语义。
 //! 请求固定发往 `www.kimi.com`（常量，无环境变量覆写），UA 用 `kimi-switch`；
 //! 错误文案一律英文且不含 token。本模块不被 `swap` / `activate` / 额度查询
-//! 路径调用（网页接口只属于绑定与用户发起的刷新）。
+//! 路径调用（网页接口只属于绑定、用户发起的刷新、以及导入/登录后的补读）。
 
 use std::time::Duration;
 
@@ -156,13 +156,15 @@ pub(crate) async fn bind_web_at(
 
 /// 仅刷新已绑定账号的会员到期（issue #52，生产入口，固定 [`MEMBERSHIP_BASE_URL`]）。
 ///
-/// 触发口径（#52）：只在用户发起刷新（`QuotaCollectReason::UserInitiated` 的
-/// GUI 行列组装路径）对已绑定账号调用；缓存日历日无论新旧（含已过期）都重打
-/// `GetSubscription`。Scheduled / 静默收集 / 启动加载 / 操作后再列不得调用。
+/// 触发口径（#52）：用户发起刷新（`QuotaCollectReason::UserInitiated` 的
+/// GUI 行列组装路径）对已绑定账号调用；导入 / 登录补读走
+/// [`restore_membership_after_import`]（内部调用本函数的注入式版本）。
+/// 缓存日历日无论新旧（含已过期）都重打 `GetSubscription`。
+/// Scheduled / 静默收集 / 启动加载 / swap 后再列不得调用。
 ///
 /// 与绑定的差异：网页凭证已由绑定管道写好，这里不再做身份门、不写网页 field，
 /// 只用已存 token 重打一次 `GetSubscription`——成功则按 #49 schema 重写 extra
-/// 两个键（日期可能更新；订阅已无到期数据时清掉旧键）；任何失败（网络 / HTTP /
+/// 三个会员到期键（日期可能更新；订阅已无到期数据时清掉旧键）；任何失败（网络 / HTTP /
 /// 解析，含 401 类网页 token 失效）extra 与网页凭证原样不动、返回英文错误
 /// （不含 token）。缓存降级语义（行内保留旧日期 + 绑定提示再现）由 GUI 层承接，
 /// 本层不删任何已有数据。
@@ -223,6 +225,35 @@ pub(crate) async fn refresh_web_membership_at(
         expiry_text,
         period_days,
     })
+}
+
+/// 导入 / 登录后：若该账号已有网页绑定，补打一次 `GetSubscription` 把会员到期 extra 写回。
+///
+/// 未绑定不发请求；刷新失败不失败主流程（extra 若已由导入合并保留则仍在，
+/// 若早已缺失则等用户点刷新或重新绑定）。
+pub async fn restore_membership_after_import(
+    registry: &AccountRegistry,
+    store: &dyn CredentialStore,
+    target: &AccountId,
+) {
+    restore_membership_after_import_at(registry, store, target, MEMBERSHIP_BASE_URL).await;
+}
+
+/// 注入式导入后补读；生产走 [`restore_membership_after_import`]。
+pub(crate) async fn restore_membership_after_import_at(
+    registry: &AccountRegistry,
+    store: &dyn CredentialStore,
+    target: &AccountId,
+    base_url: &str,
+) {
+    let bound = matches!(
+        store.get(PROVIDER_ID, target.0.as_str(), WEB_STORE_FIELD),
+        Ok(Some(_))
+    );
+    if !bound {
+        return;
+    }
+    let _ = refresh_web_membership_at(registry, store, target, base_url).await;
 }
 
 /// 网页 JWT 身份辨认：payload 的 `sub`（回退 `user_id`）。
@@ -937,6 +968,95 @@ mod tests {
             "期望 AccountNotFound：{err}"
         );
         assert!(server.finish().is_empty());
+    }
+
+    /// 导入后补读：已绑定但 extra 到期键已空（导入整表重建的现场）→ 打一次
+    /// GetSubscription 写回到期日；网页凭证不动。
+    #[tokio::test]
+    async fn restore_after_import_fills_expiry_when_web_bound() {
+        let h = Harness::new();
+        h.seed("u1");
+        h.store
+            .set("kimi", "u1", WEB_STORE_FIELD, &token_for("u1"))
+            .unwrap();
+        assert_eq!(
+            membership_expiry_from_extra(&h.bound_account("u1").extra),
+            None
+        );
+        let server = MockServer::start(vec![("200 OK", SUBSCRIPTION_FIXTURE)]);
+
+        restore_membership_after_import_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            server.base_url(),
+        )
+        .await;
+
+        assert_eq!(
+            membership_expiry_from_extra(&h.bound_account("u1").extra).as_deref(),
+            Some("2027-08-27")
+        );
+        assert_eq!(
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
+            Some(token_for("u1").as_str())
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    /// 导入后补读：未绑定不打网络、extra 不动。
+    #[tokio::test]
+    async fn restore_after_import_skips_unbound() {
+        let h = Harness::new();
+        let seeded = h.seed("u1");
+        let server = MockServer::start(vec![]);
+
+        restore_membership_after_import_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            server.base_url(),
+        )
+        .await;
+
+        assert_eq!(h.bound_account("u1").extra, seeded.extra);
+        assert!(server.finish().is_empty());
+    }
+
+    /// 导入后补读：已绑定但 GetSubscription 失败 → 不失败调用方，extra 与网页
+    /// 凭证原样保留。
+    #[tokio::test]
+    async fn restore_after_import_ignores_refresh_failure() {
+        let h = Harness::new();
+        h.seed("u1");
+        h.store
+            .set("kimi", "u1", WEB_STORE_FIELD, &token_for("u1"))
+            .unwrap();
+        let server = MockServer::start(vec![("401 Unauthorized", r#"{"code":"unauthorized"}"#)]);
+
+        restore_membership_after_import_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            server.base_url(),
+        )
+        .await;
+
+        assert_eq!(
+            membership_expiry_from_extra(&h.bound_account("u1").extra),
+            None
+        );
+        assert_eq!(
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
+            Some(token_for("u1").as_str())
+        );
+        assert_eq!(server.finish().len(), 1);
     }
 
     /// 生产入口域名固定为 `www.kimi.com`（ADR-0004：不做环境变量覆写）。

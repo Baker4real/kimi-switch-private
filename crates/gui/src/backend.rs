@@ -423,6 +423,12 @@ impl Backend {
             .context("导入失败：请先在 Kimi Code 里登录账号")?;
         self.registry.set_active("kimi", &account.id)?;
         self.cache_official_profile(&account).await;
+        web_membership::restore_membership_after_import(
+            self.registry.as_ref(),
+            self.store.as_ref(),
+            &account.id,
+        )
+        .await;
         let account = account_for_notice(self.registry.as_ref(), account);
         if let Ok(mut removed) =
             AppPaths::resolve().map(|p| RemovedAccounts::load(&p.removed_file()))
@@ -921,8 +927,9 @@ fn skipped_quota_cache_path() -> std::path::PathBuf {
 /// （用户点「刷新」）对已绑定账号并发刷新会员到期（与额度收集并行发起，单请求
 /// 超时 15s；join 阶段另受 [`MEMBERSHIP_JOIN_BUDGET`] 总预算约束，网页挂起
 /// 不得拖死整次刷新），缓存日历日无论新旧（含已过期）都请求；Scheduled（启动
-/// 加载 / 静默收集 / swap / import / 绑定等操作后再列）完全不发网页请求。会员
-/// 刷新失败只降级为行内绑定提示（日期 + hint 共存），不影响额度行、不计告急、
+/// 加载 / 静默收集 / swap 后再列）完全不发网页请求。导入 / 登录在 snapshot
+/// 之前对已绑定账号单独补读一次，不走本函数。会员刷新失败只降级为行内绑定
+/// 提示（日期 + hint 共存），不影响额度行、不计告急、
 /// 不置凭证待续期。后端快照不写会员 toast；GUI 用户点刷新后自行聚合瞬时提示。
 /// 既有全量收集入口（兼容形态）：等价于 [`collect_account_rows_scoped`] 传
 /// `current_only = false`。生产路径已改走 scoped 版本，本 wrapper 只服务既有测试。

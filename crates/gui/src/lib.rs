@@ -851,8 +851,8 @@ mod tests {
     }
 
     /// Scheduled（启动加载 / 静默收集 / swap 等操作后再列）两次收集：网页会员
-    /// 请求 0 次（#52 验收 1 与 swap 红线——swap / import / 绑定后的再列出
-    /// 全部走 Scheduled reason，网页路径只在 UserInitiated 打开）。
+    /// 请求 0 次（#52 验收 1 与 swap 红线——再列出走 Scheduled；GetSubscription
+    /// 只在 UserInitiated 刷新，以及绑定 / 已绑定账号的导入补读，不经本收集路径）。
     #[tokio::test]
     async fn scheduled_collect_makes_no_web_membership_request() {
         let dir = tempfile::tempdir().unwrap();

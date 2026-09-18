@@ -914,6 +914,12 @@ async fn login(ctx: &AppContext, provider: &str) -> Result<()> {
                 )
                 .await;
             }
+            kimi_switch_kimi::web_membership::restore_membership_after_import(
+                ctx.registry.as_ref(),
+                ctx.store.as_ref(),
+                &account.id,
+            )
+            .await;
             if let Ok(mut removed) = AppContext::load_removed() {
                 if let Err(e) = removed.clear("kimi", account.id.0.as_str()) {
                     tracing::warn!(err=%e, "failed to clear removed-account marker");

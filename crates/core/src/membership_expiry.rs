@@ -179,6 +179,7 @@ pub fn membership_expiry_from_extra(
 /// 契约（与读侧 schema 对齐）：
 /// - **只动三个 membership 键**，保留 dedup / scope 等其他既有键——调用方
 ///   必须走「读出 Account → 改 extra → registry upsert」路径，不得整体重建 extra；
+///   导入 Code blob 时引擎会重建 extra，但须把这三键从旧 extra 合并回去（ADR-0004）；
 /// - `None` 的瞬间移除对应键：重新绑定后旧日期不得残留（比如会员已到期）；
 /// - 值格式化为 RFC3339 UTC 字符串（AutoSi 精度：整秒无小数、亚秒保留实际位数，
 ///   与官网响应字面量一致），读侧按原样解析。

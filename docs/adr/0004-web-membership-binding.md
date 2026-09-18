@@ -14,6 +14,7 @@ documents:
     - web
   symbols:
     - write_membership_extra
+    - restore_membership_after_import
     - WEB_STORE_FIELD
 ---
 # 绑定网页登录：会员到期读取的凭证分离与身份门
@@ -36,8 +37,10 @@ extra，默认列表即出现「有效期至」。展示格式化与读侧 schem
    UA），超时 15s。域名是固定常量（`web_membership::MEMBERSHIP_BASE_URL`），
    不做环境变量覆写；本票的网络白名单因此扩为
    `auth.kimi.com` / `api.kimi.com` / `www.kimi.com`（最后者仅限本路径，
-   见 AGENTS.md 规则 2，同一变更集修订）。请求节奏只有「绑定时一次」；
-   后续刷新（何时重读、何时静默）是 #52 的决策空间，本票不预设。
+   见 AGENTS.md 规则 2，同一变更集修订）。
+   请求节奏在本票落地时只有「绑定时一次」；#52 把用户点刷新纳入重读，
+   静默收集仍不打该接口。2026-09-18 起已绑定账号的导入/login 也会补读
+   （见下方写序）。
 
 2. **为何网页消费者凭证与 Code OAuth 分离存储**：网页 token 与 Code OAuth
    blob 是两套不同信任域的凭证（签发对象、scope、生命周期都不同），任何一侧
@@ -85,9 +88,10 @@ extra，默认列表即出现「有效期至」。展示格式化与读侧 schem
 身份已验证，token 即有效绑定），再请求 `GetSubscription`；会员读取失败（网络/
 HTTP）不回滚网页 field——到期日期可由重试或 #52 的刷新补齐，回滚反而把用户
 刚验证过的凭证丢掉。extra 写入走「读出 Account → 只动三个 membership 键 →
-registry upsert」，保留 dedup / scope 等既有键；导入/同步路径从 metadata 整体
-重建 extra 的既有行为不变（重建后到期日缺失，展示回退绑定弱提示，等下次读取
-补齐）。`None` 的瞬间移除对应键：重新绑定后旧日期不得残留。
+registry upsert」，保留 dedup / scope 等既有键；导入/登录仍从 blob metadata
+整体重建 extra，但会把已有的三个会员到期键合并回去。若该账号网页 field 仍在，
+导入成功后再补打一次 `GetSubscription` 写回到期日（未绑定不请求，失败不挡导入）。
+`None` 的瞬间移除对应键：重新绑定后旧日期不得残留。
 
 取消续费但 active 的订阅照常返回到期日，不产生「已取消」语义（夹具
 `SUBSCRIPTION_STATUS_CANCEL` + `active: true` 由测试钉住）。删除账号时
