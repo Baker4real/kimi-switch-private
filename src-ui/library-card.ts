@@ -41,13 +41,16 @@ function profileStatusHtml(row: AccountRow): string {
 /** 账号库一张卡的 HTML。busy 只用于首绘；之后由 listedActionSelector 就地改 disabled。 */
 export function accountCardHtml(row: AccountRow, busy: boolean): string {
   const plan = membershipPlanHtml(row) ?? "";
+  /* 长名补读（issue #167）：标题单行省略归 CSS，完整显示名写进 title 供悬停/读屏；
+   * 值沿用 accountDisplayName 后端单一出处，前端不重推官方昵称优先级。 */
+  const displayName = accountDisplayName(row, row.id);
   return `<article class="profile-card${row.active ? " is-current" : ""}" ${accountFocusAttr(row.id)}>
         ${renameOverflowHtml(row, busy)}
         <div class="profile-identity">
           <span class="profile-avatar" aria-hidden="true">${escapeHtml(displayInitial(row.display_name))}</span>
           <div class="profile-identity-copy">
             <div class="profile-title-row">
-              <span class="profile-title">${escapeHtml(accountDisplayName(row, row.id))}</span>
+              <span class="profile-title" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</span>
               ${currentAccountChipHtml(row.active)}
             </div>
             <span class="profile-plan">${plan}${bindWebButtonHtml(row, busy)}</span>

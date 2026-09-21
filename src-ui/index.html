@@ -246,7 +246,7 @@
                 <div class="settings-row settings-row--switch">
                   <div class="settings-copy">
                     <span id="renewal-toggle-label">当前账号主动续期</span>
-                    <p class="settings-note" id="renewal-toggle-note">仅在 Windows 生效。允许本工具为当前账号主动续期登录凭证；极端情况下官方会话可能要求重新登录。本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」。</p>
+                    <p class="settings-note" id="renewal-toggle-note">默认关闭。开启后，额度查询前允许本工具为当前账号主动续期登录凭证，不等官方客户端的懒刷新；仅在 Windows 生效。极端情况下官方会话可能要求重新登录；本工具与官方客户端同时轮换时，可能一次性误报「凭证待续期」。</p>
                   </div>
                   <button id="renewal-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="renewal-toggle-label" aria-describedby="renewal-toggle-note">
                     <span class="switch-thumb" aria-hidden="true"></span>
@@ -255,51 +255,57 @@
                 <div class="settings-row settings-row--switch">
                   <div class="settings-copy">
                     <span id="auto-swap-toggle-label">额度耗尽自动切换</span>
-                    <p class="settings-note" id="auto-swap-toggle-note">当前账号任一额度窗口达到阈值时，自动切到合格停泊账号（默认按已用比例升序）。默认关闭。</p>
+                    <p class="settings-note" id="auto-swap-toggle-note">默认关闭。开启后，每次额度查询完成后检查当前账号：任一额度窗口已用达到阈值时，自动切换到合格的停泊账号（写入路径与手动切换相同，默认按已用比例升序）；额度查询失败或数据未知时不触发。停泊账号：账号库里除当前账号外、未接入 Kimi Code 使用的其余账号。下方子开关需先开启本开关才能调整，只影响自动切换的判定与排序，不影响手动切换。</p>
                   </div>
                   <button id="auto-swap-toggle" class="switch" type="button" role="switch" aria-checked="false" aria-labelledby="auto-swap-toggle-label" aria-describedby="auto-swap-toggle-note">
                     <span class="switch-thumb" aria-hidden="true"></span>
                   </button>
                 </div>
+                <!-- 子开关依赖原因行（issue #166）：默认总开关关，静态首帧即可见；paint 层按总开关显隐并维护 aria 关联。 -->
+                <p id="auto-swap-subswitch-requirement" class="settings-note auto-swap-subswitch-requirement">需先开启「额度耗尽自动切换」，以下子开关才能调整；已保存的子开关设置会保留，待总开关开启后生效。</p>
                 <div class="settings-row settings-row--switch settings-row--nested">
                   <div class="settings-copy">
                     <span id="auto-swap-prefer-lower-tier-toggle-label">自动切换时优先低档位账号</span>
-                    <p class="settings-note" id="auto-swap-prefer-lower-tier-toggle-note">开启后，额度耗尽自动切换时优先选择更低档位的停泊账号。默认关闭。</p>
+                    <p class="settings-note" id="auto-swap-prefer-lower-tier-toggle-note">默认关闭。开启后，额度耗尽自动切换挑选目标时优先选会员档位更低的停泊账号，同档位再按已用比例从低到高；只改变自动切换的挑选顺序，不影响手动切换。</p>
                   </div>
-                  <button id="auto-swap-prefer-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-prefer-lower-tier-toggle-label" aria-describedby="auto-swap-prefer-lower-tier-toggle-note">
+                  <button id="auto-swap-prefer-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-prefer-lower-tier-toggle-label" aria-describedby="auto-swap-prefer-lower-tier-toggle-note auto-swap-subswitch-requirement">
                     <span class="switch-thumb" aria-hidden="true"></span>
                   </button>
                 </div>
                 <div class="settings-row settings-row--switch settings-row--nested">
                   <div class="settings-copy">
                     <span id="auto-swap-resident-lower-tier-toggle-label">额度恢复后回驻低档账号</span>
-                    <p class="settings-note" id="auto-swap-resident-lower-tier-toggle-note">开启后，当前账号未耗尽但更低档位停泊账号额度可用时，自动切回其中档位最低者。手动切换后 8 小时内不回驻。默认关闭。</p>
+                    <p class="settings-note" id="auto-swap-resident-lower-tier-toggle-note">默认关闭。开启后，当前账号未达耗尽阈值、且账号库里存在档位更低的合格停泊账号（额度可用）时，自动把当前账号换回其中档位最低者；回驻前目标需连续多个快照周期保持合格，手动切换后 8 小时内不回驻。</p>
                   </div>
-                  <button id="auto-swap-resident-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-resident-lower-tier-toggle-label" aria-describedby="auto-swap-resident-lower-tier-toggle-note">
+                  <button id="auto-swap-resident-lower-tier-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-resident-lower-tier-toggle-label" aria-describedby="auto-swap-resident-lower-tier-toggle-note auto-swap-subswitch-requirement">
                     <span class="switch-thumb" aria-hidden="true"></span>
                   </button>
                 </div>
                 <div class="settings-row settings-row--switch settings-row--nested">
                   <div class="settings-copy">
                     <span id="auto-swap-pace-pre-swap-toggle-label">pace 预切换</span>
-                    <p class="settings-note" id="auto-swap-pace-pre-swap-toggle-note">开启后，当前账号未达耗尽阈值但预测撑不到重置时，自动提前切到更健康的停泊账号。默认关闭。</p>
+                    <p class="settings-note" id="auto-swap-pace-pre-swap-toggle-note">默认关闭。开启后，当前账号用量达到预警水位、且按当前速度预测撑不到重置时，提前自动切换到用量更低的合格停泊账号；已达耗尽阈值时仍按耗尽规则切换。</p>
                   </div>
-                  <button id="auto-swap-pace-pre-swap-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-pace-pre-swap-toggle-label" aria-describedby="auto-swap-pace-pre-swap-toggle-note">
+                  <button id="auto-swap-pace-pre-swap-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-pace-pre-swap-toggle-label" aria-describedby="auto-swap-pace-pre-swap-toggle-note auto-swap-subswitch-requirement">
                     <span class="switch-thumb" aria-hidden="true"></span>
                   </button>
                 </div>
                 <div class="settings-row settings-row--switch settings-row--nested">
                   <div class="settings-copy">
                     <span id="auto-swap-pre-reset-burn-toggle-label">重置前抢用</span>
-                    <p class="settings-note" id="auto-swap-pre-reset-burn-toggle-note">开启后，临近重置时自动切到快清零的停泊账号烧尾巴，烧完自动切回。默认关闭。</p>
+                    <p class="settings-note" id="auto-swap-pre-reset-burn-toggle-note">默认关闭。开启后，某停泊账号的额度窗口临近重置（5 小时窗的最后一小时、7 天窗的最后两天）且该窗口已用超过抢用水位时，自动切过去把快清零的剩余额度用掉；窗口重置或额度用完后自动切回原账号，期间可能多次往返，属预期行为。</p>
                   </div>
-                  <button id="auto-swap-pre-reset-burn-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-pre-reset-burn-toggle-label" aria-describedby="auto-swap-pre-reset-burn-toggle-note">
+                  <button id="auto-swap-pre-reset-burn-toggle" class="switch" type="button" role="switch" aria-checked="false" disabled aria-labelledby="auto-swap-pre-reset-burn-toggle-label" aria-describedby="auto-swap-pre-reset-burn-toggle-note auto-swap-subswitch-requirement">
                     <span class="switch-thumb" aria-hidden="true"></span>
                   </button>
                 </div>
               </div>
             </section>
-            <div id="accounts-empty" class="empty-state hidden">暂无账号。点「添加账号」用浏览器授权。已在 Kimi Code 登录的，可切到总览导入。</div>
+            <!-- 账号库空态（issue #165）：动作就地可执行，并指明总览导入适用于已在 Kimi Code 登录的场景。 -->
+            <div id="accounts-empty" class="empty-state library-empty hidden">
+              <p class="library-empty-copy">暂无账号。「添加账号」在浏览器里完成授权，加入新的 Kimi 账号；已在 Kimi Code 登录的，切到「总览」点「导入当前账号」直接收入，无需重新授权。</p>
+              <button id="library-empty-add-button" class="action-button action-button-primary" type="button">添加账号</button>
+            </div>
             <div id="library-action-error" class="action-retry hidden">
               <p id="library-action-error-text"></p>
               <button id="library-retry-button" class="action-button action-button-primary" type="button">
@@ -367,10 +373,15 @@
       <h3 id="bind-dialog-title">绑定网页登录</h3>
       <p id="bind-copy" class="dialog-kicker"></p>
       <div class="dialog-actions">
-        <button id="bind-open" class="action-button" type="button">打开控制台</button>
+        <button id="bind-open" class="action-button action-button-primary" type="button">从 Edge 自动读取并绑定</button>
+      </div>
+      <p id="bind-edge-status" class="dialog-kicker" aria-live="polite"></p>
+      <p id="bind-manual-steps" class="dialog-kicker">没有扩展或自动读取失败时：打开 www.kimi.com/code/console 并登录同一账号，按 F12 打开开发者工具，在 Application → Local Storage → www.kimi.com 中复制 access_token，粘贴到下方输入框。</p>
+      <div class="dialog-actions">
+        <button id="bind-open-console" class="action-button" type="button">打开控制台</button>
       </div>
       <label class="field">
-        <span>网页 token（kimi.com 控制台的 access_token）</span>
+        <span>备用：网页 access_token</span>
         <textarea id="bind-token" class="token-input" rows="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="粘贴 access_token" aria-describedby="bind-token-error"></textarea>
         <p id="bind-token-error" class="field-error hidden"></p>
       </label>

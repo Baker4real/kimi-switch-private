@@ -1,9 +1,9 @@
 /** 绑定网页登录（issue #51）的纯逻辑：控制台地址、token 规整、对话框文案。
- * token 的 DOM 生命周期在 main.ts：对话框任何关闭路径都清空输入，不落 store。 */
+ * 自动读取路径只把一次性挑战交给 Edge；网页凭证不进入 WebView。 */
 
-/** 绑定对话框「打开控制台」按钮的目标页：网页 token 即该页 localStorage 的
- * `access_token`（#50 / ADR-0004），打开它用户才能拿到 token；只经现有
- * `open_url` 能力跳系统浏览器，不读浏览器 cookie、不做内嵌抓取。 */
+/** 网页凭证的来源页（官方控制台）。自动路径由 Rust 追加一次性挑战 fragment 后交给
+ * Edge；手动兜底的「打开控制台」按钮打开无 fragment 的原始地址——扩展页面脚本
+ * 检测不到挑战时直接返回，不会读取任何凭证。 */
 export const WEB_BIND_CONSOLE_URL = "https://www.kimi.com/code/console";
 
 /** trim 后的网页 token；空白输入返回 null（不发起绑定）。
@@ -13,8 +13,7 @@ export function parseWebToken(raw: string): string | null {
   return trimmed.length === 0 ? null : trimmed;
 }
 
-/** 绑定对话框的说明文案：账号显示名帮用户核对绑的是哪张卡，
- * 粘贴来源（控制台 localStorage 的 access_token）写清楚。 */
+/** 绑定对话框的说明文案：自动读取优先，手动粘贴作为浏览器扩展不可用时的兜底。 */
 export function webBindCopy(displayName: string): string {
-  return `1. 绑定「${displayName}」后这张卡可显示会员到期。2. 打开 kimi.com 控制台并登录同一账号。3. 在浏览器开发者工具（F12）→ Application → Local Storage → www.kimi.com 中复制 access_token 的值。4. 粘贴到下面。`;
+  return `绑定「${displayName}」后这张卡可显示会员到期。优先从 Edge 控制台自动读取；如果 Edge 扩展未安装或读取失败，仍可在下方粘贴网页 access_token。`;
 }

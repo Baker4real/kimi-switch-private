@@ -86,6 +86,50 @@ describe("accountCardHtml", () => {
   });
 });
 
+describe("长显示名补读（issue #167）", () => {
+  it("长中文名：单行省略归 CSS，完整名写进 title 供悬停与读屏补读", () => {
+    const long = "张三的超级长的工作账号显示名超出标题列宽后被省略号截断";
+    const html = accountCardHtml(row({ display_name: long }), false);
+    expect(html).toContain(`<span class="profile-title" title="${long}">`);
+    expect(html).toContain(`>${long}</span>`);
+  });
+
+  it("长拉丁名同样补 title，不依赖省略号传达唯一身份", () => {
+    const long = "Extremely Long Latin Workspace Account Name Overflows The Title Column";
+    const html = accountCardHtml(row({ display_name: long }), false);
+    expect(html).toContain(`title="${long}"`);
+  });
+
+  it("混合符号名经 HTML 转义后写进 title，不破坏属性", () => {
+    const html = accountCardHtml(row({ display_name: `Dev "主力" <tag> & Co'` }), false);
+    expect(html).toContain('title="Dev &quot;主力&quot; &lt;tag&gt; &amp; Co&#39;"');
+  });
+
+  it("title 与正文同用后端单一显示名：显示名缺失时一并回退账号 id", () => {
+    const html = accountCardHtml(row({ display_name: "   " }), false);
+    expect(html).toContain('title="acc-1"');
+    expect(html).toContain('>acc-1</span>');
+  });
+});
+
+describe("「更多操作」原生按钮契约（issue #167）", () => {
+  it("开关是原生 button：无 role / tabindex / aria-haspopup 菜单键盘契约", () => {
+    const html = accountCardHtml(row({ official_nickname_known: false }), false);
+    const start = html.indexOf("data-overflow=");
+    const tag = html.slice(html.lastIndexOf("<button", start), html.indexOf(">", start) + 1);
+    expect(tag).toContain('type="button"');
+    expect(tag).not.toContain("role=");
+    expect(tag).not.toContain("tabindex");
+    expect(tag).not.toContain("aria-haspopup");
+  });
+
+  it("菜单项是普通按钮留在 Tab 序：整卡不出现 tabindex 改写", () => {
+    const html = accountCardHtml(row({ official_nickname_known: false }), false);
+    expect(html).not.toContain("tabindex");
+    expect(html).toContain('data-rename="acc-1"');
+  });
+});
+
 describe("cardActionButtons", () => {
   it("停泊账号有切换，当前账号没有", () => {
     expect(cardActionButtons(row({ active: false }), false)).toContain("data-swap");

@@ -2159,10 +2159,14 @@ version = "1.4.17"
 dependencies = [
  "anyhow",
  "kimi-switch-gui",
+ "rand",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
+ "tokio",
+ "tracing",
  "windows-sys 0.60.2",
 ]
 

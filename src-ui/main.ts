@@ -5,15 +5,23 @@ import { accountStatusBodyHtml, accountStatusView } from "./account-status";
 import { runDeviceAuth, type DeviceAuthDialog } from "./deviceAuth";
 import { accountDisplayName, displayInitial, parseAliasInput } from "./labels";
 import { accountCardHtml } from "./library-card";
-import { applyOverflowMenuState, nextOverflowOpenId } from "./overflow-menu";
+import {
+  applyOverflowMenuState,
+  closeOverflowToggle,
+  linkOverflowPanels,
+  nextOverflowOpenId,
+} from "./overflow-menu";
 import { credentialRecoveredToast } from "./credentialToast";
 import { bindWebButtonHtml, membershipPlanHtml, quotaStackHtml } from "./membership";
 import { runUserQuotaRefresh } from "./membershipToast";
 import {
+  AUTO_SWAP_SUBSWITCH_REQUIREMENT_ID,
   autoSwapPacePreSwapSwitchView,
   autoSwapPreferLowerTierSwitchView,
   autoSwapPreResetBurnSwitchView,
   autoSwapResidentLowerTierSwitchView,
+  autoSwapSubSwitchDescribedBy,
+  autoSwapSubSwitchRequirementVisible,
   autoSwapSwitchView,
   behaviorPanelStatusText,
 } from "./auto-swap";
@@ -44,6 +52,8 @@ type Route = "overview" | "library";
 const BUSY_BUTTON_IDS = [
   "add-account-button",
   "library-add-button",
+  // 空态里的添加入口（issue #165）：与页眉「添加账号」同一动作，忙碌时同样禁用。
+  "library-empty-add-button",
   "library-refresh-button",
   "import-button",
   "refresh-button",
@@ -62,6 +72,13 @@ const BUSY_BUTTON_IDS = [
 ] as const;
 
 const routes: Route[] = ["overview", "library"];
+/** 自动切换四个子开关 id（issue #166）：依赖原因行与 aria 关联按此列表涂刷。 */
+const AUTO_SWAP_SUB_SWITCH_IDS = [
+  "auto-swap-prefer-lower-tier-toggle",
+  "auto-swap-resident-lower-tier-toggle",
+  "auto-swap-pace-pre-swap-toggle",
+  "auto-swap-pre-reset-burn-toggle",
+] as const;
 const store = createAppStore();
 let renameId = "";
 let deleteId = "";
@@ -69,6 +86,11 @@ let deleteId = "";
 let pendingListFocus: ListFocusKey | null = null;
 // 绑定网页登录（issue #51）的目标账号 id：仅对话框打开期间持有，token 不落这里。
 let bindId = "";
+/** Edge 免粘贴绑定的当前一次性挑战；只保存 nonce，不保存网页凭证。 */
+let pendingWebBindNonce: string | null = null;
+/** 对话框内最近一次发起的绑定路径（issue #173）：失败后的「重试」复用同一路径——
+ * 自动读取失败重试自动读取，手动粘贴失败重试手动粘贴；关闭对话框即复位。 */
+let lastBindAction: "edge" | "manual" | null = null;
 // 最近一次打开授权对话框的流程类型：仅用于取消时的 toast 文案区分
 let authIsReauth = false;
 /** 最近一次操作失败的中文原因，供就近重试面板复用。 */
@@ -254,6 +276,7 @@ function submitBind(): void {
     return;
   }
   const id = bindId;
+  lastBindAction = "manual";
   void runDialogSnapshotAction({
     label: "正在绑定…",
     action: () => api.bindWebAccount(id, token),
@@ -261,6 +284,59 @@ function submitBind(): void {
     retryPanelId: "bind-action-error",
     retryTextId: "bind-action-error-text",
   });
+}
+
+/** 自动路径失败后的状态行引导：失败原因本体显示在就近重试面板（Rust 中文错误，
+ * 如「Edge 绑定等待超时」「找不到 Microsoft Edge…」），这里只给两条出路。
+ * 未安装扩展、Edge 未登录在真机上都表现为等待超时（#173 验收：引导转手动粘贴）。 */
+const EDGE_BIND_FAILED_STATUS =
+  "自动读取未完成：可点「重试」再试，或在下方手动粘贴网页 access_token。";
+
+/** Edge 免粘贴绑定（issue #173）：一次点击先 begin 发起挑战（Rust 随即打开 Edge
+ * 控制台），再 complete 等待扩展回传并复用既有绑定管道。前端只持有一次性 nonce，
+ * 网页凭证只在 Rust 侧流转，不进 WebView 返回值、DOM 或日志。 */
+async function bindFromEdge(id: string): Promise<Snapshot> {
+  const status = required<HTMLParagraphElement>("bind-edge-status");
+  status.textContent = "正在打开 Edge 控制台，等待网页凭证…";
+  let nonce: string | null = null;
+  try {
+    const challenge = await api.beginWebBind(id);
+    nonce = challenge.nonce;
+    pendingWebBindNonce = challenge.nonce;
+    status.textContent = "已打开 Edge；登录目标网页账号后会自动完成绑定。";
+    return await api.completeWebBind(id, challenge.nonce);
+  } catch (error) {
+    status.textContent = EDGE_BIND_FAILED_STATUS;
+    throw error;
+  } finally {
+    if (nonce !== null && pendingWebBindNonce === nonce) {
+      pendingWebBindNonce = null;
+    }
+  }
+}
+
+/** 自动绑定的点击入口：忙碌早退（裁定与手动提交一致），失败留在对话框就近重试。 */
+function runBindFromEdge(): void {
+  if (store.get().busy) {
+    return;
+  }
+  lastBindAction = "edge";
+  const id = bindId;
+  void runDialogSnapshotAction({
+    label: "正在从 Edge 读取并绑定…",
+    action: () => bindFromEdge(id),
+    dialogId: "bind-dialog",
+    retryPanelId: "bind-action-error",
+    retryTextId: "bind-action-error-text",
+  });
+}
+
+async function cancelPendingWebBind(): Promise<void> {
+  const nonce = pendingWebBindNonce;
+  pendingWebBindNonce = null;
+  if (nonce !== null) {
+    await api.cancelWebBind(nonce);
+  }
 }
 
 function submitDelete(): void {
@@ -351,6 +427,24 @@ function paintAutoSwapPacePreSwap(autoSwapEnabled: boolean, pacePreSwap: boolean
   const toggle = required<HTMLButtonElement>("auto-swap-pace-pre-swap-toggle");
   toggle.setAttribute("aria-checked", String(view.checked));
   toggle.disabled = controlDisabledByBusy(store.get().busy, view.disabled);
+}
+
+/**
+ * 子开关依赖说明 paint（issue #166）：总开关关闭时显示「需先开启总开关」原因行，
+ * 并把它并入每个子开关的 aria-describedby；开启时隐藏原因行、关联还原为各自 note。
+ * 只涂说明与关联；置灰仍由子开关 disabled 与点击早退承担，判定语义不变。
+ */
+function paintAutoSwapSubSwitchRequirement(autoSwapEnabled: boolean): void {
+  required<HTMLElement>(AUTO_SWAP_SUBSWITCH_REQUIREMENT_ID).classList.toggle(
+    "hidden",
+    !autoSwapSubSwitchRequirementVisible(autoSwapEnabled),
+  );
+  for (const id of AUTO_SWAP_SUB_SWITCH_IDS) {
+    required<HTMLButtonElement>(id).setAttribute(
+      "aria-describedby",
+      autoSwapSubSwitchDescribedBy(autoSwapEnabled, `${id}-note`),
+    );
+  }
 }
 
 /**
@@ -448,6 +542,9 @@ function paintAccountCards(next: Snapshot): void {
   const empty = required<HTMLDivElement>("accounts-empty");
   empty.classList.toggle("hidden", next.accounts.length > 0);
   list.innerHTML = next.accounts.map((row) => accountCardHtml(row, false)).join("");
+  // 「…」开关与唯一面板的控制关系（issue #167）：重绘后给菜单面板起稳定唯一
+  // DOM id，开关补 aria-controls 指向；开合事实来源仍是 aria-expanded，不受影响。
+  linkOverflowPanels(overflowToggles());
 }
 
 /** 总览当前账号档位行：绑定入口与账号卡同一规则（issue #51），busy 时同样
@@ -498,6 +595,8 @@ function paintSnapshot(next: Snapshot): void {
   paintAutoSwapResidentLowerTier(next.auto_swap, next.auto_swap_resident_lower_tier);
   paintAutoSwapPreResetBurn(next.auto_swap, next.auto_swap_pre_reset_burn);
   paintAutoSwapPacePreSwap(next.auto_swap, next.auto_swap_pace_pre_swap);
+  // 依赖说明（issue #166）：跟随总开关真值涂原因行与子开关 aria 关联。
+  paintAutoSwapSubSwitchRequirement(next.auto_swap);
   // 折叠 paint 放在六个开关之后：收起态状态行要读刚涂好的开关真值；开合不因快照改写。
   paintBehaviorPanel();
   const current = next.accounts.find((row) => row.active);
@@ -913,12 +1012,13 @@ function openBindDialog(id: string): void {
   required<HTMLParagraphElement>("bind-copy").textContent = webBindCopy(
     accountDisplayName(row, id),
   );
+  required<HTMLParagraphElement>("bind-edge-status").textContent = "";
   const tokenInput = required<HTMLTextAreaElement>("bind-token");
   tokenInput.value = "";
   paintFieldError(tokenInput, required("bind-token-error"), null);
   hideActionRetry("bind-action-error", "bind-action-error-text");
   required<HTMLDialogElement>("bind-dialog").showModal();
-  tokenInput.focus();
+  required<HTMLButtonElement>("bind-open").focus();
 }
 
 function wireDialogs(): void {
@@ -965,34 +1065,51 @@ function wireDialogs(): void {
     void api.cancelDeviceAuth();
   });
 
-  // 绑定网页登录（issue #51）：打开控制台 → 粘贴 token → 提交走 bind-web 管道。
-  required<HTMLButtonElement>("bind-open").addEventListener("click", async () => {
+  // 绑定网页登录：Edge 自动读取失败时仍可从下方手动粘贴走原有 bind-web 管道。
+  required<HTMLButtonElement>("bind-open").addEventListener("click", () => {
+    runBindFromEdge();
+  });
+  // 手动兜底自解释（#164 链回归修复）：次按钮一键打开官方控制台，供无扩展用户
+  // 按 F12 → Application → Local Storage 取 access_token。打开的是无挑战 fragment
+  // 的原始地址，扩展页面脚本因此不会读取任何凭证；也不改挑战、nonce 或账号状态。
+  required<HTMLButtonElement>("bind-open-console").addEventListener("click", async () => {
     try {
       await api.openUrl(WEB_BIND_CONSOLE_URL);
     } catch {
-      showToast("无法打开浏览器，请手动打开 kimi.com 控制台", true);
+      showToast("无法打开浏览器，请手动访问 www.kimi.com/code/console", true);
     }
   });
   required<HTMLButtonElement>("bind-cancel").addEventListener("click", () => {
-    required<HTMLDialogElement>("bind-dialog").close();
+    void cancelPendingWebBind().finally(() => {
+      required<HTMLDialogElement>("bind-dialog").close();
+    });
   });
   required<HTMLButtonElement>("bind-submit").addEventListener("click", () => {
     submitBind();
   });
   required<HTMLButtonElement>("bind-retry-button").addEventListener("click", () => {
+    // 就近重试复用失败时的同一路径（issue #173）：自动读取失败重试自动读取
+    // （超时/未装扩展/串线），手动粘贴失败带着已粘贴内容重试手动提交。
+    if (lastBindAction === "edge") {
+      runBindFromEdge();
+      return;
+    }
     submitBind();
   });
   required<HTMLTextAreaElement>("bind-token").addEventListener("input", () => {
     const input = required<HTMLTextAreaElement>("bind-token");
     paintFieldError(input, required("bind-token-error"), null);
   });
-  // 对话框任何关闭路径（取消按钮 / Esc / 提交成功后的 close()）都清空 token 输入，
-  // token 不留在 DOM。
+  // 对话框任何关闭路径（取消按钮 / Esc / 提交成功后的 close()）都取消等待中的
+  // Edge 绑定挑战并清空 token 输入，token 不留在 DOM。
   required<HTMLDialogElement>("bind-dialog").addEventListener("close", () => {
+    void cancelPendingWebBind();
+    lastBindAction = null;
     const input = required<HTMLTextAreaElement>("bind-token");
     input.value = "";
     paintFieldError(input, required("bind-token-error"), null);
     hideActionRetry("bind-action-error", "bind-action-error-text");
+    required<HTMLParagraphElement>("bind-edge-status").textContent = "";
   });
 
   required<HTMLButtonElement>("rename-cancel").addEventListener("click", () => {
@@ -1033,10 +1150,12 @@ function currentOverflowOpenId(): string | null {
   return open?.dataset.overflow ?? null;
 }
 
-/** 全收起：aria-expanded 归 false、菜单 hidden；Escape / 外点 / 菜单项触发共用。 */
+/** 全收起：aria-expanded 归 false、菜单 hidden；Escape / 外点 / 菜单项触发共用。
+ * 焦点去向（issue #167，spec D）：仅当焦点就在被隐藏的菜单内容里才送回开关
+ * （Escape 后不甩到 body）；外点 / 再点开关时焦点本就不在菜单里，不会被抢。 */
 function closeOverflowMenus(): void {
   for (const toggle of overflowToggles()) {
-    applyOverflowMenuState(toggle, false);
+    closeOverflowToggle(toggle, document.activeElement);
   }
 }
 
@@ -1064,7 +1183,8 @@ function wireOverflowDismiss(): void {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      // Escape 等价状态机的 dismiss 事件：归 null，全收起。
+      // Escape 等价状态机的 dismiss 事件：归 null，全收起；
+      // 是否把焦点送回开关由 closeOverflowToggle 裁决（焦点在被隐藏菜单里才送）。
       closeOverflowMenus();
     }
   });
@@ -1161,6 +1281,10 @@ async function init(): Promise<void> {
   required<HTMLButtonElement>("library-add-button").addEventListener("click", () => {
     void startDeviceAuth(null, "");
   });
+  // 空态「添加账号」（issue #165）：复用页眉同一添加动作，不另起授权实现。
+  required<HTMLButtonElement>("library-empty-add-button").addEventListener("click", () => {
+    void startDeviceAuth(null, "");
+  });
   required<HTMLButtonElement>("import-button").addEventListener("click", () => {
     void runAction("正在导入…", () => api.importCurrent());
   });
@@ -1221,6 +1345,8 @@ async function init(): Promise<void> {
           "aria-checked",
         ) === "true";
       paintAutoSwapPreResetBurn(saved, burn);
+      // 总开关保存后立刻重涂依赖原因行与子开关 aria 关联（issue #166）。
+      paintAutoSwapSubSwitchRequirement(saved);
       paintBehaviorPanel();
       showToast(autoSwapSwitchView(saved).toast);
     });

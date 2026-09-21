@@ -110,6 +110,21 @@ export function autoSwapPacePreSwapSwitchView(
   };
 }
 
+/** 子开关依赖原因行节点 id（issue #166）：总开关关闭时并入四个子开关的 aria-describedby。 */
+export const AUTO_SWAP_SUBSWITCH_REQUIREMENT_ID = "auto-swap-subswitch-requirement";
+
+/** 总开关关闭时依赖原因行可见（「需先开启总开关」等价原因）；开启时隐藏。纯函数。 */
+export function autoSwapSubSwitchRequirementVisible(autoSwapEnabled: boolean): boolean {
+  return !autoSwapEnabled;
+}
+
+/** 子开关 aria-describedby（issue #166）：总开关关时在自身 note 之外并入依赖原因行；开时还原为单一 note。 */
+export function autoSwapSubSwitchDescribedBy(autoSwapEnabled: boolean, noteId: string): string {
+  return autoSwapEnabled
+    ? noteId
+    : `${noteId} ${AUTO_SWAP_SUBSWITCH_REQUIREMENT_ID}`;
+}
+
 /**
  * 「账号行为」一层折叠收起态的状态行文案（issue #120，取代 #116/#117 内层折叠）：
  * 标题下用一行字写出当前生效项（「已开启：……」）。纯函数，不碰 DOM、不碰盘；由 paint 层只在收起时渲染。

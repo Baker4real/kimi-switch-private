@@ -1658,6 +1658,19 @@ p {
   gap: var(--space-lg);
 }
 
+/* 账号库空态（issue #165）：竖排收拢文案与主按钮；颜色与字号沿用 .empty-state 继承。 */
+.library-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+.library-empty-copy {
+  max-width: 36em;
+  margin: 0;
+}
+
 .settings-row {
   display: flex;
   align-items: center;
@@ -1674,6 +1687,12 @@ p {
 }
 
 .settings-row--nested {
+  padding-left: var(--space-lg);
+}
+
+/* 子开关依赖原因行（issue #166）：与嵌套开关行同缩进；可见性由 paint 层按总开关切换。 */
+.auto-swap-subswitch-requirement {
+  margin: var(--space-xs) 0 0;
   padding-left: var(--space-lg);
 }
 

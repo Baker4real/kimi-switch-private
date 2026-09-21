@@ -25,6 +25,10 @@ kimi-switch-gui = { path = "../crates/gui" }
 anyhow.workspace = true
 serde.workspace = true
 tauri = { version = "=2.11.5", features = [] }
+rand.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 [features]
 default = ["custom-protocol"]

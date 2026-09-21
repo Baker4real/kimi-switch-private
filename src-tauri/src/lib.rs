@@ -10,8 +10,11 @@ use std::sync::Arc;
 use kimi_switch_gui::{Backend, CommandError, QuotaCollectReason, Snapshot, SwapOutcome};
 use tauri::{Manager, State};
 
+mod web_bind;
+
 struct AppState {
     backend: Arc<Backend>,
+    web_bind: Arc<web_bind::WebBindBroker>,
 }
 
 fn map_err(err: anyhow::Error) -> CommandError {
@@ -113,6 +116,39 @@ async fn bind_web_account(
     token: String,
 ) -> Result<Snapshot, CommandError> {
     state.backend.bind_web(&id, &token).await.map_err(map_err)
+}
+
+/// 发起 Edge 免粘贴绑定：挑战 URL 只含一次性 nonce，不含网页凭证。
+#[tauri::command]
+async fn begin_web_bind(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<web_bind::WebBindChallenge, CommandError> {
+    let challenge = state.web_bind.begin(&id).await.map_err(map_err)?;
+    if let Err(error) = web_bind::open_in_edge(&challenge.url) {
+        state.web_bind.cancel(&challenge.nonce);
+        return Err(map_err(error));
+    }
+    Ok(challenge)
+}
+
+/// 等待 Edge 扩展把网页凭证交给一次性回调，再复用既有 bind-web 管道。
+/// 跨账号串线校验在 broker 内完成：目标账号已变化时丢弃回调凭证并报错。
+/// token 只在 Rust 内存中流转，不进入 WebView 返回值、日志或错误文本。
+#[tauri::command]
+async fn complete_web_bind(
+    state: State<'_, AppState>,
+    id: String,
+    nonce: String,
+) -> Result<Snapshot, CommandError> {
+    let token = state.web_bind.wait(&nonce, &id).await.map_err(map_err)?;
+    state.backend.bind_web(&id, &token).await.map_err(map_err)
+}
+
+/// 取消等待中的 Edge 绑定；不会写凭证，也不会改变已有绑定。
+#[tauri::command]
+fn cancel_web_bind(state: State<'_, AppState>, nonce: String) {
+    state.web_bind.cancel(&nonce);
 }
 
 #[tauri::command]
@@ -279,7 +315,10 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .manage(AppState { backend })
+        .manage(AppState {
+            backend,
+            web_bind: Arc::new(web_bind::WebBindBroker::default()),
+        })
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window
@@ -299,6 +338,9 @@ pub fn run() {
             complete_device_auth,
             cancel_device_auth,
             bind_web_account,
+            begin_web_bind,
+            complete_web_bind,
+            cancel_web_bind,
             open_url,
             set_proactive_renewal,
             set_auto_swap,

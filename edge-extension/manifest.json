@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "kimi-switch Edge 绑定助手",
+  "version": "0.1.0",
+  "description": "仅在 kimi-switch 绑定挑战打开时读取 Kimi 控制台网页凭证。",
+  "permissions": [],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://www.kimi.com/code/console*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  }
+}

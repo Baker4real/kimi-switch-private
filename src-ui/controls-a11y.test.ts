@@ -14,6 +14,7 @@ const dir = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(join(dir, "index.html"), "utf8").replace(/\r\n/g, "\n");
 const css = readFileSync(join(dir, "styles.css"), "utf8").replace(/\r\n/g, "\n");
 const windowControlsSrc = readFileSync(join(dir, "window-controls.ts"), "utf8");
+const mainSrc = readFileSync(join(dir, "main.ts"), "utf8").replace(/\r\n/g, "\n");
 
 function ruleBody(selector: string): string {
   const idx = css.indexOf(`${selector} {`);
@@ -161,5 +162,54 @@ describe("对话框标题关联（issue #85）", () => {
       expect(dialog).toMatch(new RegExp(`<h3[^>]*id="${titleId}"`));
       expect(dialog).toContain(title);
     }
+  });
+});
+
+describe("账号卡长名与「更多操作」可达性（issue #167）", () => {
+  it("标题单行省略有界：截断规则与收缩列宽契约在，长名不横向溢出", () => {
+    const title = ruleBody(".profile-title");
+    expect(title).toMatch(/white-space:\s*nowrap/);
+    expect(title).toMatch(/overflow:\s*hidden/);
+    expect(title).toMatch(/text-overflow:\s*ellipsis/);
+    for (const selector of [".profile-identity", ".profile-identity-copy", ".profile-title-row"]) {
+      expect(ruleBody(selector), selector).toMatch(/min-width:\s*0/);
+    }
+    expect(ruleBody(".profile-card")).toMatch(/minmax\(0,\s*1fr\)/);
+  });
+
+  it("账号卡重绘后把「…」开关与唯一面板连上 aria-controls", () => {
+    expect(mainSrc).toContain("linkOverflowPanels(overflowToggles())");
+  });
+
+  it("收起走焦点裁决：把当前焦点交给收起路径统一判定", () => {
+    expect(mainSrc).toContain("closeOverflowToggle(toggle, document.activeElement)");
+  });
+
+  it("Escape / 外点关闭仍走统一收起；外点关闭路径不出现强制 focus", () => {
+    const start = mainSrc.indexOf("function wireOverflowDismiss");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = mainSrc.indexOf("function wireList", start);
+    expect(end).toBeGreaterThan(start);
+    const region = mainSrc.slice(start, end);
+    expect(region).toContain('event.key === "Escape"');
+    expect(region).toContain("closeOverflowMenus()");
+    expect(region).not.toContain(".focus()");
+  });
+
+  it("外点关闭监听注册在 click：换成 pointerdown 会在焦点尚在菜单内时抢先归焦（reviewer P3-2）", () => {
+    const start = mainSrc.indexOf("function wireOverflowDismiss");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = mainSrc.indexOf("function wireList", start);
+    const region = mainSrc.slice(start, end);
+    expect(region).toContain('document.addEventListener("click"');
+    // 若换成 pointerdown：焦点仍在菜单项上时浏览器尚未把焦点移到点击目标，
+    // closeOverflowToggle 会误判「焦点在被隐藏菜单里」而把焦点抢还给开关。
+    expect(region).not.toContain("pointerdown");
+  });
+
+  it("不引入 menu 键盘契约：无方向键 / Tab 拦截，原生 Tab/Enter/Space 不被改写", () => {
+    expect(mainSrc).not.toMatch(/ArrowDown|ArrowUp|ArrowLeft|ArrowRight/);
+    expect(mainSrc).not.toMatch(/event\.key === "Tab"/);
+    expect(mainSrc).not.toContain('role="menu"');
   });
 });

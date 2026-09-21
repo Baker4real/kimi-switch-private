@@ -773,6 +773,105 @@ mod tests {
         );
     }
 
+    /// 身份不匹配也不「自动改绑」（issue #174 / spec 用户故事 10）：token 的
+    /// 真实主人（u9）同时在库里时，绑定仍只失败于目标账号，不得把网页凭证
+    /// 转写给它或任何其他账号卡——账号选择始终由用户控制。
+    #[tokio::test]
+    async fn identity_mismatch_does_not_retarget_token_owner() {
+        let h = Harness::new();
+        let seeded_target = h.seed("u1");
+        let seeded_owner = h.seed("u9");
+        let web_token = token_for("u9");
+        let server = MockServer::start(vec![]);
+
+        let err = bind_web_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            &web_token,
+            server.base_url(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err.bind_web_error(),
+                Some(kimi_switch_core::BindWebError::IdentityMismatch { .. })
+            ),
+            "期望 IdentityMismatch：{err}"
+        );
+
+        // 目标账号与 token 主人账号的库存逐项不变：谁都不被写 web field、
+        // 不动 extra、不动 active 标记（不自动改绑、不自动切换）。
+        for (seeded, id) in [(&seeded_target, "u1"), (&seeded_owner, "u9")] {
+            assert_eq!(
+                h.store.get("kimi", id, WEB_STORE_FIELD).unwrap(),
+                None,
+                "{id} 不得被写入网页凭证"
+            );
+            assert_eq!(h.bound_account(id).extra, seeded.extra, "{id} extra 不变");
+            assert_eq!(h.bound_account(id).label, seeded.label);
+            assert!(!h.bound_account(id).active, "{id} active 不变");
+        }
+        assert!(server.finish().is_empty(), "不匹配不得发任何会员请求");
+    }
+
+    /// 写序回归（ADR-0004：先网页 field，后 extra / 会员请求返回）：用挂起
+    /// 服务器把管道停在「请求已发出、响应未返回」的现场，此刻 web field 必须
+    /// 已落库、extra 必须尚未写入——请求失败保留凭证的语义正来自这个顺序。
+    #[tokio::test]
+    async fn web_field_is_written_before_membership_request_returns() {
+        let h = Harness::new();
+        let seeded = h.seed("u1");
+        let web_token = token_for("u1");
+        // 挂起服务器：接受请求但永不响应（其 doc 注明不要 finish）。
+        let server = MockServer::start_then_hang(vec![]);
+
+        let target = AccountId("u1".into());
+        let fut = bind_web_at(
+            &h.registry,
+            &h.store,
+            &target,
+            &web_token,
+            server.base_url(),
+        );
+        tokio::pin!(fut);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut arrived = false;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                // 服务器永不响应，绑定不应完成；完成即写序被破坏。
+                done = &mut fut => {
+                    panic!("挂起的服务器上绑定不应完成：{done:?}");
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    if server.received() == 1 {
+                        arrived = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(arrived, "5s 内 GetSubscription 请求应已到达挂起服务器");
+
+        // 请求在途的现场断言：web field 已写入（先网页 field），
+        // extra 尚未动（会员响应成功后才写）。
+        assert_eq!(
+            h.store
+                .get("kimi", "u1", WEB_STORE_FIELD)
+                .unwrap()
+                .as_deref(),
+            Some(web_token.as_str()),
+            "身份门通过后、会员响应返回前，web field 必须已落库"
+        );
+        assert_eq!(
+            h.bound_account("u1").extra,
+            seeded.extra,
+            "extra 只能在会员响应成功后写入"
+        );
+    }
+
     /// 目标账号不在 registry：在任何写入之前失败（AccountNotFound），不打网络。
     #[tokio::test]
     async fn missing_account_fails_before_any_write() {
@@ -921,6 +1020,91 @@ mod tests {
             Some(web_token.as_str())
         );
         assert_eq!(server.finish().len(), 1);
+    }
+
+    /// Code OAuth blob 与网页凭证不混用（ADR-0004 分离存储，issue #174）：
+    /// - 只有 Code blob（哪怕形态就是 JWT、`sub` 还对得上本账号）而没有
+    ///   web field 时，刷新与导入补读都不得把 blob 当网页凭证——失败、零请求；
+    /// - 有 web field 时，刷新的 Bearer 只用网页凭证，Code blob 绝不进请求头，
+    ///   也不被网页路径改写。
+    #[tokio::test]
+    async fn code_blob_is_never_used_as_web_credential() {
+        let h = Harness::new();
+        h.seed("u1");
+        // blob 换成 JWT 形态且 `sub` 对得上：证明按 field 名隔离，不做内容嗅探。
+        let blob_looks_like_jwt = token_for("u1");
+        h.store
+            .set("kimi", "u1", "blob", &blob_looks_like_jwt)
+            .unwrap();
+        let unbound_server = MockServer::start(vec![]);
+
+        // 无 web field：刷新直接失败、不打网络。
+        let err = refresh_web_membership_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            unbound_server.base_url(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("requires an existing web binding"),
+            "不得把 blob 当网页凭证：{err}"
+        );
+        // 导入补读同样跳过。
+        restore_membership_after_import_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            unbound_server.base_url(),
+        )
+        .await;
+        assert!(
+            unbound_server.finish().is_empty(),
+            "blob 形态像 JWT 也不得触发会员请求"
+        );
+
+        // 有 web field：刷新 Bearer 只用网页凭证。blob 换成带蜜罐标记的
+        // 另一 JWT——若误用 blob，蜜罐会出现在请求头里。
+        let honeypot_blob = format!("{}.sig-HONEYPOT-BLOB", token_for("honeypot"));
+        h.store
+            .set("kimi", "u1", "blob", &honeypot_blob)
+            .unwrap();
+        let web_token = token_for("u1");
+        h.store
+            .set("kimi", "u1", WEB_STORE_FIELD, &web_token)
+            .unwrap();
+        let server = MockServer::start(vec![("200 OK", SUBSCRIPTION_FIXTURE)]);
+
+        let binding = refresh_web_membership_at(
+            &h.registry,
+            &h.store,
+            &AccountId("u1".into()),
+            server.base_url(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(binding.expiry_text.as_deref(), Some("2027-08-27"));
+
+        let requests = server.finish_full();
+        assert_eq!(requests.len(), 1);
+        let full = requests.join("\n").to_lowercase();
+        assert!(
+            full.contains(&format!(
+                "authorization: bearer {}",
+                web_token.to_lowercase()
+            )),
+            "刷新只用网页凭证：{full}"
+        );
+        assert!(
+            !full.contains("honeypot-blob"),
+            "Code blob 不得进入会员请求头：{full}"
+        );
+        // 网页路径不写 Code field：blob 原样。
+        assert_eq!(
+            h.store.get("kimi", "u1", "blob").unwrap().as_deref(),
+            Some(honeypot_blob.as_str())
+        );
     }
 
     /// 未绑定（无网页凭证）：英文错误、不打网络、extra 不动。

@@ -11,6 +11,8 @@ import {
   autoSwapPreferLowerTierSwitchView,
   autoSwapPreResetBurnSwitchView,
   autoSwapResidentLowerTierSwitchView,
+  autoSwapSubSwitchDescribedBy,
+  autoSwapSubSwitchRequirementVisible,
   autoSwapSwitchView,
   behaviorPanelStatusText,
   silentQuotaMessage,
@@ -104,9 +106,10 @@ describe("账号库页「额度耗尽自动切换」开关（issue #68）", () =
     expect(libraryPage).toMatch(/id="auto-swap-toggle"[^>]*aria-checked="false"/);
   });
 
-  it("开关旁带阈值切换说明，不写 daemon / 403", () => {
+  it("开关旁带触发/结果说明，不写 daemon / 403", () => {
     expect(libraryPage).toContain("额度耗尽自动切换");
-    expect(libraryPage).toContain("当前账号任一额度窗口达到阈值时，自动切到合格停泊账号（默认按已用比例升序）。默认关闭。");
+    expect(libraryPage).toContain("任一额度窗口已用达到阈值时，自动切换到合格的停泊账号");
+    expect(libraryPage).toContain("默认关闭");
     expect(libraryPage).not.toContain("剩余最多");
     expect(libraryPage).not.toContain("daemon");
     expect(libraryPage).not.toContain("403");
@@ -365,6 +368,29 @@ describe("main.ts 账号行为折叠会话接线（issue #120）", () => {
     );
     expect(main).toContain('toggle.removeAttribute("aria-describedby")');
   });
+
+  it("子开关依赖说明接线（issue #166）：paint 按总开关涂原因行显隐与子开关 aria 关联，快照与总开关保存后都重涂", () => {
+    expect(main).toContain("function paintAutoSwapSubSwitchRequirement(");
+    const fn = functionSrc("paintAutoSwapSubSwitchRequirement");
+    expect(fn).toContain("autoSwapSubSwitchRequirementVisible");
+    expect(fn).toContain("autoSwapSubSwitchDescribedBy");
+    expect(fn).toContain("AUTO_SWAP_SUBSWITCH_REQUIREMENT_ID");
+    expect(fn).toContain('classList.toggle(');
+    expect(fn).toContain('"aria-describedby"');
+    // 快照路径与总开关保存成功路径都重涂，不等下一次快照。
+    expect(functionSrc("paintSnapshot")).toContain(
+      "paintAutoSwapSubSwitchRequirement(next.auto_swap);",
+    );
+    const masterStart = main.indexOf(
+      'required<HTMLButtonElement>("auto-swap-toggle").addEventListener',
+    );
+    const preferStart = main.indexOf(
+      'required<HTMLButtonElement>("auto-swap-prefer-lower-tier-toggle").addEventListener',
+    );
+    expect(main.slice(masterStart, preferStart)).toContain(
+      "paintAutoSwapSubSwitchRequirement(saved);",
+    );
+  });
 });
 
 describe("autoSwapPreferLowerTierSwitchView", () => {
@@ -524,7 +550,9 @@ describe("账号库页「重置前抢用」子开关（issue #150）", () => {
 
   it("文案为重置前抢用并说明烧尾巴与自动切回，不写套餐、plan 或三个参数", () => {
     expect(libraryPage).toContain("重置前抢用");
-    expect(libraryPage).toContain("临近重置时自动切到快清零的停泊账号烧尾巴，烧完自动切回");
+    expect(libraryPage).toContain("临近重置");
+    expect(libraryPage).toContain("把快清零的剩余额度用掉");
+    expect(libraryPage).toContain("自动切回原账号");
     expect(libraryPage).toContain("默认关闭");
     const start = libraryPage.indexOf("auto-swap-pre-reset-burn");
     const snippet = libraryPage.slice(start, start + 900);
@@ -593,6 +621,131 @@ describe("账号库页「额度恢复后回驻低档账号」子开关（issue #
     const snippet = libraryPage.slice(start, start + 900);
     expect(snippet).not.toContain("套餐");
     expect(snippet).not.toMatch(/\bplan\b/i);
+  });
+});
+
+describe("autoSwapSubSwitchRequirementVisible / autoSwapSubSwitchDescribedBy（issue #166）", () => {
+  it("总开关关：原因行可见，子开关 aria-describedby 并入原因行 id", () => {
+    expect(autoSwapSubSwitchRequirementVisible(false)).toBe(true);
+    expect(autoSwapSubSwitchDescribedBy(false, "x-note")).toBe(
+      "x-note auto-swap-subswitch-requirement",
+    );
+  });
+
+  it("总开关开：原因行隐藏，aria-describedby 还原为单一 note", () => {
+    expect(autoSwapSubSwitchRequirementVisible(true)).toBe(false);
+    expect(autoSwapSubSwitchDescribedBy(true, "x-note")).toBe("x-note");
+  });
+});
+
+describe("账号行为面板术语与依赖说明（issue #166）", () => {
+  /** 取 index.html 某 settings-note 的纯文本（单行 p，无内嵌标签）。 */
+  const noteText = (id: string): string =>
+    libraryPage.match(new RegExp(`id="${id}"[^>]*>([^<]*)<`))?.[1] ?? "";
+
+  it("总开关说明写默认关闭、触发/结果，并就地解释停泊账号", () => {
+    const note = noteText("auto-swap-toggle-note");
+    expect(note).toContain("默认关闭");
+    expect(note).toContain("额度查询完成后");
+    expect(note).toContain("任一额度窗口已用达到阈值");
+    expect(note).toContain("写入路径与手动切换相同");
+    expect(note).toContain("停泊账号：账号库里除当前账号外");
+    expect(note).toContain("需先开启本开关");
+    expect(note).toContain("不影响手动切换");
+  });
+
+  it("停泊账号不用禁用替代词（闲置账号 / 非当前账号 / parked），自动切换不用「自动轮换」", () => {
+    expect(libraryPage).not.toContain("闲置账号");
+    expect(libraryPage).not.toContain("非当前账号");
+    expect(libraryPage).not.toMatch(/\bparked\b/i);
+    expect(libraryPage).not.toContain("自动轮换");
+  });
+
+  it("主动续期说明写默认关闭与触发/结果，保留风险提示，不用自动刷新 / 自动续费", () => {
+    const note = noteText("renewal-toggle-note");
+    expect(note).toContain("默认关闭");
+    expect(note).toContain("额度查询前");
+    expect(note).toContain("主动续期登录凭证");
+    expect(note).toContain("极端情况下官方会话可能要求重新登录");
+    expect(libraryPage).not.toContain("自动刷新");
+    expect(libraryPage).not.toContain("自动续费");
+  });
+
+  it("pace 预切换说明写预警水位与预测撑不到重置的触发/结果，不用速度切换或裸「预切」", () => {
+    const note = noteText("auto-swap-pace-pre-swap-toggle-note");
+    expect(note).toContain("默认关闭");
+    expect(note).toContain("预警水位");
+    expect(note).toContain("预测撑不到重置");
+    expect(note).toContain("提前自动切换到用量更低的合格停泊账号");
+    expect(note).not.toContain("速度切换");
+    expect(note).not.toMatch(/预切(?!换)/);
+  });
+
+  it("重置前抢用说明写临近重置与抢用水位、烧完切回与往返预期，不用禁用替代词", () => {
+    const note = noteText("auto-swap-pre-reset-burn-toggle-note");
+    expect(note).toContain("默认关闭");
+    expect(note).toContain("临近重置");
+    expect(note).toContain("抢用水位");
+    expect(note).toContain("自动切回原账号");
+    expect(note).toContain("多次往返，属预期行为");
+    expect(note).not.toContain("临重置");
+    expect(note).not.toContain("抢烧");
+    expect(note).not.toContain("到期烧完");
+    expect(note).not.toContain("快重置偏好");
+  });
+
+  it("回驻说明用回驻/换回表述并说明保持期，不用「切回」「归位」称呼回驻行为", () => {
+    const note = noteText("auto-swap-resident-lower-tier-toggle-note");
+    expect(note).toContain("默认关闭");
+    expect(note).toContain("把当前账号换回其中档位最低者");
+    expect(note).toContain("手动切换后 8 小时内不回驻");
+    expect(note).not.toContain("切回");
+    expect(note).not.toContain("归位");
+  });
+
+  it("四个子开关说明都写默认关闭；依赖原因走共享条件行，per-note 文案不写死「需先开启」", () => {
+    const subNoteIds = [
+      "auto-swap-prefer-lower-tier-toggle-note",
+      "auto-swap-resident-lower-tier-toggle-note",
+      "auto-swap-pace-pre-swap-toggle-note",
+      "auto-swap-pre-reset-burn-toggle-note",
+    ];
+    for (const id of subNoteIds) {
+      const note = noteText(id);
+      expect(note, id).toContain("默认关闭");
+      // 总开关开启时这句会误导，依赖原因只能由共享条件行按真值显隐。
+      expect(note, id).not.toContain("需先开启「额度耗尽自动切换」");
+    }
+  });
+
+  it("依赖原因行：静态首帧可见（默认总开关关），位于面板体内、总开关之后首个子开关之前", () => {
+    const req = libraryPage.indexOf('id="auto-swap-subswitch-requirement"');
+    const panel = libraryPage.indexOf('id="behavior-panel-body"');
+    const master = libraryPage.indexOf('id="auto-swap-toggle"');
+    const prefer = libraryPage.indexOf('id="auto-swap-prefer-lower-tier-toggle"');
+    expect(req).toBeGreaterThan(panel);
+    expect(req).toBeGreaterThan(master);
+    expect(req).toBeLessThan(prefer);
+    // 静态首帧总开关关：原因行不挂 hidden，「需先开启总开关」等价原因与设置保留语义都在行内。
+    const snippet = libraryPage.slice(req, req + 200);
+    expect(snippet).not.toMatch(/class="[^"]*\bhidden\b/);
+    expect(snippet).toContain("需先开启「额度耗尽自动切换」");
+    expect(snippet).toContain("已保存的子开关设置会保留");
+  });
+
+  it("静态首帧四个子开关 aria-describedby 都并入依赖原因行（与默认关态一致）", () => {
+    for (const id of [
+      "auto-swap-prefer-lower-tier-toggle",
+      "auto-swap-resident-lower-tier-toggle",
+      "auto-swap-pace-pre-swap-toggle",
+      "auto-swap-pre-reset-burn-toggle",
+    ]) {
+      expect(libraryPage).toMatch(
+        new RegExp(
+          `id="${id}"[^>]*aria-describedby="${id}-note auto-swap-subswitch-requirement"`,
+        ),
+      );
+    }
   });
 });
 

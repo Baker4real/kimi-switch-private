@@ -74,6 +74,11 @@ export interface AuthLink {
   user_code: string;
 }
 
+export interface WebBindChallenge {
+  nonce: string;
+  url: string;
+}
+
 /** 手动切换的立即返回载荷（issue #157）：activate（含审计、保持期）已提交的成功背书。
  * 前端据 account_id 立即把所点卡片标记为当前账号；额度数字沿用既有缓存值，
  * 后台快照到齐后整体刷新。 */
@@ -159,6 +164,10 @@ export function createApi(invokeFn: InvokeFn) {
     /** 绑定网页登录（issue #51）：token 只经 Tauri IPC 发给后端管道，不落 store。 */
     bindWebAccount: (id: string, token: string) =>
       call<Snapshot>("bind_web_account", { id, token }),
+    beginWebBind: (id: string) => call<WebBindChallenge>("begin_web_bind", { id }),
+    completeWebBind: (id: string, nonce: string) =>
+      call<Snapshot>("complete_web_bind", { id, nonce }),
+    cancelWebBind: (nonce: string) => call<void>("cancel_web_bind", { nonce }),
     openUrl: (url: string) => call<void>("open_url", { url }),
     setProactiveRenewal: (enabled: boolean) =>
       call<boolean>("set_proactive_renewal", { enabled }),
