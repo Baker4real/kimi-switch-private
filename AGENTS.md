@@ -13,7 +13,7 @@ src-ui/                  浅蓝白卡片风前端（总览 / 账号库两个路�
 scripts/generate-icons.mjs  图标确定性生成器（改图标改这里的常量后重跑，勿手改 icons/ 二进制；icons/ 变更不会触发 tauri-build 重嵌 exe 图标资源，GUI 构建前需先 touch src-tauri/build.rs）
 crates/providers/common/ 文件型 OAuth 账号切换共享引擎（FileBlobProvider/FileBlobRuntime）
 crates/providers/kimi/   Kimi 适配器（设备码授权、token 刷新协调、额度查询、官方昵称 /me、绑定网页登录）；网络发送统一走 src/net.rs（env 代理不可达回退直连，ADR-0005；有 timeout 时回退只用剩余时间，新增请求勿内联建 client）
-edge-extension/          Edge 免粘贴绑定扩展（MV3 三文件私有分发包：仅带挑战 fragment 的控制台页读网页凭证→一次性 loopback 回调，ADR-0018；协议字面量与权限面由 src-ui/edge-extension-contract.test.ts 静态钉住，改协议两侧测试同改）
+edge-extension/          Edge 免粘贴绑定扩展（MV3 三文件私有分发包：仅带挑战 fragment 的控制台页读网页凭证→一次性 loopback 回调，再凭 nonce 只读回查状态并在挑战页显示结果，ADR-0018；协议字面量与权限面由 src-ui/edge-extension-contract.test.ts 静态钉住，改协议两侧测试同改；真实 Edge 交接不再作为关闭条件，且尚未真机核对）
 ```
 
 ## 规则

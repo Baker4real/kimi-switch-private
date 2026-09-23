@@ -9,7 +9,7 @@
 1. 在 Edge 打开 `edge://extensions`，开启「开发人员模式」。
 2. 选择「加载解压缩的扩展」，选中本目录（`edge-extension/`，即包含 `manifest.json` 的目录）。
 3. 在 kimi-switch 的某张账号卡上点击「绑定 / 重新绑定」→「从 Edge 自动读取并绑定」。程序会打开带一次性挑战的 Kimi 控制台页面。
-4. 在 Edge 登录目标 Kimi 网页账号。扩展只在该挑战页面读取 `localStorage.access_token`，然后把它一次性发回本机 GUI，完成绑定。
+4. 在 Edge 登录目标 Kimi 网页账号。扩展只在该挑战页面读取 `localStorage.access_token`，然后把它一次性发回本机 GUI，完成绑定。绑定结果会短暂显示在挑战页面。
 
 安装不需要以任何特殊参数（包括远程调试）启动 Edge。
 
@@ -56,4 +56,4 @@ manifest 权限逐条对照（以 `manifest.json` 为准）：
 
 ## 分发状态
 
-当前为项目内私有分发包（本目录源码），尚未提交 Edge Add-ons 商店审核。真实 Edge 交接、企业策略与 Local Network Access 行为仍需在目标机器验收。
+当前为项目内私有分发包（本目录源码），尚未提交 Edge Add-ons 商店审核。真实 Edge 交接、企业策略与 Local Network Access 尚未在目标机器核对；按 2026-09-23 的决定，这不再作为 #170 / #176 的关闭条件。本地测试不写成该项已通过。

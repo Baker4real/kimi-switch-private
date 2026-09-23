@@ -5,7 +5,7 @@
 mod backend;
 mod dto;
 
-pub use backend::Backend;
+pub use backend::{finish_edge_web_bind, Backend, BindWebReady};
 pub use dto::{
     AccountRow, AuthLink, CommandError, MessageTone, QuotaTone, QuotaView, Snapshot, SwapOutcome,
     UiMessage, UiMessageKind, URGENT_USED_RATIO,
@@ -31,6 +31,7 @@ mod tests {
         attach_auto_swap_message, attach_skip_message, auth_success_message,
         auto_swap_opt_out_message, auto_swap_success_message, bind_web_success_message,
         bind_web_user_message, cached_membership_plan, collect_account_rows,
+        finish_edge_web_bind, BindWebReady,
         collect_account_rows_scoped, credential_locally_dead, delete_success_message,
         import_success_message, pre_reset_burn_message, pre_reset_burn_return_message,
         reauth_success_message, rename_success_message, startup_notice_message,
@@ -592,6 +593,62 @@ mod tests {
             "disk unavailable".into(),
         ));
         assert_eq!(store, "绑定失败：credential store: disk unavailable");
+    }
+
+    /// Edge 收尾：网页状态在额度快照之前发布。失败不跑快照，发布的是 `{:#}` 文案。
+    #[tokio::test]
+    async fn edge_web_bind_publishes_status_before_snapshot() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let ready = BindWebReady {
+            message: UiMessage::ok("绑定成功，有效期至 2027-08-27"),
+        };
+        let publish_order = Arc::clone(&order);
+        let snapshot_order = Arc::clone(&order);
+        let text = finish_edge_web_bind(
+            Ok(ready),
+            |outcome| {
+                assert!(outcome.is_none(), "成功发布不带失败文案");
+                publish_order.lock().unwrap().push("publish");
+            },
+            |message| {
+                snapshot_order.lock().unwrap().push("snapshot");
+                async move { message.text }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "绑定成功，有效期至 2027-08-27");
+        assert_eq!(order.lock().unwrap().as_slice(), ["publish", "snapshot"]);
+
+        let mut published = None;
+        let mut snapshotted = false;
+        let error = anyhow::anyhow!("网页身份与该账号不一致，未绑定");
+        let failed: Result<(), _> = finish_edge_web_bind(
+            Err(error),
+            |outcome| published = outcome.map(str::to_string),
+            |_| {
+                snapshotted = true;
+                async {}
+            },
+        )
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            published.as_deref(),
+            Some("网页身份与该账号不一致，未绑定")
+        );
+        assert!(!snapshotted, "失败分支不得取额度快照");
+
+        let mut membership = None;
+        let membership_error = anyhow::anyhow!("会员信息获取失败，请稍后再试");
+        let membership_failed: Result<(), _> = finish_edge_web_bind(
+            Err(membership_error),
+            |outcome| membership = outcome.map(str::to_string),
+            |_| async {},
+        )
+        .await;
+        assert!(membership_failed.is_err());
+        assert_eq!(membership.as_deref(), Some("会员信息获取失败，请稍后再试"));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! 账号库读写与额度快照渲染。所有出口都是 DTO，不含凭证。
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -681,7 +682,17 @@ impl Backend {
     /// 绑定弱提示消失。失败映射为简洁中文（[`bind_web_user_message`]），不是额度
     /// 错误：不写账号行 `error`、不置 `credential_expired`、不动 `urgent_count`，
     /// 只经错误通道（前端 toast）表达，不影响切换。
+    /// 手动粘贴仍是快照完成才返回。
     pub async fn bind_web(&self, id: &str, web_token: &str) -> Result<Snapshot> {
+        let ready = self.settle_web_bind(id, web_token).await?;
+        Ok(self
+            .snapshot(Some(ready.message), QuotaCollectReason::Scheduled)
+            .await)
+    }
+
+    /// 绑定管道结算并写完审计，不取额度快照。网页凭证不进入返回值。
+    /// Edge 免粘贴在此之后、快照之前发布回查状态：快照会等额度查询，不能挡在发布前面。
+    pub async fn settle_web_bind(&self, id: &str, web_token: &str) -> Result<BindWebReady> {
         let target = AccountId(id.to_string());
         let outcome = web_membership::bind_web(
             self.registry.as_ref(),
@@ -694,10 +705,9 @@ impl Backend {
             Ok(binding) => {
                 self.audit
                     .append(AuditEvent::ok("bind-web", "kimi", Some(target.0.as_str())));
-                let message = bind_web_success_message(&binding);
-                Ok(self
-                    .snapshot(Some(message), QuotaCollectReason::Scheduled)
-                    .await)
+                Ok(BindWebReady {
+                    message: bind_web_success_message(&binding),
+                })
             }
             Err(error) => {
                 // 审计与 CLI bind-web 同源：英文 detail，管道保证不含 token。
@@ -1372,6 +1382,36 @@ pub(crate) fn pre_reset_burn_message(account: &Account) -> String {
 /// 抢用回程成功 toast 文案（issue #150），与自动切换成功共用同一消息通道。
 pub(crate) fn pre_reset_burn_return_message(account: &Account) -> String {
     format!("已回程 {}", display_name(account))
+}
+
+/// 网页绑定已结算（管道与审计已写完），尚未取额度快照。不含网页凭证。
+pub struct BindWebReady {
+    pub(crate) message: UiMessage,
+}
+
+/// Edge 免粘贴收尾：先发布回查状态，再取额度快照。
+/// `publish(None)` 表示管道成功；`Some` 是返回给 GUI 的既有 `{:#}` 文案。
+/// 失败不调用 `snapshot`。
+pub async fn finish_edge_web_bind<T, S, Fut>(
+    settled: Result<BindWebReady>,
+    mut publish: impl FnMut(Option<&str>),
+    snapshot: S,
+) -> Result<T>
+where
+    S: FnOnce(UiMessage) -> Fut,
+    Fut: Future<Output = T>,
+{
+    match settled {
+        Ok(ready) => {
+            publish(None);
+            Ok(snapshot(ready.message).await)
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            publish(Some(message.as_str()));
+            Err(error)
+        }
+    }
 }
 
 /// 绑定成功的 toast 文案（issue #51）。订阅无到期瞬间时到期展示回退弱提示，

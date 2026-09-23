@@ -75,7 +75,7 @@ Edge 扩展需要用户手动安装和撤销；首版为项目内可审计的私
 - GUI seam：自动绑定按钮启动 Edge 挑战并展示状态；成功展示现有 Snapshot；自动路径失败后手动粘贴仍可用；关闭/取消对话框清理挑战和输入框；token 不出 Snapshot 或错误日志。
 - 扩展静态契约：Manifest 只包含控制台路径脚本和 loopback host permission；脚本没有挑战时不读取 storage；读取后清除 fragment；service worker 只向固定 loopback 路径发送，不接受任意 URL。
 - CLI 回归：`bind-web <id|N>` stdin 行为保持，`--token` 仍被拒绝。
-- 真实 Edge 验收必须覆盖：正确账号免粘贴绑定、另一账号身份门拒绝、未登录/无 token、扩展未安装、多个 Edge profile、用户取消、超时、重复回调、会员接口失败和手动兜底。单元测试或前端构建通过不能替代真实 Edge 验收。
+- 真实 Edge 矩阵（正确账号免粘贴绑定、另一账号身份门拒绝、未登录/无 token、扩展未安装、多个 Edge profile、用户取消、超时、重复回调、会员接口失败、手动兜底，以及 Local Network Access）按 2026-09-23 的决定不再作为 #170 / #176 的关闭条件，也未在已登录 Edge 上执行。单元测试或前端构建通过不能写成该矩阵已通过。
 
 ## Out of Scope
 
@@ -90,5 +90,5 @@ Edge 扩展需要用户手动安装和撤销；首版为项目内可审计的私
 ## Further Notes
 
 - 现有 ADR-0004 仍是网页凭证分离、身份门、写序和 `GetSubscription` 的权威来源；本 spec 和 ADR-0018 只新增“用户主动发起的 Edge Local Storage 提取”路径。
-- 这是高风险凭证交接功能。发布报告必须把“候选实现、dry-run、构建通过、真实 Edge 交接、live verified”分开；未完成真实 Edge 验收不得宣称功能闭环。
-- 真实 Edge 行为还需核实目标 Edge 版本的 loopback Local Network Access、CORS/no-cors、企业策略和扩展安装限制；这些是验收项，不应在单元测试中假定为已验证。
+- 这是高风险凭证交接功能。发布报告必须把“候选实现、dry-run、构建通过、真实 Edge 交接、live verified”分开。真实 Edge 交接按 2026-09-23 的决定不再阻塞 #170 / #176 关闭；未做该项时不得宣称功能闭环，也不得把本地测试写成真实 Edge 已验收。
+- 目标 Edge 版本的 loopback Local Network Access、CORS/no-cors、企业策略和扩展安装限制尚未在目标机器核对。它们不再作为 #170 / #176 的关闭条件，也不应在单元测试中假定为已验证。

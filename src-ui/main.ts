@@ -265,7 +265,7 @@ function submitRename(): void {
   });
 }
 
-function submitBind(): void {
+export function submitBind(): void {
   if (store.get().busy) {
     return;
   }
@@ -295,7 +295,7 @@ const EDGE_BIND_FAILED_STATUS =
 /** Edge 免粘贴绑定（issue #173）：一次点击先 begin 发起挑战（Rust 随即打开 Edge
  * 控制台），再 complete 等待扩展回传并复用既有绑定管道。前端只持有一次性 nonce，
  * 网页凭证只在 Rust 侧流转，不进 WebView 返回值、DOM 或日志。 */
-async function bindFromEdge(id: string): Promise<Snapshot> {
+export async function bindFromEdge(id: string): Promise<Snapshot> {
   const status = required<HTMLParagraphElement>("bind-edge-status");
   status.textContent = "正在打开 Edge 控制台，等待网页凭证…";
   let nonce: string | null = null;
@@ -1003,7 +1003,7 @@ function startDeviceAuth(target: string | null, displayName: string): Promise<vo
 
 /** 打开绑定对话框（issue #51）：粘贴来源见文案；token 输入随每次关闭清空（close 事件），
  * 这里再清一次保证上次残留不出现。忙碌时不打开（防与进行中操作交错）。 */
-function openBindDialog(id: string): void {
+export function openBindDialog(id: string): void {
   if (store.get().busy) {
     return;
   }

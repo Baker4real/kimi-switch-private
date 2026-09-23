@@ -7,7 +7,9 @@ compile_error!(
 
 use std::sync::Arc;
 
-use kimi_switch_gui::{Backend, CommandError, QuotaCollectReason, Snapshot, SwapOutcome};
+use kimi_switch_gui::{
+    finish_edge_web_bind, Backend, CommandError, QuotaCollectReason, Snapshot, SwapOutcome,
+};
 use tauri::{Manager, State};
 
 mod web_bind;
@@ -135,6 +137,8 @@ async fn begin_web_bind(
 /// 等待 Edge 扩展把网页凭证交给一次性回调，再复用既有 bind-web 管道。
 /// 跨账号串线校验在 broker 内完成：目标账号已变化时丢弃回调凭证并报错。
 /// token 只在 Rust 内存中流转，不进入 WebView 返回值、日志或错误文本。
+/// wait 的错误由 broker 自己发布。管道结算并写完审计之后、额度快照之前，
+/// 按既有 GUI 文案发布回查状态；WebView 仍等快照返回。返回给 GUI 的 Result 文案不变。
 #[tauri::command]
 async fn complete_web_bind(
     state: State<'_, AppState>,
@@ -142,7 +146,14 @@ async fn complete_web_bind(
     nonce: String,
 ) -> Result<Snapshot, CommandError> {
     let token = state.web_bind.wait(&nonce, &id).await.map_err(map_err)?;
-    state.backend.bind_web(&id, &token).await.map_err(map_err)
+    let settled = state.backend.settle_web_bind(&id, &token).await;
+    finish_edge_web_bind(
+        settled,
+        |outcome| state.web_bind.publish_bind_outcome(&nonce, outcome),
+        |message| state.backend.snapshot(Some(message), QuotaCollectReason::Scheduled),
+    )
+    .await
+    .map_err(map_err)
 }
 
 /// 取消等待中的 Edge 绑定；不会写凭证，也不会改变已有绑定。
