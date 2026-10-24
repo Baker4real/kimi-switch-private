@@ -29,10 +29,11 @@ pub const AUTO_SWAP_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 /// 即使已达阈值。
 pub const AUTO_SWAP_SETTLE_GRACE_MS: i64 = 60 * 1000;
 
-/// 手动切换后的「回驻保持期」（毫秒）（issue #95 / ADR-0008）。
+/// 手动切换后的「手动保持期」（毫秒）（issue #95 / ADR-0008；抢用见 ADR-0014 第 10 条）。
 ///
 /// 任何手动切换成功后写 `manual_hold_until`；此窗口内不触发回驻（非耗尽的
-/// 档位偏好切换），耗尽被迫切换不受影响。不进 GUI，只在 config.toml 调。
+/// 档位偏好切换），也不新开重置前抢用；耗尽被迫切换不受影响。不进 GUI，只在
+/// config.toml 调。
 pub const AUTO_SWAP_MANUAL_HOLD_MS: i64 = 8 * 60 * 60 * 1000;
 
 /// 耗尽 / pace 路径候选防抖边际（0.0~1.0）（issue #108 / ADR-0010，pace 复用见 ADR-0013）。

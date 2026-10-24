@@ -992,8 +992,8 @@ async fn swap(ctx: &AppContext, id_input: Option<&str>) -> Result<()> {
                 AuditEvent::ok("activate", "kimi", Some(acc.id.0.as_str()))
                     .with_duration_ms(activate_started.elapsed().as_millis() as u64),
             );
-            // 手动切换写回驻保持期（issue #97 / ADR-0008）：期间回驻不触发，
-            // 耗尽被迫切换不受影响。只写本机状态文件，不引入网络依赖；
+            // 手动切换写保持期（issue #97 / ADR-0008，ADR-0014 第 10 条）：期间回驻与
+            // 新开抢用不触发，耗尽被迫切换不受影响。只写本机状态文件，不引入网络依赖；
             // 写失败在 core 内只 warn，不影响 swap 成功结果。
             if let Ok(paths) = AppPaths::resolve() {
                 set_manual_hold_until(
@@ -3040,7 +3040,7 @@ mod tests {
     async fn passive_403_swaps_via_real_activate_despite_grace_and_hold() {
         let env = passive_env::isolate();
         let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
-        // 手动保持期写入（只约束回驻，不该挡被动耗尽切换）。
+        // 手动保持期写入（只约束回驻与新开抢用，不该挡被动耗尽切换）。
         {
             use kimi_switch_core::paths::AppPaths;
             let state = AppPaths::resolve().unwrap().auto_swap_state_file();
