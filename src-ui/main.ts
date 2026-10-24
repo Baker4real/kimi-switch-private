@@ -124,7 +124,7 @@ const silentQuota = createSilentQuotaScheduler({
     // 适应性轮询（issue #161）：加密轮只对当前账号发真实查询；"all" 走全量。
     listAccounts: (scope) => api.listAccounts(false, scope === "current"),
     // 调度器自身轮次走不发 noteApplied 的入口（issue #183，契约见 SilentQuotaHost）。
-    applySnapshot: (snapshot, generation) => applySilentSnapshot(snapshot, generation),
+    applySnapshot: (snapshot) => applySilentSnapshot(snapshot),
     toast: (text, isError) => showToast(text, isError),
   },
 });
@@ -690,9 +690,13 @@ function reserveUserSnapshotGeneration(): number {
 }
 
 /** 应用用户发起的快照：启动首载、点「刷新」、各类账号操作、设备码授权、切换流的
- * 合成快照与切换后的后台重列。它们都是全量列表，经 noteApplied 让两条节奏从此刻起算。
+ * 合成快照与切换后的后台重列。它们都含全部账号行，经 noteApplied 让两条节奏从此刻起算。
+ * 残留（行为不改，spec #182 保留这条用户路径通知）：除「刷新」按 UserInitiated 收集外，
+ * 这些路径在后端按 Scheduled 收集，缓存不到 90 秒的停泊账号不重查（切换流的合成快照
+ * 沿用界面已有的行）。加密档里用户操作之后，下一轮全量要等 90 秒，停泊行的缓存会在
+ * 那之前越过 90 秒窗，最多约 80–90 秒按陈旧回退展示、不作自动切换候选。
  * 静默调度器自身轮次的快照不走这里，见 applySilentSnapshot。 */
-function applySnapshot(
+function applyUserSnapshot(
   next: Snapshot,
   generation: number,
   source: SnapshotAnnounceSource = "other",
@@ -706,11 +710,10 @@ function applySnapshot(
 
 /** 应用静默调度器自身轮次（全量轮与加密轮）的快照。两条节奏的簿记归调度器，本轮完成后
  * 它按本轮范围自行记账，这里不得发 noteApplied：否则每个加密轮都把「最近一次全量收集」
- * 重置成此刻，停泊账号的 90s 全量轮被无限顺延（issue #183）。 */
-function applySilentSnapshot(next: Snapshot, generation: number): void {
-  if (!silentQuota.generation.applyIfCurrent(generation)) {
-    return;
-  }
+ * 重置成此刻，停泊账号的 90s 全量轮被无限顺延（issue #183）。
+ * 这里不再查世代：调度器 run() 同步调用 host.applySnapshot 之前，刚对同一世代
+ * applyIfCurrent 过，中间没有 await，再查恒为真。 */
+function applySilentSnapshot(next: Snapshot): void {
   paintAppliedSnapshot(next, "other");
 }
 
@@ -752,7 +755,7 @@ async function runAction(label: string, action: () => Promise<Snapshot>): Promis
   setBusy(true, label);
   const generation = reserveUserSnapshotGeneration();
   try {
-    applySnapshot(await action(), generation);
+    applyUserSnapshot(await action(), generation);
     hideLibraryRetry();
     return true;
   } catch (error) {
@@ -859,7 +862,7 @@ function refreshAfterSwapInBackground(): void {
       if (!silentQuota.generation.applyIfCurrent(generation)) {
         return;
       }
-      applySnapshot(next, generation);
+      applyUserSnapshot(next, generation);
     } catch {
       // 后台刷新失败不 toast：额度区此刻显示的是切换成功账号的缓存值。
     }
@@ -876,7 +879,7 @@ async function runSwap(id: string): Promise<boolean> {
       setBusy,
       reserveGeneration: reserveUserSnapshotGeneration,
       currentSnapshot: () => store.get().snapshot,
-      applySnapshot,
+      applySnapshot: applyUserSnapshot,
       showToast,
       reportError: (message) => {
         lastActionError = message;
@@ -902,7 +905,7 @@ async function refreshQuotas(): Promise<void> {
   try {
     await runUserQuotaRefresh({
       list: () => api.listAccounts(true),
-      applySnapshot: (snapshot) => applySnapshot(snapshot, generation, "refresh"),
+      applySnapshot: (snapshot) => applyUserSnapshot(snapshot, generation, "refresh"),
       toast: (text, isError = false) => showToast(text, isError),
     });
   } finally {
@@ -919,7 +922,7 @@ async function loadInitialSnapshot(): Promise<void> {
   try {
     const initial = await api.listAccounts();
     // 启动加载不是用户点「刷新」，不弹会员到期 toast。
-    applySnapshot(initial, generation);
+    applyUserSnapshot(initial, generation);
   } catch (error) {
     showToast(commandError(error).message, true);
     setOverviewLoadError(true);
@@ -1005,7 +1008,7 @@ function startDeviceAuth(target: string | null, displayName: string): Promise<vo
       isBusy: () => store.get().busy,
       setBusy,
       reserveGeneration: reserveUserSnapshotGeneration,
-      applySnapshot,
+      applySnapshot: applyUserSnapshot,
       showError: (message) => {
         lastActionError = message;
         authHoldOpen = true;

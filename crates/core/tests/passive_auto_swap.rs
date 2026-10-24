@@ -1,6 +1,7 @@
 //! 配额失败被动切换（issue #162，spec #152 实现决策 14；#184 改认官方 429）核心面测试：
 //! - StopFailure 事件分类纯函数：官方 429 耗尽文案与旧口径 403 配额文案命中；
-//!   非耗尽 429 与其他错误不命中；畸形静默；
+//!   非耗尽 429、其他错误、用户内容字段（会话标题 / 工作目录）与不在命中文案本地的
+//!   状态信号不命中；畸形静默；
 //! - 权威耗尽证据合成 [`overlay_exhausted_snapshot`]；
 //! - 被动门面 [`decide_auto_swap_passive_from_state`]：安顿宽限与手动保持期不阻挡、
 //!   冷却照常，资格线 / 防抖边际 / 摘出等全部继承轮询路径。
@@ -64,6 +65,31 @@ fn ready(id: &str, quotas: Vec<Quota>) -> QuotaSnapshot {
         membership: None,
         state: QuotaState::Ready(quotas),
     }
+}
+
+/// 夹具工作目录（不含状态码样子的数字）。
+const WORKSPACE: &str = r"D:\agents\projects\kimi-switch";
+
+/// Kimi Code CLI 2.3.0 的 StopFailure 载荷形态：平铺对象
+/// `{hook_event_name, session_id, cwd, session_title, error_type, error_message}`。
+/// 形态出自 #182 评审对本机 kimi.exe 内嵌源码的阅读（withSessionFacts /
+/// notifyStopFailure / titleFromPromptMetadataText），未抓过真机事件。`session_title`
+/// 是首句用户提示的前 200 字，`cwd` 是会话工作目录，两者都是用户内容。
+fn stop_failure_event(
+    cwd: &str,
+    session_title: &str,
+    error_type: &str,
+    error_message: &str,
+) -> String {
+    serde_json::json!({
+        "hook_event_name": "StopFailure",
+        "session_id": "0b7c2f9e-5d1a-4c3b-9e8f-1a2b3c4d5e6f",
+        "cwd": cwd,
+        "session_title": session_title,
+        "error_type": error_type,
+        "error_message": error_message,
+    })
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +317,169 @@ fn classify_429_signal_requires_standalone_token() {
     }
 }
 
+/// 真实平铺载荷（Kimi Code CLI 2.3.0）：状态码以 "429 " / "403 " 前缀出现在
+/// error_message 里。官方 429 三种文案命中并辨认窗口，旧口径 403 同样命中；
+/// 标题引用别的窗口的文案不影响窗口辨认。
+#[test]
+fn classify_matches_real_flat_payload() {
+    let cases = [
+        // 2026-10-24 真机会话日志 errorMessage 原文。
+        (
+            "修一下 README",
+            "APIProviderQuotaExhaustedError",
+            "429 You've reached your 5-hour usage limit",
+            Some(QuotaWindow::FiveHour),
+        ),
+        (
+            "修一下 README",
+            "APIProviderQuotaExhaustedError",
+            "429 You've reached your weekly (7-day) usage limit.",
+            Some(QuotaWindow::SevenDay),
+        ),
+        (
+            "修一下 README",
+            "APIProviderQuotaExhaustedError",
+            "429 You've reached your monthly usage limit for this billing cycle.",
+            Some(QuotaWindow::Month),
+        ),
+        // 旧口径：2026-10-08 真机会话日志还是 `403 … APIStatusError`。
+        (
+            "修一下 README",
+            "APIStatusError",
+            "403 You've reached your 5-hour usage limit",
+            Some(QuotaWindow::FiveHour),
+        ),
+        // 标题引用月度文案，真实错误是 5 小时：窗口只从命中的错误文案辨认。
+        (
+            "You've reached your monthly usage limit for this billing cycle 是什么意思",
+            "APIProviderQuotaExhaustedError",
+            "429 You've reached your 5-hour usage limit",
+            Some(QuotaWindow::FiveHour),
+        ),
+    ];
+    for (title, error_type, message, window) in cases {
+        let raw = stop_failure_event(WORKSPACE, title, error_type, message);
+        assert_eq!(
+            classify_stop_failure(&raw),
+            StopFailureSignal::QuotaExhausted { window },
+            "应命中额度耗尽：{raw}"
+        );
+    }
+}
+
+/// 承载用户内容的字段不参与分类（#182 评审）：`session_title` 是首句用户提示，
+/// `cwd` 是工作目录。用户在提示里贴耗尽报错排查之后，这个会话撞上的瞬时 429、
+/// 网络错误或别的 403 都不得判成耗尽。
+#[test]
+fn classify_ignores_user_content_fields() {
+    let cases = [
+        // 标题引用耗尽文案 + 过载 429。
+        (
+            WORKSPACE,
+            "You've reached your 5-hour usage limit 之后自动切换没切，帮我查",
+            "APIProviderOverloadedError",
+            "429 The engine is currently overloaded, please try again later",
+        ),
+        // 标题引用耗尽文案 + 并发上限 429。
+        (
+            WORKSPACE,
+            "You've reached your 5-hour usage limit 之后自动切换没切，帮我查",
+            "APIProviderRateLimitError",
+            "429 You've reached your concurrent request limit.",
+        ),
+        // 标题自带 429 与耗尽文案 + 网络错误。
+        (
+            WORKSPACE,
+            "429 You've reached your 5-hour usage limit 是什么意思",
+            "APIConnectionError",
+            "Connection error.",
+        ),
+        // 工作目录里的 429 + 标题引用耗尽文案 + 没有耗尽文案的 500。
+        (
+            r"D:\work\issue-429",
+            "You've reached your 5-hour usage limit 排查",
+            "APIStatusError",
+            "500 internal: conn closed",
+        ),
+        // 旧口径：标题含 usage limit + 不是额度耗尽的 403（会员等级不含所请求的模型）。
+        (
+            WORKSPACE,
+            "被动切换的 usage limit 识别口径",
+            "APIStatusError",
+            "403 Your current subscription does not have access to this model.",
+        ),
+    ];
+    for (cwd, title, error_type, message) in cases {
+        let raw = stop_failure_event(cwd, title, error_type, message);
+        assert_eq!(
+            classify_stop_failure(&raw),
+            StopFailureSignal::Other,
+            "用户内容不得触发：{raw}"
+        );
+    }
+}
+
+/// 信号局部性（#182 评审）：状态信号须与命中文案出自同一字符串，或是与该字符串
+/// 同处一个 JSON 对象的状态码（数值，或整串就是状态码的字符串）。别的对象里的数字、
+/// 时间戳、request id，以及同一对象里另一句话中的 "429" / "403"，都不算。
+#[test]
+fn classify_status_signal_must_be_local_to_matched_text() {
+    let cases = [
+        r#"{"ts":"2026-10-24T12:39:42.429+08:00","error":{"status":500,"message":"You've reached your 5-hour usage limit."}}"#,
+        r#"{"request_id":"req_429_ab","error":{"status":500,"message":"You've reached your 5-hour usage limit."}}"#,
+        r#"{"duration_ms":429,"error":{"status":500,"message":"You've reached your 5-hour usage limit."}}"#,
+        r#"{"error":{"message":"You've reached your 5-hour usage limit.","detail":"HTTP 429"}}"#,
+        // 旧口径同理：403 属于会员等级权限错误，usage limit 在另一个字段。
+        r#"{"error_message":"403 Your current subscription does not have access to this model.","hint":"see the usage limit docs"}"#,
+    ];
+    for raw in cases {
+        assert_eq!(
+            classify_stop_failure(raw),
+            StopFailureSignal::Other,
+            "不在命中文案本地的状态信号不算：{raw}"
+        );
+    }
+}
+
+/// 状态 token 收紧（#182 评审）：`_` 算词字符，数字之间的 `.` 算数字的一部分。
+/// 同一字符串里 ISO 毫秒（`12:39:42.429`）、request id（`req_429_ab`）、小数
+/// （`429.5`）里的 429 / 403 不算状态信号；句末的 `.` 仍是边界。
+#[test]
+fn classify_status_token_treats_underscore_and_decimal_point_as_part_of_word() {
+    let negatives = [
+        r#"{"error":{"message":"[2026-10-24T12:39:42.429+08:00] You've reached your 5-hour usage limit."}}"#,
+        r#"{"error":{"message":"req_429_ab: You've reached your 5-hour usage limit."}}"#,
+        r#"{"error":{"message":"You've reached your 5-hour usage limit. Retry after 429.5 ms"}}"#,
+        r#"{"error":{"message":"[12:39:42.403] usage limit check failed"}}"#,
+        r#"{"error":{"message":"req_403_ab: usage limit check failed"}}"#,
+    ];
+    for raw in negatives {
+        assert_eq!(
+            classify_stop_failure(raw),
+            StopFailureSignal::Other,
+            "数字或标识符里的状态码子串不算：{raw}"
+        );
+    }
+
+    let positives = [
+        (
+            r#"{"error":{"message":"You've reached your 5-hour usage limit, status 429."}}"#,
+            Some(QuotaWindow::FiveHour),
+        ),
+        (
+            r#"{"error":{"message":"usage limit reached, status 403."}}"#,
+            None,
+        ),
+    ];
+    for (raw, window) in positives {
+        assert_eq!(
+            classify_stop_failure(raw),
+            StopFailureSignal::QuotaExhausted { window },
+            "句末的点后面没有数字，状态码照常算：{raw}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 权威耗尽证据合成
 // ---------------------------------------------------------------------------
@@ -444,7 +633,7 @@ fn passive_bypasses_settle_grace_while_polling_stays() {
             usage_ratio: 1.0,
             kind: kimi_switch_core::AutoSwapKind::Exhausted,
         }),
-        "403 权威耗尽证据不受安顿宽限阻挡"
+        "额度耗尽原文是权威耗尽证据，不受安顿宽限阻挡"
     );
 }
 
