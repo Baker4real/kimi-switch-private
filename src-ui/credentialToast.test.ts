@@ -83,13 +83,13 @@ describe("credentialRecoveredToast", () => {
   });
 });
 
-describe("applySnapshot 接线（issue #105）", () => {
+describe("applyUserSnapshot 接线（issue #105）", () => {
   it("应用快照时用上一份 vs 这一份账号行调用凭证恢复 toast", () => {
     const main = readFileSync(
       join(dirname(fileURLToPath(import.meta.url)), "main.ts"),
       "utf8",
     );
-    const start = main.indexOf("function applySnapshot");
+    const start = main.indexOf("function applyUserSnapshot");
     const end = main.indexOf("function stopSilentQuotaQueries");
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);

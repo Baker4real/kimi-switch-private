@@ -124,7 +124,8 @@ export interface SilentQuotaHost {
   listAccounts(scope: SilentQuotaScope): Promise<Snapshot>;
   /** 应用调度器自身轮次（全量轮与加密轮）的快照。契约（issue #183）：宿主可以绘制并重新
    * `arm()`，但不得调用 `noteApplied()`——两条节奏的簿记归调度器，本轮完成后按本轮范围
-   * 自行记账。宿主若在这里重置节奏，加密档期间停泊账号的 90s 全量轮会被无限顺延。 */
+   * 自行记账。宿主若在这里重置节奏，加密档期间停泊账号的 90s 全量轮会被无限顺延。
+   * 调度器只在 `generation.applyIfCurrent(generation)` 刚通过后同步调用本方法，宿主不必再查世代。 */
   applySnapshot(snapshot: Snapshot, generation: number): void;
   toast(text: string, isError: boolean): void;
 }
