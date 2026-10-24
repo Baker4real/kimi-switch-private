@@ -24,6 +24,23 @@ describe("quotaHtml", () => {
     expect(quotaHtml([], null, null, false)).toBe(`<p class="quota-reset">额度：n/a</p>`);
   });
 
+  it("总览和账号库都把5小时排在7天上方且不改输入", () => {
+    const quotas = [
+      quota({ window: "7天", text: "70 / 100" }),
+      quota({ window: "5小时", text: "20 / 100" }),
+    ];
+    for (const variant of ["card", "hero"] as const) {
+      const html = quotaHtml(quotas, null, null, false, variant);
+      const fiveHourAt = html.indexOf(`<span class="quota-label">5小时</span>`);
+      const sevenDayAt = html.indexOf(`<span class="quota-label">7天</span>`);
+      expect(fiveHourAt).toBeGreaterThanOrEqual(0);
+      expect(sevenDayAt).toBeGreaterThan(fiveHourAt);
+      expect(html).toContain("20 / 100");
+      expect(html).toContain("70 / 100");
+    }
+    expect(quotas.map((item) => item.window)).toEqual(["7天", "5小时"]);
+  });
+
   it("额度条带 progressbar 语义与窗口名、用量文字", () => {
     const html = quotaHtml([quota()], null, null, false);
     expect(html).toContain(`role="progressbar"`);

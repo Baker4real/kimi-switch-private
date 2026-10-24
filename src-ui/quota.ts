@@ -49,6 +49,9 @@ export function quotaHtml(
   credentialExpired: boolean,
   variant: QuotaVariant = "card",
 ): string {
+  const displayQuotas = [...quotas].sort(
+    (a, b) => Number(b.window === "5小时") - Number(a.window === "5小时"),
+  );
   let body: string;
   if (error && credentialExpired) {
     // 凭证待续期是凭证生命周期状态，不是查询故障：不按错误红渲染。
@@ -60,9 +63,9 @@ export function quotaHtml(
   } else if (quotas.length === 0) {
     body = `<p class="quota-reset">额度：n/a</p>`;
   } else if (variant === "hero") {
-    body = quotas.map((q) => heroQuotaRowHtml(q)).join("");
+    body = displayQuotas.map((q) => heroQuotaRowHtml(q)).join("");
   } else {
-    body = quotas
+    body = displayQuotas
       .map((q) => {
         const width = quotaPercent(q.ratio ?? 0);
         const reset = q.reset ? `<span class="quota-reset">${escapeHtml(q.reset)}</span>` : "";
