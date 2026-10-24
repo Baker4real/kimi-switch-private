@@ -123,7 +123,8 @@ const silentQuota = createSilentQuotaScheduler({
     accounts: () => store.get().snapshot?.accounts ?? null,
     // 适应性轮询（issue #161）：加密轮只对当前账号发真实查询；"all" 走全量。
     listAccounts: (scope) => api.listAccounts(false, scope === "current"),
-    applySnapshot: (snapshot, generation) => applySnapshot(snapshot, generation),
+    // 调度器自身轮次走不发 noteApplied 的入口（issue #183，契约见 SilentQuotaHost）。
+    applySnapshot: (snapshot, generation) => applySilentSnapshot(snapshot, generation),
     toast: (text, isError) => showToast(text, isError),
   },
 });
@@ -688,6 +689,9 @@ function reserveUserSnapshotGeneration(): number {
   return silentQuota.generation.reserveUser();
 }
 
+/** 应用用户发起的快照：启动首载、点「刷新」、各类账号操作、设备码授权、切换流的
+ * 合成快照与切换后的后台重列。它们都是全量列表，经 noteApplied 让两条节奏从此刻起算。
+ * 静默调度器自身轮次的快照不走这里，见 applySilentSnapshot。 */
 function applySnapshot(
   next: Snapshot,
   generation: number,
@@ -697,6 +701,22 @@ function applySnapshot(
     return;
   }
   silentQuota.noteApplied();
+  paintAppliedSnapshot(next, source);
+}
+
+/** 应用静默调度器自身轮次（全量轮与加密轮）的快照。两条节奏的簿记归调度器，本轮完成后
+ * 它按本轮范围自行记账，这里不得发 noteApplied：否则每个加密轮都把「最近一次全量收集」
+ * 重置成此刻，停泊账号的 90s 全量轮被无限顺延（issue #183）。 */
+function applySilentSnapshot(next: Snapshot, generation: number): void {
+  if (!silentQuota.generation.applyIfCurrent(generation)) {
+    return;
+  }
+  paintAppliedSnapshot(next, "other");
+}
+
+/** 两个应用入口共用的步骤：绘制快照、弹快照与凭证恢复 toast，再按新快照重新 arm。
+ * 不碰调度器的节奏簿记。 */
+function paintAppliedSnapshot(next: Snapshot, source: SnapshotAnnounceSource): void {
   // paintSnapshot 会覆盖 store 快照，待续期 diff 必须用上一份。
   const previousAccounts = store.get().snapshot?.accounts ?? null;
   paintSnapshot(next);
@@ -1267,7 +1287,9 @@ function wireList(): void {
   });
 }
 
-async function init(): Promise<void> {
+/** GUI 外壳启动入口。导出只作测试接缝（外壳接线测试在 JSDOM 里驱动真实启动流程）；
+ * 生产启动仍只由文件末尾的 VITEST 守卫触发一次。 */
+export async function init(): Promise<void> {
   await setupWindowControls();
   // 状态栏版本号：构建时注入的 package.json version，缺失/非法时回退 0.0.0。
   required<HTMLElement>("app-version").textContent = appVersionLabel(injectedAppVersion);
