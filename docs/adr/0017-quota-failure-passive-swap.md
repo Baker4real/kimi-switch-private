@@ -3,7 +3,7 @@ type: adr
 title: 配额失败被动切换：StopFailure hook 秒级唤起，403 原文即权威耗尽证据
 status: accepted
 tags: [auto-swap, passive-swap, stop-failure-hook, install-hook, credential-health]
-intent: Record the quota-failure passive swap trigger (spec #152 decisions 14-17): Kimi Code 0.42.0 provides the official StopFailure hook channel, reversing CONTEXT.md's old avoidance of "swap on 403"; an observer-only CLI subcommand always exits 0, classifies "usage limit" as a case-insensitive substring plus a word-boundary 403 token (official copy is "You've reached your ... usage limit"), overlays the authoritative exhaustion evidence without touching quota cache, inherits the exhaustion decision semantics via a dedicated serialization lock, installs the hook only through an idempotent install-hook subcommand, and narrows the local credential health check to invalid_grant fingerprints only (JWT exp excluded by an explicit, reversible ruling). Live 403 is manual acceptance and does not block release.
+intent: Record the quota-failure passive swap trigger (spec #152 decisions 14-17): Kimi Code 0.42.0 provides the official StopFailure hook channel, reversing CONTEXT.md's old avoidance of "swap on 403"; an observer-only CLI subcommand always exits 0, classifies "usage limit" as a case-insensitive substring plus a word-boundary 403 token (official copy is "You've reached your ... usage limit"), overlays the authoritative exhaustion evidence without touching quota cache, inherits the exhaustion decision semantics via a dedicated serialization lock, installs the hook only through an idempotent install-hook subcommand, and narrows the local credential health check to invalid_grant fingerprints only (JWT exp excluded by an explicit, reversible ruling). Live 403 is manual acceptance and does not block release. Ruling change on 2026-10-24 (issue 184) - the official error reference moved quota exhaustion to HTTP 429, so a 429 signal now also matches when one string contains both "reached your" and "usage limit"; legacy 403 plus usage limit is kept, other 429s never match, and live 429 is manual acceptance.
 documents:
   symbols:
     - classify_stop_failure
@@ -25,6 +25,7 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
 
 关键事实（spec 已核实）：配额耗尽 = HTTP 403，5 小时窗 / 7 天窗 / 月度各有
 "You've reached your ... usage limit" 文案，官方明示重试无意义、会话不销毁；429 仅为瞬时限流/引擎过载，与配额无关。
+（2026-10-24 起官方已把额度耗尽改为 429，见文末「裁定变迁」。）
 
 ## 决策
 
@@ -47,6 +48,7 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
    不另认 `You've reached` 前缀。两者缺一归其他：429 过载/瞬时限流绝不匹配。官方未枚举
    事件 JSON 的错误字段，因此不依赖 hook 的 matcher 做过滤，而是在子命令内部对 stdin
    原文分类——hook schema 变化最坏只会**漏**触发，不会**误**触发。非合法 JSON 一律归其他。
+   **2026-10-24 起本条的「429 绝不匹配」由文末「裁定变迁」取代。**
 
 4. **窗口辨认是尽力而为。** 从含 "usage limit" 的字符串辨认耗尽窗口（"month" → 月度；
    "5"+"hour" → 5 小时；"7"+"day" → 7 天），辨认不出为 None——只影响权威证据标注哪个
@@ -150,3 +152,50 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
   判定起点。
 - **快检认 JWT exp（spec 原措辞）**：见决策 9 裁定——exp 口径会在被动切换主场景排空全部
   候选，把新功能变静默空转；裁定可推翻，推翻时须先解停泊账号自然过期问题。
+
+## 裁定变迁（2026-10-24，#182 / #184）：额度耗尽改认官方 429
+
+**推翻决策 3 与 spec #152 决策 14 的「429 绝不匹配」。** 重开的原因是官方语义变了：额度
+耗尽本身改成了 429。
+
+- 官方[错误参考](https://www.kimi.com/code/docs/kimi-code/error-reference.html)（2026-10-24
+  访问）把 5 小时、7 天（weekly，仅老会员）和月度额度耗尽统一归为 HTTP 429，前缀为
+  `error, status code: 429, message:`，文案仍是固定的 "You've reached your … usage limit"：
+  `You've reached your 5-hour usage limit.`、`You've reached your weekly (7-day) usage limit.`、
+  `You've reached your monthly usage limit for this billing cycle.`。并发上限
+  （`You've reached your concurrent request limit.`）、too many requests、engine overloaded
+  是另外几类 429；403 改为套餐权益类错误。
+- 本机会话日志对得上：2026-10-08 还是 `403 … APIStatusError`；2026-10-24 12:39:42（东八区）
+  已是 `429 You've reached your 5-hour usage limit`（`APIProviderQuotaExhaustedError`，
+  Kimi Code CLI 2.3.0，2026-10-21 发布）。旧分类器只认 403，把这次 429 静默放行，只打
+  debug 日志，审计里没有任何痕迹。
+
+**新口径。** `classify_stop_failure` 仍对整份事件 JSON 递归扫描、大小写不敏感、不依赖官方
+未文档化的字段名，满足任一条即判耗尽：
+
+1. **官方 429**：同一个字符串同时含官方耗尽措辞 "reached your" 与 "usage limit"，且存在
+   429 信号——数值 429，或作为独立 token 的 "429"（词边界规则与 403 相同，时间戳、
+   request id 等数字串里的子串不算）。
+2. **旧口径 403（保留兜底）**：任一字符串含 "usage limit"，且存在 403 信号（决策 3 原规则）。
+
+其余一律归其他、静默放行，宁漏勿误：429 只提 usage limit 而无 "reached your"、
+"reached your" 与 "usage limit" 分在两个字符串、并发上限、too many requests、engine
+overloaded、403 的非配额文案、没有状态信号的耗尽文案。原决定「429 绝不匹配」的本意是防误
+触发；429 不再只代表瞬时限流之后，这个本意改由「同一字符串须含官方耗尽措辞」守住：只认
+"usage limit" 会把 `usage limit window busy` 一类 429 当成耗尽，只认 "reached your" 会把
+并发上限当成耗尽。窗口辨认（决策 4）规则不变，已覆盖 5-hour、"weekly (7-day)" 与
+"monthly … for this billing cycle"。
+
+**不变。** 决策 1、2、5–8 的编排原样继承：恒退出码 0、被动串行化锁、overlay 不回写额度
+缓存、耗尽路径语义（安顿宽限不阻挡）、审计写 `trigger=passive` 或 `no eligible candidate`、
+零新增网络请求；不新增配置项，hook 仍只经 `install-hook` 安装。上文的「403 原文」「撞
+403」一律读作「额度耗尽原文」「撞上额度耗尽」。
+
+**验收。** tempdir 端到端：`passive_429_usage_limit_swaps_via_real_activate`（真实 activate
+切到合格停泊账号、恰好一条 `trigger=passive` 审计）、`passive_429_no_eligible_candidate_keeps_live`、
+`passive_non_exhaustion_429_is_silent`；分类表在 `crates/core/tests/passive_auto_swap.rs`。
+真机 429 正路径沿用上文先例，手动验收、不阻塞关闭：重建 release CLI 后，下一次自然撞上
+429 额度耗尽时，审计里应出现 `trigger=passive` 的 auto_swap 记录；不向真机会话注入合成
+429，也不故意烧额度。官方 [hooks 文档](https://www.kimi.com/code/docs/kimi-code-cli/customization/hooks.html)
+仍没有列出 StopFailure 的 payload 字段，Kimi Code 2.3.0 的真实 StopFailure 样本尚未核实；
+真机没命中时，以真实样本为准补规则。

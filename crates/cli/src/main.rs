@@ -20,9 +20,10 @@
 //!   到期写进账号 extra，默认列表即可见「有效期至」。
 //! - `kimi-switch config`       — 打印生效配置（含 `proactive_renewal.enabled`，只读）。
 //!   与 GUI 设置页同源：都是 `<config_dir>/config.toml`。
-//! - `kimi-switch on-quota-failure` — 配额失败被动切换（issue #162，spec #152 决策 14）：
-//!   Kimi Code `StopFailure` hook 观察型入口，stdin 读事件 JSON，命中 403 配额耗尽
-//!   （"usage limit"）即以 403 原文为当前账号耗尽的权威证据，零新增网络查询，按耗尽
+//! - `kimi-switch on-quota-failure` — 配额失败被动切换（issue #162，spec #152 决策 14；
+//!   #184 改认官方 429）：Kimi Code `StopFailure` hook 观察型入口，stdin 读事件 JSON，
+//!   命中额度耗尽（官方 429 "You've reached your … usage limit"，兼容旧口径 403 +
+//!   "usage limit"）即以该原文为当前账号耗尽的权威证据，零新增网络查询，按耗尽
 //!   路径语义（安顿宽限与手动保持期不阻挡、冷却照常）复用既有自动切换判定与
 //!   activate。任何情况下退出码恒 0；stdin 畸形静默放行。
 //! - `kimi-switch install-hook [--uninstall]` — 幂等写入 / 卸载 Kimi Code
@@ -132,10 +133,12 @@ enum Cmd {
     /// Print the effective settings (read-only), as loaded from config.toml.
     Config,
 
-    /// Observe a Kimi Code StopFailure hook event (stdin JSON). On a 403
-    /// quota-exhaustion signal ("usage limit"), run one passive auto-swap
-    /// reusing the existing exhaustion-path decision. Zero new network
-    /// queries. Always exits 0 (observer hook; never blocks the session).
+    /// Observe a Kimi Code StopFailure hook event (stdin JSON). On a
+    /// quota-exhaustion signal (429 "You've reached your ... usage limit", or
+    /// legacy 403 + "usage limit"), run one passive auto-swap reusing the
+    /// existing exhaustion-path decision. Other 429s (overloaded, too many
+    /// requests, concurrent limit) are ignored. Zero new network queries.
+    /// Always exits 0 (observer hook; never blocks the session).
     OnQuotaFailure,
 
     /// Idempotently install (or remove with --uninstall) the Kimi Code
@@ -1163,9 +1166,9 @@ fn render_config() -> Result<String> {
 // on-quota-failure（配额失败被动切换，issue #162 / spec #152 决策 14）
 // ---------------------------------------------------------------------------
 
-/// Kimi Code `StopFailure` hook 观察型入口：stdin 读事件 JSON → 分类 → 命中 403
-/// 配额耗尽时按耗尽路径语义复用既有自动切换判定与 activate。零新增网络查询；
-/// 任何错误只写 stderr 日志，退出码由调用方恒置 0；stdin 畸形静默放行。
+/// Kimi Code `StopFailure` hook 观察型入口：stdin 读事件 JSON → 分类 → 命中额度
+/// 耗尽（官方 429 / 旧口径 403）时按耗尽路径语义复用既有自动切换判定与 activate。
+/// 零新增网络查询；任何错误只写 stderr 日志，退出码由调用方恒置 0；stdin 畸形静默放行。
 async fn on_quota_failure(ctx: &AppContext) {
     use std::io::Read;
 
@@ -1192,11 +1195,12 @@ async fn run_on_quota_failure_with(
         StopFailureSignal,
     };
 
-    // 1. 分类：仅 403 配额类（"usage limit"）命中；429 / 其他 / 畸形静默放行。
+    // 1. 分类：官方 429 "reached your … usage limit" 或旧口径 403 + "usage limit" 命中；
+    //    非耗尽 429（过载 / 请求过多 / 并发上限）/ 其他 / 畸形静默放行。
     let window = match classify_stop_failure(raw) {
         StopFailureSignal::QuotaExhausted { window } => window,
         StopFailureSignal::Other => {
-            tracing::debug!("on-quota-failure: not a quota-exhaustion 403; ignoring");
+            tracing::debug!("on-quota-failure: not a quota-exhaustion signal; ignoring");
             return Ok(());
         }
     };
@@ -1212,7 +1216,7 @@ async fn run_on_quota_failure_with(
     // 3. 被动串行化锁（独立于交换锁，无嵌套）：把「读状态 → 判定 → activate →
     //    写冷却」整段排成队列。并发触发时后到者在锁内重读状态，看到冷却或新
     //    当前账号健康即自然落空（issue #162 锁 + 冷却收敛；冷却写在 activate
-    //    返回之后，没有这把锁时 [提交, 写冷却] 间隙里迟到的触发会把 403 证据
+    //    返回之后，没有这把锁时 [提交, 写冷却] 间隙里迟到的触发会把耗尽证据
     //    错按在新当前账号上再切一跳）。等待超时视为另一触发处理中：观察型放弃。
     let lock_path = paths.state_dir.join("passive-swap.lock");
     let guard = tokio::task::spawn_blocking(move || PassiveSwapLock::acquire(&lock_path))
@@ -1243,7 +1247,7 @@ async fn run_on_quota_failure_with(
     // 保住被动判定的档位排序与回驻资格。
     kimi_switch_core::apply_cached_membership(&mut snapshots, &accounts);
 
-    // 5. 403 原文 = 当前账号耗尽的权威证据：合成/覆盖当前账号快照后进既有判定。
+    // 5. 耗尽原文 = 当前账号耗尽的权威证据：合成/覆盖当前账号快照后进既有判定。
     //    耗尽语义（冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆、候选本地
     //    凭证快检）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。
     let overlay = overlay_exhausted_snapshot(
@@ -3017,6 +3021,12 @@ mod tests {
         r#"{"hook_event_name":"StopFailure","session_id":"s-1","client_type":"kimi_code_cli","error":{"status":403,"message":"You have reached your 5-hour usage limit"}}"#.into()
     }
 
+    /// 官方现行额度耗尽事件（#184）：文案取 2026-10-24 真机会话日志 errorMessage 原文
+    /// （Kimi Code CLI 2.3.0），429 只出现在文案里；载荷字段名未经真机核实。
+    fn event_429_5h() -> String {
+        r#"{"hook_event_name":"StopFailure","session_id":"s-1","client_type":"kimi_code_cli","error":{"name":"APIProviderQuotaExhaustedError","message":"429 You've reached your 5-hour usage limit"}}"#.into()
+    }
+
     fn live_blob(env: &passive_env::IsolatedHomes) -> String {
         std::fs::read_to_string(env.kimi_home.join("credentials").join("kimi-code.json")).unwrap()
     }
@@ -3102,6 +3112,71 @@ mod tests {
         let audits = auto_swap_audits();
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].result, "error");
+        assert_eq!(audits[0].detail.as_deref(), Some("no eligible candidate"));
+    }
+
+    /// 端到端（#184）：官方 429 五小时额度耗尽事件与 403 同走耗尽路径。当前账号缓存
+    /// 未达阈值（80/100）也被权威证据覆写触发；夹具当前账号刚被选中，安顿宽限不阻挡；
+    /// 切换走真实 activate（live 变为 bob、registry active 翻转、冷却落盘、恰好一条
+    /// ok 审计且 detail 带 trigger=passive）。
+    #[tokio::test]
+    async fn passive_429_usage_limit_swaps_via_real_activate() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+        super::run_on_quota_failure_with(&ctx, &event_429_5h(), &passive_settings())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#
+        );
+        assert!(
+            ctx.registry
+                .list_by_provider("kimi")
+                .unwrap()
+                .iter()
+                .any(|a| a.id.0 == "bob" && a.active),
+            "registry active 应翻转为 bob"
+        );
+        use kimi_switch_core::paths::AppPaths;
+        let state = AppPaths::resolve().unwrap().auto_swap_state_file();
+        assert!(
+            kimi_switch_core::read_last_auto_swap_at(&state).is_some(),
+            "冷却应落盘"
+        );
+        let audits = auto_swap_audits();
+        assert_eq!(audits.len(), 1, "恰好一条 auto_swap 审计：{audits:?}");
+        assert_eq!(audits[0].result, "ok");
+        assert_eq!(audits[0].account.as_deref(), Some("bob"));
+        let detail = audits[0].detail.as_deref().unwrap();
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("trigger=passive"), "{detail}");
+    }
+
+    /// 429 额度耗尽但无合格候选（#184）：唯一停泊账号已达阈值 → live 不动，
+    /// 记一条 no eligible candidate 审计。
+    #[tokio::test]
+    async fn passive_429_no_eligible_candidate_keeps_live() {
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 99, 100)]);
+
+        super::run_on_quota_failure_with(&ctx, &event_429_5h(), &passive_settings())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#,
+            "无候选不得切换"
+        );
+        let audits = auto_swap_audits();
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].result, "error");
+        assert_eq!(audits[0].account.as_deref(), Some("alice"));
         assert_eq!(audits[0].detail.as_deref(), Some("no eligible candidate"));
     }
 
@@ -3209,6 +3284,37 @@ mod tests {
                 .unwrap();
 
             assert!(live_blob(&env).contains("alice"), "不得切换：{raw}");
+            assert!(auto_swap_audits().is_empty(), "不得写审计：{raw}");
+            use kimi_switch_core::paths::AppPaths;
+            assert!(
+                !AppPaths::resolve().unwrap().auto_swap_state_file().exists(),
+                "不得写状态文件：{raw}"
+            );
+        }
+    }
+
+    /// 不是额度耗尽的 429（#184）：引擎过载、请求过多、并发上限全部静默放行——
+    /// 无审计、无状态文件、live 不动（停泊账号 bob 明明合格也不切）。
+    #[tokio::test]
+    async fn passive_non_exhaustion_429_is_silent() {
+        for raw in [
+            r#"{"hook_event_name":"StopFailure","error":{"status":429,"message":"The engine is currently overloaded, please try again later"}}"#,
+            r#"{"hook_event_name":"StopFailure","error":{"status":429,"message":"Too Many Requests"}}"#,
+            r#"{"hook_event_name":"StopFailure","error":{"status":429,"message":"You've reached your concurrent request limit."}}"#,
+        ] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+            super::run_on_quota_failure_with(&ctx, raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                live_blob(&env),
+                r#"{"label":"alice","access_token":"tok-alice"}"#,
+                "不得切换：{raw}"
+            );
             assert!(auto_swap_audits().is_empty(), "不得写审计：{raw}");
             use kimi_switch_core::paths::AppPaths;
             assert!(

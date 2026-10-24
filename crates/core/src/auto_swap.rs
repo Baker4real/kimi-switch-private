@@ -5,8 +5,9 @@
 //! （issue #158）：`locally_invalid` 集合里的「已确认失效」账号（invalid_grant 指纹
 //! 在案；#158 续跑裁定只认指纹、不认 JWT exp）不作为任何自动路径的候选，
 //! 见 [`crate::credential_health`]。
-//! 配额失败被动切换（issue #162，spec #152 决策 14）：Kimi Code `StopFailure` hook
-//! 的 403 原文是当前账号耗尽的权威证据，经 [`classify_stop_failure`] 分类、
+//! 配额失败被动切换（issue #162，spec #152 决策 14；#184 改认官方 429）：Kimi Code
+//! `StopFailure` hook 的额度耗尽原文（官方 429 "You've reached your … usage limit"，
+//! 兼容旧口径 403）是当前账号耗尽的权威证据，经 [`classify_stop_failure`] 分类、
 //! [`overlay_exhausted_snapshot`] 合成耗尽快照后，走 [`decide_auto_swap_passive_from_state`]
 //! 进入与轮询路径同一判定单点。
 
@@ -98,7 +99,7 @@ pub enum AutoSwapDecision {
 enum TriggerSource {
     /// 快照轮询（GUI 静默查询 / CLI status）：安顿宽限照常阻挡。
     Snapshot,
-    /// 配额失败被动（StopFailure hook 403）：403 原文是「此刻已耗尽」的权威证据，
+    /// 配额失败被动（StopFailure hook 额度耗尽）：耗尽原文是「此刻已耗尽」的权威证据，
     /// 胜过「刚被手动选中先观察一阵」的保守等待，安顿宽限不阻挡（spec #152 决策 14）。
     QuotaFailureHook,
 }
@@ -170,7 +171,7 @@ fn decide_auto_swap_with_trip(
         return stay(AutoSwapSkipReason::Cooldown);
     }
 
-    // 被动触发（403 权威耗尽证据）跳过安顿宽限；轮询路径照常被挡。
+    // 被动触发（StopFailure 权威耗尽证据）跳过安顿宽限；轮询路径照常被挡。
     if trigger == TriggerSource::Snapshot
         && in_settle_grace(now, current.last_used_at, settings.settle_grace_ms)
     {
@@ -1064,82 +1065,99 @@ fn decide_auto_swap_from_state_with_trigger(
 /// StopFailure hook 事件对「当前账号配额耗尽」信号的分类结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopFailureSignal {
-    /// 403 配额耗尽：文案含官方 "usage limit" 字样，且带 403 状态信号。
+    /// 额度耗尽：官方 429 "You've reached your … usage limit"，或旧口径 403 +
+    /// "usage limit"（命中条件见 [`classify_stop_failure`]）。
     /// `window` 是文案中可辨认的耗尽窗口（5 小时 / 7 天 / 月度），辨认不出为 `None`。
     QuotaExhausted { window: Option<QuotaWindow> },
-    /// 其他：429 过载 / 瞬时限流、非配额错误，或 stdin 不是合法 JSON（畸形静默）。
+    /// 其他：不是额度耗尽的 429（并发上限 / 请求过多 / 引擎过载）、非配额错误，
+    /// 或 stdin 不是合法 JSON（畸形静默）。
     Other,
 }
 
 /// Kimi Code `StopFailure` hook 事件分类（纯函数，stdin 原文 → 分类）。
 ///
-/// 官方配额错误是 403 且文案明确含 "usage limit"（5 小时 / 7 天 / 月度窗口各有文案）；
-/// 429 仅瞬时限流 / 引擎过载，与配额无关，绝不匹配。事件 JSON 的错误字段官方文档未
-/// 枚举，因此对整份 JSON 递归扫描：任一字符串含 "usage limit"（大小写不敏感）且
-/// 存在 403 信号（数值 403，或任一字符串含作为独立 token 的 "403"，见
-/// [`contains_403_token`]——时间戳 / request id 等数字串里的 "403" 子串不算）才判
-/// 耗尽——hook schema 变化最坏漏触发，不会误触发。原不是合法 JSON 一律归
-/// [`StopFailureSignal::Other`]。
+/// 官方错误参考（2026-10-24 核对，#184）把额度耗尽归为 HTTP 429，文案固定为
+/// "You've reached your … usage limit"（5 小时 / weekly (7-day) / 月度各一条）；
+/// 并发上限、请求过多、引擎过载也是 429，但不是额度耗尽；403 改为套餐权益类错误。
+/// 事件 JSON 的错误字段官方文档未枚举，因此对整份 JSON 递归扫描，满足任一口径才判
+/// 耗尽（都大小写不敏感）：
+/// - 新口径：同一字符串同时含官方耗尽措辞 "reached your" 与 "usage limit"，且存在
+///   429 信号；
+/// - 旧口径（保留兜底）：任一字符串含 "usage limit"，且存在 403 信号。
+///
+/// 状态信号是数值 403 / 429，或任一字符串里作为独立 token 的 "403" / "429"（见
+/// [`contains_status_token`]——时间戳 / request id 等数字串里的子串不算）。其余一律归
+/// [`StopFailureSignal::Other`]：hook schema 变化最坏漏触发，不会误触发。原文不是
+/// 合法 JSON 同样归 Other。
 pub fn classify_stop_failure(raw: &str) -> StopFailureSignal {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return StopFailureSignal::Other;
     };
-    let mut usage_limit_texts: Vec<&str> = Vec::new();
-    let mut saw_403 = false;
-    scan_stop_failure_values(&value, &mut usage_limit_texts, &mut saw_403);
-    if !saw_403 || usage_limit_texts.is_empty() {
+    let mut scan = StopFailureScan::default();
+    scan.visit(&value);
+    let official_429 = scan.saw_429 && scan.saw_exhaustion_phrase;
+    let legacy_403 = scan.saw_403 && !scan.usage_limit_texts.is_empty();
+    if !official_429 && !legacy_403 {
         return StopFailureSignal::Other;
     }
     StopFailureSignal::QuotaExhausted {
-        window: window_from_usage_limit_texts(usage_limit_texts),
+        window: window_from_usage_limit_texts(scan.usage_limit_texts),
     }
 }
 
-/// 递归收集：含 "usage limit" 的字符串（供窗口辨认），以及 403 信号。
-fn scan_stop_failure_values<'a>(
-    value: &'a serde_json::Value,
-    usage_limit_texts: &mut Vec<&'a str>,
-    saw_403: &mut bool,
-) {
-    match value {
-        serde_json::Value::String(text) => {
-            if text.to_lowercase().contains("usage limit") {
-                usage_limit_texts.push(text.as_str());
+/// 对事件 JSON 递归扫描收集的分类证据。
+#[derive(Default)]
+struct StopFailureScan<'a> {
+    /// 含 "usage limit" 的字符串：旧口径的文案条件，也供窗口辨认。
+    usage_limit_texts: Vec<&'a str>,
+    /// 某个字符串同时含 "reached your" 与 "usage limit"（新口径的文案条件）。
+    saw_exhaustion_phrase: bool,
+    saw_403: bool,
+    saw_429: bool,
+}
+
+impl<'a> StopFailureScan<'a> {
+    fn visit(&mut self, value: &'a serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => {
+                let lower = text.to_lowercase();
+                if lower.contains("usage limit") {
+                    self.usage_limit_texts.push(text.as_str());
+                    self.saw_exhaustion_phrase |= lower.contains("reached your");
+                }
+                self.saw_403 = self.saw_403 || contains_status_token(text, "403");
+                self.saw_429 = self.saw_429 || contains_status_token(text, "429");
             }
-            if !*saw_403 && contains_403_token(text) {
-                *saw_403 = true;
+            serde_json::Value::Number(number) => {
+                self.saw_403 |= number.as_i64() == Some(403);
+                self.saw_429 |= number.as_i64() == Some(429);
             }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.visit(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    self.visit(item);
+                }
+            }
+            _ => {}
         }
-        serde_json::Value::Number(number) => {
-            if !*saw_403 && number.as_i64() == Some(403) {
-                *saw_403 = true;
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                scan_stop_failure_values(item, usage_limit_texts, saw_403);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for item in map.values() {
-                scan_stop_failure_values(item, usage_limit_texts, saw_403);
-            }
-        }
-        _ => {}
     }
 }
 
-/// 字符串里的 "403" 是否作为独立 token 出现：前后都不是 ASCII 字母数字
-/// （字符串首尾视为边界；非 ASCII 字符也视为边界）。时间戳（epoch 秒如
-/// `1760004031`）、request id（`req-1403f8`）、行号（`line 1403`）等数字串里的
-/// "403" 子串不算 403 状态信号；`403 Forbidden`、`status code 403.`、
-/// `(403)`、`status=403` 这类写法算。
-fn contains_403_token(text: &str) -> bool {
+/// 字符串里的状态码 `code`（"403" / "429"）是否作为独立 token 出现：前后都不是
+/// ASCII 字母数字（字符串首尾视为边界；非 ASCII 字符也视为边界）。时间戳（epoch 秒
+/// 如 `1760004031`）、request id（`req-1403f8`）、行号（`line 1429`）等数字串里的
+/// 子串不算状态信号；`403 Forbidden`、`status code: 429,`、`(403)`、`status=429`
+/// 这类写法算。
+fn contains_status_token(text: &str, code: &str) -> bool {
     let bytes = text.as_bytes();
     let mut from = 0;
-    while let Some(offset) = text[from..].find("403") {
+    while let Some(offset) = text[from..].find(code) {
         let start = from + offset;
-        let end = start + "403".len();
+        let end = start + code.len();
         let boundary_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
         let boundary_after = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
         if boundary_before && boundary_after {
@@ -1172,7 +1190,7 @@ fn window_from_usage_limit_texts<'a>(
     None
 }
 
-/// 以 403 权威证据合成 / 覆盖当前账号快照（纯函数，不写缓存、不落盘）：
+/// 以耗尽原文这一权威证据合成 / 覆盖当前账号快照（纯函数，不写缓存、不落盘）：
 /// 被动路径复用既有耗尽判定，「当前账号已耗尽」这一证据以快照形态进入判定单点。
 ///
 /// - 缓存快照可用（`Ready` / 非 stale `Cached`）时以其为底：把 `window`（文案辨认
@@ -1228,7 +1246,7 @@ pub fn overlay_exhausted_snapshot(
             limit: 1,
             reset_at: None,
             status: QuotaStatus::Ok,
-            note: Some("403 usage limit (StopFailure hook)".into()),
+            note: Some("usage limit (StopFailure hook)".into()),
             membership: None,
         });
     }
@@ -1244,7 +1262,7 @@ pub fn overlay_exhausted_snapshot(
 /// 配额失败被动切换判定门面（issue #162）：调用方先用 [`overlay_exhausted_snapshot`]
 /// 把当前账号快照换成权威耗尽证据，再经本门面进入与轮询路径同一判定单点。
 ///
-/// 与 [`decide_auto_swap_from_state`] 的唯一差异是安顿宽限不阻挡（403 原文是
+/// 与 [`decide_auto_swap_from_state`] 的唯一差异是安顿宽限不阻挡（耗尽原文是
 /// 「此刻已耗尽」的权威证据；手动保持期本就只约束回驻、不约束耗尽路径）。
 /// 冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆与候选本地凭证快检
 /// 语义与轮询路径完全一致，由同一实现保证。
