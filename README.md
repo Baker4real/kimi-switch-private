@@ -48,6 +48,8 @@ npm run tauri build
 
 产物：`target/release/kimi-switch.exe`（图形界面）、`target/release/kimi-switch-cli.exe`（命令行）、`target/release/bundle/`（MSI/NSIS 安装包）。
 
+Windows 上更新桌面快捷方式指向的本地 GUI 时，先退出正在运行的 `kimi-switch.exe`，再运行 `npm run build:desktop`。该命令会先完成前端检查，若目标程序仍在运行会明确报错，成功后更新固定路径 `target/release/kimi-switch.exe`。
+
 ### Edge 扩展（Windows GUI）
 
 免粘贴绑定需要手动加载项目内的私有扩展包：分发包即仓库内 `edge-extension/` 源码目录（三个纯文本文件，可直接审计，无构建/打包步骤）。安装（加载解压缩的扩展）、更新（重新加载）与撤销（`edge://extensions` 移除，等待中的挑战自动收口）步骤见 [`edge-extension/README.md`](edge-extension/README.md)。扩展只声明 Kimi 控制台页面和 `127.0.0.1` 回调权限，不读取 cookie、不扫描其他 profile，也不把网页 token 写入扩展存储；权限面由 `src-ui/edge-extension-contract.test.ts` 钉住。真实 Edge 交接、企业策略和 Local Network Access 尚未在目标机器核对；按 2026-09-23 的决定，这不再作为 #170 / #176 的关闭条件。本地测试不写成该项已通过。

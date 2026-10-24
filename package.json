@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check:ui": "npm run typecheck && npm test && npm run build",
+    "build:desktop": "pwsh -NoProfile -File scripts/build-desktop.ps1",
     "tauri": "tauri"
   },
   "dependencies": {
