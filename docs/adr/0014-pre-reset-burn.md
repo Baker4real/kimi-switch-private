@@ -2,14 +2,15 @@
 type: adr
 title: 重置前抢用：临近重置主动切到快清零账号、烧完自动切回
 status: accepted
-tags: [auto-swap, pre-reset-burn, round-trip]
-intent: Record that auto-swap gains an opt-in pre-reset burn path that swaps to a parked account whose 5h/7d window is near reset and mostly used, then swaps back after the reset passes or the target exhausts, keeping round-trip memory in the auto-swap state file.
+tags: [auto-swap, pre-reset-burn, round-trip, manual-hold]
+intent: Record that auto-swap gains an opt-in pre-reset burn path that swaps to a parked account whose 5h/7d window is near reset and mostly used, then swaps back after the reset passes or the target exhausts, keeping round-trip memory in the auto-swap state file; a manual swap clears that memory and the manual hold blocks new burns.
 documents:
   config_keys:
     - pre_reset_burn
     - pre_reset_burn_min_ratio
     - pre_reset_burn_near_5h_ms
     - pre_reset_burn_near_7d_ms
+    - manual_hold_ms
   symbols:
     - decide_auto_swap
     - AutoSwapKind
@@ -70,8 +71,10 @@ documents:
    往返记忆存续时不评估抢用路径。此期间耗尽命中（即决策 7 的第二回程时机）目的地锁定
    记忆中的原账号，不重新排序选候选。
 
-10. **手动切换即接管。** 燃烧期间或回程前任何手动切换清除往返记忆；摘出、快照不可
-    用不触发、只读已收集快照不打网等既有约束全部沿用（规则 3）。
+10. **手动切换即接管。** 燃烧期间或回程前任何手动切换清除往返记忆，且手动切换写入的
+    手动保持期（ADR-0008 第 4 条，`manual_hold_ms` 默认 8 小时）内不新开抢用（2026-10-24
+    修订，见文末）。保持期只挡新开抢用：耗尽、pace 与回程语义不变，届满后抢用照常评估。
+    摘出、快照不可用不触发、只读已收集快照不打网等既有约束全部沿用（规则 3）。
 
 11. **「7d 燃烧 ↔ 5h 耗尽」循环是预期行为。** 烧 7 天尾巴时 5 小时窗先撞线 → 回程；
     目标 5h 窗重置后若 7d 仍临近且超水位 → 再次抢用。两天内可能往返多次；5 分钟
@@ -94,3 +97,19 @@ documents:
   引入新概念不成比例。将来真嫌吵再加。
 - **回程豁免冷却**：数值上（5 分钟冷却 vs 1 小时 / 2 天窗口）不会真撞到，不值得开
   豁免通道。
+
+## 修订（2026-10-24）：手动保持期挡新开抢用
+
+原第 10 条只清往返记忆。记忆一清，判定回到无记忆分支；抢用条件若仍成立，60 秒安顿宽限
+一过，下一轮快照就会再次抢用，接管名存实亡。真机复现：燃烧期间用户两次手动切回原账号，
+目标 7 天窗口距重置不足 2 天、已用 94%～95%（高于水位 0.7、低于阈值 0.99），两次都在手动
+切换后 90 秒被 `kind=burn` 切回（审计 2026-10-24 17:55:54、18:01:26，东八区）。根因是保持期
+原先只挡回驻（ADR-0008 第 4 条），抢用路径不看它。
+
+处置：第 10 条扩为保持期内不新开抢用，复用既有 `manual_hold_until`，不新增键或状态字段；
+判定仍只读 `auto_swap.json` 与已收集快照（决策 12）。保持期内放弃抢用机会（含 5 小时窗
+最后一小时这类短窗口）是有意取舍：手动选择优先于占便宜，与决策 4「保命优先于占便宜」
+同一方向。届满时条件仍成立则照常抢用；嫌长可调 `manual_hold_ms`（与回驻共用）。
+
+不采用：只拒绝被手动打断的那个目标窗口、直到它重置（「拒绝记忆」）。更精确，但要新增
+状态字段与过期规则；保持期已表达「用户接管」，不为此另造一套状态。

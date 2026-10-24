@@ -448,7 +448,7 @@ fn passive_bypasses_settle_grace_while_polling_stays() {
     );
 }
 
-/// 手动保持期不阻挡被动耗尽切换（保持期本就只约束回驻；spec 明文语义回归钉）。
+/// 手动保持期不阻挡被动耗尽切换（保持期只约束回驻与新开抢用；spec 明文语义回归钉）。
 #[test]
 fn passive_ignores_manual_hold() {
     let tmp = tempfile::tempdir().unwrap();

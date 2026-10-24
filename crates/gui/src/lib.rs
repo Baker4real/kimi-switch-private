@@ -2606,7 +2606,7 @@ mod tests {
         assert!(detail.contains("from=alice"), "{detail}");
     }
 
-    /// 回驻保持期（issue #95 / ADR-0008）：手动切换后的 8 小时内不回驻——
+    /// 手动保持期（issue #95 / ADR-0008）：手动切换后的 8 小时内不回驻——
     /// 无 toast、无审计、不碰状态文件（耗尽路径不受影响，另行覆盖）。
     #[tokio::test]
     async fn snapshot_resident_return_blocked_by_manual_hold() {

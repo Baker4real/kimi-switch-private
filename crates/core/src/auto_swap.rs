@@ -119,7 +119,8 @@ enum TriggerSource {
 /// `Swap` 且 [`AutoSwapTarget::kind`] 为 [`AutoSwapKind::Pace`]。pace 不抢占耗尽。
 /// 耗尽与 pace 都未命中时，若开启 [`AutoSwap::pre_reset_burn`]，合格停泊账号临近重置
 /// 且该窗口已用超过水位，则返回 `Swap` 且 kind 为 [`AutoSwapKind::Burn`]。
-/// 抢用候选不适用防抖边际。
+/// 抢用候选不适用防抖边际。手动保持期内不新开抢用（ADR-0014 第 10 条）；保持期只由
+/// [`decide_auto_swap_from_state`] 从状态文件读入，本函数按无保持期判定。
 ///
 /// 往返记忆存在且当前账号就是燃烧目标时，先评估回程（issue #148）：目标窗口
 /// `reset_at` 翻过记录值，或当前任一窗口达耗尽阈值，则尝试切回原账号，kind 为
@@ -141,6 +142,7 @@ pub fn decide_auto_swap(
         settings,
         now,
         last_auto_swap_at,
+        None,
         &mut trip,
         locally_invalid,
         TriggerSource::Snapshot,
@@ -149,12 +151,14 @@ pub fn decide_auto_swap(
 
 /// 带往返记忆的自动切换判定。回程命中但原账号不合格时把 `trip` 置 `None`。
 /// `trigger` 只影响安顿宽限是否放行（见 [`TriggerSource`]）。
+/// `manual_hold_until` 只挡新开抢用（ADR-0014 第 10 条），不挡耗尽、pace 与回程。
 fn decide_auto_swap_with_trip(
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
+    manual_hold_until: Option<DateTime<Utc>>,
     trip: &mut Option<BurnTrip>,
     locally_invalid: &HashSet<AccountId>,
     trigger: TriggerSource,
@@ -215,9 +219,15 @@ fn decide_auto_swap_with_trip(
             ) {
                 return AutoSwapDecision::Swap(target);
             }
-            if let Some(target) =
-                decide_burn_swap(current, accounts, snapshots, settings, now, locally_invalid)
-            {
+            if let Some(target) = decide_burn_swap(
+                current,
+                accounts,
+                snapshots,
+                settings,
+                now,
+                manual_hold_until,
+                locally_invalid,
+            ) {
                 return AutoSwapDecision::Swap(target);
             }
         }
@@ -278,8 +288,9 @@ fn decide_pace_swap(
     })
 }
 
-/// 未达耗尽、pace 未命中时的重置前抢用。子开关关、无临近超水位窗口、或没有合格
-/// 停泊候选时返回 `None`（调用方仍报 [`AutoSwapSkipReason::BelowThreshold`]）。
+/// 未达耗尽、pace 未命中时的重置前抢用。子开关关、手动保持期内（手动切换即接管，
+/// ADR-0014 第 10 条）、无临近超水位窗口、或没有合格停泊候选时返回 `None`
+/// （调用方仍报 [`AutoSwapSkipReason::BelowThreshold`]）。
 /// 候选过既有合格线，但不走 [`beats_current_by_margin`]。
 fn decide_burn_swap(
     current: &Account,
@@ -287,9 +298,10 @@ fn decide_burn_swap(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     now: DateTime<Utc>,
+    manual_hold_until: Option<DateTime<Utc>>,
     locally_invalid: &HashSet<AccountId>,
 ) -> Option<AutoSwapTarget> {
-    if !settings.pre_reset_burn {
+    if !settings.pre_reset_burn || manual_hold_until.is_some_and(|until| now < until) {
         return None;
     }
     let (best, trigger_window, usage_ratio) =
@@ -902,7 +914,8 @@ struct AutoSwapStateFile {
     /// （issue #96），序列化时 None 跳过该字段，读侧 `#[serde(default)]` 同语义。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_auto_swap_at: Option<DateTime<Utc>>,
-    /// 手动切换后的回驻保持期截止（issue #95）。缺失视为无保持期，存量文件兼容。
+    /// 手动切换后的保持期截止（issue #95）：期间不回驻、不新开抢用（ADR-0014 第 10 条）。
+    /// 缺失视为无保持期，存量文件兼容。
     #[serde(default)]
     manual_hold_until: Option<DateTime<Utc>>,
     /// 回驻确认期 per-account 连续合格计数（issue #111）。键为账号 id。
@@ -1007,6 +1020,7 @@ pub fn decide_resident_return_from_state(
 }
 
 /// 读往返记忆、判定、不合格时写回清除。调用方不必自己搬 [`BurnTrip`]。
+/// 手动保持期同样从状态文件读入，只挡新开抢用（ADR-0014 第 10 条）。
 /// 停泊候选额外经本地凭证快检过滤（issue #158）：invalid_grant 指纹在案的账号
 /// 不作为任何自动路径候选（续跑裁定只认指纹，不认 JWT exp）；本地文件只读、
 /// 零网络，读取失败 fail-open。
@@ -1048,6 +1062,7 @@ fn decide_auto_swap_from_state_with_trigger(
         settings,
         now,
         last_auto_swap_at,
+        read_manual_hold_until(path),
         &mut trip,
         &locally_invalid,
         trigger,
@@ -1263,7 +1278,7 @@ pub fn overlay_exhausted_snapshot(
 /// 把当前账号快照换成权威耗尽证据，再经本门面进入与轮询路径同一判定单点。
 ///
 /// 与 [`decide_auto_swap_from_state`] 的唯一差异是安顿宽限不阻挡（耗尽原文是
-/// 「此刻已耗尽」的权威证据；手动保持期本就只约束回驻、不约束耗尽路径）。
+/// 「此刻已耗尽」的权威证据；手动保持期只约束回驻与新开抢用、不约束耗尽路径）。
 /// 冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆与候选本地凭证快检
 /// 语义与轮询路径完全一致，由同一实现保证。
 pub fn decide_auto_swap_passive_from_state(
@@ -1368,8 +1383,8 @@ pub fn write_last_auto_swap_at(path: &Path, at: DateTime<Utc>) {
 /// 并清掉回驻确认计数与往返记忆（手动决定作废未完成的确认 / 用户接管）。
 /// 失败只 warn，不回传错误。
 pub fn set_manual_hold_until(path: &Path, until: DateTime<Utc>) {
-    // 文件缺失或损坏时重建：没有切换史就不伪造任何时刻（issue #96）。保持期
-    // 只约束回驻，不得借 last_auto_swap_at 把耗尽切换也锁进冷却（ADR-0008 第 4 条）。
+    // 文件缺失或损坏时重建：没有切换史就不伪造任何时刻（issue #96）。保持期只约束
+    // 回驻与新开抢用，不得借 last_auto_swap_at 把耗尽切换也锁进冷却（ADR-0008 第 4 条）。
     let mut state = read_state(path).unwrap_or_default();
     state.manual_hold_until = Some(until);
     state.resident_confirm.clear();
@@ -3072,6 +3087,7 @@ mod tests {
                 &case.settings,
                 now(),
                 case.last_auto_swap_at,
+                None,
                 &mut memory,
                 &HashSet::new(),
                 TriggerSource::Snapshot,
@@ -3190,6 +3206,53 @@ mod tests {
         assert!(read_burn_trip(&path).is_none());
         assert_eq!(read_manual_hold_until(&path), Some(hold));
         assert_eq!(read_last_auto_swap_at(&path), last);
+    }
+
+    /// 2026-10-24 真机复现（ADR-0014 第 10 条修订）：抢用中途手动切回原账号后，停泊
+    /// 账号 7 天窗口仍临近重置且超水位；过了安顿宽限与冷却的下一轮快照不得新开抢用
+    /// 把用户切回去。保持期只挡新开抢用：期间耗尽切换照常，届满后抢用照常。
+    #[test]
+    fn manual_hold_blocks_only_new_burn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let seven = QuotaWindow::SevenDay;
+        let reset_7d = now() + chrono::Duration::hours(40);
+        // 一小时前抢用 alice→bob；随后用户手动切回 alice：写保持期、清往返记忆。
+        seed_trip(&path, &trip("alice", "bob", seven, reset_7d));
+        let hold = now() + chrono::Duration::milliseconds(burn_on().manual_hold_ms);
+        set_manual_hold_until(&path, hold);
+        let last = read_last_auto_swap_at(&path);
+
+        let accounts = vec![settled("alice", true), settled("bob", false)];
+        let alice_reset = now() + chrono::Duration::days(4);
+        let bob = ready_reset("bob", &[(seven, 94, 100)], reset_7d);
+        let snapshots = vec![
+            ready_reset("alice", &[(seven, 30, 100)], alice_reset),
+            bob.clone(),
+        ];
+        assert_eq!(
+            decide_auto_swap_from_state(&path, &accounts, &snapshots, &burn_on(), now(), last),
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::BelowThreshold
+            },
+            "保持期内不新开抢用"
+        );
+
+        let exhausted = vec![ready_reset("alice", &[(seven, 99, 100)], alice_reset), bob];
+        match decide_auto_swap_from_state(&path, &accounts, &exhausted, &burn_on(), now(), last) {
+            AutoSwapDecision::Swap(target) => assert_eq!(target.kind, AutoSwapKind::Exhausted),
+            other => panic!("保持期内耗尽应照常切换，got {other:?}"),
+        }
+
+        let after = hold + chrono::Duration::seconds(1);
+        match decide_auto_swap_from_state(&path, &accounts, &snapshots, &burn_on(), after, last) {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::Burn);
+                assert_eq!(target.to.0, "bob");
+                assert_eq!(target.trigger_window, seven);
+            }
+            other => panic!("保持期届满应照常抢用，got {other:?}"),
+        }
     }
 
     /// issue #148：from_state 门面在原账号不合格时清文件里的记忆。
@@ -3404,6 +3467,7 @@ mod tests {
                 &case.settings,
                 now(),
                 case.last_auto_swap_at,
+                None,
                 &mut memory,
                 &HashSet::new(),
                 TriggerSource::Snapshot,
@@ -4411,6 +4475,7 @@ mod tests {
             &on(),
             now(),
             None,
+            None,
             &mut memory,
             &invalid,
             TriggerSource::Snapshot,
@@ -4427,6 +4492,7 @@ mod tests {
             &return_snaps,
             &on(),
             now(),
+            None,
             None,
             &mut memory,
             &HashSet::new(),
