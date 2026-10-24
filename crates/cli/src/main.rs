@@ -3076,6 +3076,55 @@ mod tests {
         );
     }
 
+    /// 被动切换经真实 activate 切到 bob：live 变为 bob、registry active 翻转、冷却落盘、
+    /// 恰好一条 ok 审计（带 activate 段耗时，detail 含 from=alice 与 trigger=passive）。
+    fn assert_passive_swapped_to_bob(env: &passive_env::IsolatedHomes, ctx: &super::AppContext) {
+        use kimi_switch_core::paths::AppPaths;
+        assert_eq!(
+            live_blob(env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#
+        );
+        assert!(
+            ctx.registry
+                .list_by_provider("kimi")
+                .unwrap()
+                .iter()
+                .any(|a| a.id.0 == "bob" && a.active),
+            "registry active 应翻转为 bob"
+        );
+        let state = AppPaths::resolve().unwrap().auto_swap_state_file();
+        assert!(
+            kimi_switch_core::read_last_auto_swap_at(&state).is_some(),
+            "冷却应落盘"
+        );
+        let audits = auto_swap_audits();
+        assert_eq!(audits.len(), 1, "恰好一条 auto_swap 审计：{audits:?}");
+        assert_eq!(audits[0].result, "ok");
+        assert_eq!(audits[0].account.as_deref(), Some("bob"));
+        // issue #153 续跑：被动路径审计同样携带 activate 段耗时。
+        assert!(
+            audits[0].duration_ms.is_some(),
+            "被动切换成功审计应含 duration_ms（activate 段耗时）"
+        );
+        let detail = audits[0].detail.as_deref().unwrap();
+        assert!(detail.contains("from=alice"), "{detail}");
+        assert!(detail.contains("trigger=passive"), "{detail}");
+    }
+
+    /// 无合格候选：live 仍是 alice，恰好一条记在 alice 名下的 no eligible candidate 审计。
+    fn assert_no_candidate_kept_alice(env: &passive_env::IsolatedHomes) {
+        assert_eq!(
+            live_blob(env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#,
+            "无候选不得切换"
+        );
+        let audits = auto_swap_audits();
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].result, "error");
+        assert_eq!(audits[0].account.as_deref(), Some("alice"));
+        assert_eq!(audits[0].detail.as_deref(), Some("no eligible candidate"));
+    }
+
     /// 端到端：403 usage limit 事件 → 与耗尽路径语义一致的自动切换。当前账号缓存
     /// 明明未达阈值（80/100）也被权威证据覆写触发；安顿宽限与手动保持期不阻挡；
     /// 切换走真实 activate（live 变为 bob、registry active 翻转、冷却落盘、审计
@@ -3099,36 +3148,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            live_blob(&env),
-            r#"{"label":"bob","access_token":"tok-bob"}"#
-        );
-        assert!(
-            ctx.registry
-                .list_by_provider("kimi")
-                .unwrap()
-                .iter()
-                .any(|a| a.id.0 == "bob" && a.active),
-            "registry active 应翻转为 bob"
-        );
-        use kimi_switch_core::paths::AppPaths;
-        let state = AppPaths::resolve().unwrap().auto_swap_state_file();
-        assert!(
-            kimi_switch_core::read_last_auto_swap_at(&state).is_some(),
-            "冷却应落盘"
-        );
-        let audits = auto_swap_audits();
-        assert_eq!(audits.len(), 1, "恰好一条 auto_swap 审计");
-        assert_eq!(audits[0].result, "ok");
-        assert_eq!(audits[0].account.as_deref(), Some("bob"));
-        // issue #153 续跑：被动路径审计同样携带 activate 段耗时。
-        assert!(
-            audits[0].duration_ms.is_some(),
-            "被动切换成功审计应含 duration_ms（activate 段耗时）"
-        );
-        let detail = audits[0].detail.as_deref().unwrap();
-        assert!(detail.contains("from=alice"), "{detail}");
-        assert!(detail.contains("trigger=passive"), "{detail}");
+        assert_passive_swapped_to_bob(&env, &ctx);
     }
 
     /// 无合格候选：唯一停泊账号已达阈值 → 不切换、live 不动、记 no-candidate 审计。
@@ -3142,17 +3162,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(live_blob(&env).contains("alice"), "无候选不得切换");
-        let audits = auto_swap_audits();
-        assert_eq!(audits.len(), 1);
-        assert_eq!(audits[0].result, "error");
-        assert_eq!(audits[0].detail.as_deref(), Some("no eligible candidate"));
+        assert_no_candidate_kept_alice(&env);
     }
 
-    /// 端到端（#184）：官方 429 五小时额度耗尽事件与 403 同走耗尽路径。当前账号缓存
-    /// 未达阈值（80/100）也被权威证据覆写触发；夹具当前账号刚被选中，安顿宽限不阻挡；
-    /// 切换走真实 activate（live 变为 bob、registry active 翻转、冷却落盘、恰好一条
-    /// ok 审计且 detail 带 trigger=passive）。
+    /// 端到端（#184）：官方 429 五小时额度耗尽事件（真实平铺载荷）与 403 同走耗尽路径。
+    /// 当前账号缓存未达阈值（80/100）也被权威证据覆写触发；夹具当前账号刚被选中，
+    /// 安顿宽限不阻挡；切换走真实 activate（live 变为 bob、registry active 翻转、冷却
+    /// 落盘、恰好一条 ok 审计且 detail 带 trigger=passive）。
     #[tokio::test]
     async fn passive_429_usage_limit_swaps_via_real_activate() {
         let env = passive_env::isolate();
@@ -3163,31 +3179,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            live_blob(&env),
-            r#"{"label":"bob","access_token":"tok-bob"}"#
-        );
-        assert!(
-            ctx.registry
-                .list_by_provider("kimi")
-                .unwrap()
-                .iter()
-                .any(|a| a.id.0 == "bob" && a.active),
-            "registry active 应翻转为 bob"
-        );
-        use kimi_switch_core::paths::AppPaths;
-        let state = AppPaths::resolve().unwrap().auto_swap_state_file();
-        assert!(
-            kimi_switch_core::read_last_auto_swap_at(&state).is_some(),
-            "冷却应落盘"
-        );
-        let audits = auto_swap_audits();
-        assert_eq!(audits.len(), 1, "恰好一条 auto_swap 审计：{audits:?}");
-        assert_eq!(audits[0].result, "ok");
-        assert_eq!(audits[0].account.as_deref(), Some("bob"));
-        let detail = audits[0].detail.as_deref().unwrap();
-        assert!(detail.contains("from=alice"), "{detail}");
-        assert!(detail.contains("trigger=passive"), "{detail}");
+        assert_passive_swapped_to_bob(&env, &ctx);
     }
 
     /// 429 额度耗尽但无合格候选（#184）：唯一停泊账号已达阈值 → live 不动，
@@ -3202,71 +3194,64 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            live_blob(&env),
-            r#"{"label":"alice","access_token":"tok-alice"}"#,
-            "无候选不得切换"
-        );
-        let audits = auto_swap_audits();
-        assert_eq!(audits.len(), 1, "{audits:?}");
-        assert_eq!(audits[0].result, "error");
-        assert_eq!(audits[0].account.as_deref(), Some("alice"));
-        assert_eq!(audits[0].detail.as_deref(), Some("no eligible candidate"));
+        assert_no_candidate_kept_alice(&env);
     }
 
-    /// 被动触发对额度缓存只读（reviewer 补钉）：命中（发生切换）与落空（无候选）
-    /// 两种路径跑完后，quota_cache.json 文件字节保持不变——403 权威证据只在内存
-    /// 经 overlay 合成进判定，不回写缓存，缓存写权仍只属于真实额度查询路径。
+    /// 被动触发对额度缓存只读（reviewer 补钉）：403 与官方 429 事件各跑命中（发生切换）
+    /// 与落空（无候选）两种路径，quota_cache.json 文件字节都保持不变——耗尽原文这一
+    /// 权威证据只在内存经 overlay 合成进判定，不回写缓存，缓存写权仍只属于真实额度查询路径。
     #[tokio::test]
     async fn passive_trigger_leaves_quota_cache_bytes_untouched() {
         use kimi_switch_core::paths::AppPaths;
 
-        // 命中路径：403 → 真实切换发生。
-        {
-            let env = passive_env::isolate();
-            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
-            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
-            let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
-            let before = std::fs::read(&cache_path).unwrap();
+        for event in [event_403_5h(), event_429_5h()] {
+            // 命中路径：真实切换发生。
+            {
+                let env = passive_env::isolate();
+                let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+                seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+                let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
+                let before = std::fs::read(&cache_path).unwrap();
 
-            super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
-                .await
-                .unwrap();
+                super::run_on_quota_failure_with(&ctx, &event, &passive_settings())
+                    .await
+                    .unwrap();
 
-            assert_eq!(
-                live_blob(&env),
-                r#"{"label":"bob","access_token":"tok-bob"}"#,
-                "先证明命中路径确实发生了切换，断言才有意义"
-            );
-            assert_eq!(
-                std::fs::read(&cache_path).unwrap(),
-                before,
-                "命中路径不得回写额度缓存"
-            );
-        }
+                assert_eq!(
+                    live_blob(&env),
+                    r#"{"label":"bob","access_token":"tok-bob"}"#,
+                    "先证明命中路径确实发生了切换，断言才有意义：{event}"
+                );
+                assert_eq!(
+                    std::fs::read(&cache_path).unwrap(),
+                    before,
+                    "命中路径不得回写额度缓存：{event}"
+                );
+            }
 
-        // 落空路径：无合格候选，只记 no-candidate 审计。
-        {
-            let env = passive_env::isolate();
-            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
-            seed_quota_cache(&[("alice", 80, 100), ("bob", 99, 100)]);
-            let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
-            let before = std::fs::read(&cache_path).unwrap();
+            // 落空路径：无合格候选，只记 no-candidate 审计。
+            {
+                let env = passive_env::isolate();
+                let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+                seed_quota_cache(&[("alice", 80, 100), ("bob", 99, 100)]);
+                let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
+                let before = std::fs::read(&cache_path).unwrap();
 
-            super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
-                .await
-                .unwrap();
+                super::run_on_quota_failure_with(&ctx, &event, &passive_settings())
+                    .await
+                    .unwrap();
 
-            assert_eq!(
-                auto_swap_audits().len(),
-                1,
-                "先证明落空路径确实走到了无候选分支"
-            );
-            assert_eq!(
-                std::fs::read(&cache_path).unwrap(),
-                before,
-                "落空路径不得回写额度缓存"
-            );
+                assert_eq!(
+                    auto_swap_audits().len(),
+                    1,
+                    "先证明落空路径确实走到了无候选分支：{event}"
+                );
+                assert_eq!(
+                    std::fs::read(&cache_path).unwrap(),
+                    before,
+                    "落空路径不得回写额度缓存：{event}"
+                );
+            }
         }
     }
 
@@ -3294,13 +3279,11 @@ mod tests {
         assert_eq!(auto_swap_audits().len(), 1, "冷却期内不得再次切换");
     }
 
-    /// 429 过载 / 畸形 stdin / 总开关关闭：全部静默放行，零副作用
-    /// （无审计、无状态文件、live 不动）。
+    /// 畸形 stdin / 总开关关闭：全部静默放行，零副作用（无审计、无状态文件、live
+    /// 不动）。不是额度耗尽的 429 见 `passive_non_exhaustion_429_is_silent`。
     #[tokio::test]
-    async fn passive_429_malformed_and_disabled_are_silent() {
-        let event_429 = r#"{"hook_event_name":"StopFailure","error":{"status":429,"message":"engine overloaded, retry later"}}"#;
+    async fn passive_malformed_and_disabled_are_silent() {
         for (raw, settings) in [
-            (event_429, passive_settings()),
             ("not json at all", passive_settings()),
             ("", passive_settings()),
             (&event_403_5h(), {
@@ -3317,13 +3300,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(live_blob(&env).contains("alice"), "不得切换：{raw}");
-            assert!(auto_swap_audits().is_empty(), "不得写审计：{raw}");
-            use kimi_switch_core::paths::AppPaths;
-            assert!(
-                !AppPaths::resolve().unwrap().auto_swap_state_file().exists(),
-                "不得写状态文件：{raw}"
-            );
+            assert_passive_silent(&env, raw);
         }
     }
 
@@ -3344,17 +3321,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                live_blob(&env),
-                r#"{"label":"alice","access_token":"tok-alice"}"#,
-                "不得切换：{raw}"
-            );
-            assert!(auto_swap_audits().is_empty(), "不得写审计：{raw}");
-            use kimi_switch_core::paths::AppPaths;
-            assert!(
-                !AppPaths::resolve().unwrap().auto_swap_state_file().exists(),
-                "不得写状态文件：{raw}"
-            );
+            assert_passive_silent(&env, raw);
         }
     }
 
@@ -3386,56 +3353,62 @@ mod tests {
         }
     }
 
-    /// 并发多触发收敛（锁 + 冷却）：5 个触发同时命中，被动串行化锁把
-    /// 「读状态 → 判定 → activate → 写冷却」排队；第一触发完成后，后续触发在
-    /// 锁内看到冷却即自然落空——全程恰好一次切换、稳定在 bob，不来回抖动。
+    /// 并发多触发收敛（锁 + 冷却）：403 与官方 429 事件各有 5 个触发同时命中，被动
+    /// 串行化锁把「读状态 → 判定 → activate → 写冷却」排队；第一触发完成后，后续触发
+    /// 在锁内看到冷却即自然落空——全程恰好一次切换、稳定在 bob，不来回抖动。
     #[tokio::test]
     async fn passive_concurrent_triggers_converge_without_oscillation() {
-        let env = passive_env::isolate();
-        let ctx = std::sync::Arc::new(seed_passive_fixture(
-            &env,
-            &[("alice", true), ("bob", false), ("carol", false)],
-        ));
-        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100), ("carol", 20, 100)]);
+        for event in [event_403_5h(), event_429_5h()] {
+            let env = passive_env::isolate();
+            let ctx = std::sync::Arc::new(seed_passive_fixture(
+                &env,
+                &[("alice", true), ("bob", false), ("carol", false)],
+            ));
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100), ("carol", 20, 100)]);
 
-        const TRIGGERS: usize = 5;
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(TRIGGERS));
-        let mut handles = Vec::with_capacity(TRIGGERS);
-        for _ in 0..TRIGGERS {
-            let ctx = ctx.clone();
-            let barrier = barrier.clone();
-            let event = event_403_5h();
-            handles.push(tokio::spawn(async move {
-                barrier.wait().await;
-                super::run_on_quota_failure_with(&ctx, &event, &passive_settings())
-                    .await
-                    .unwrap();
-            }));
+            const TRIGGERS: usize = 5;
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(TRIGGERS));
+            let mut handles = Vec::with_capacity(TRIGGERS);
+            for _ in 0..TRIGGERS {
+                let ctx = ctx.clone();
+                let barrier = barrier.clone();
+                let event = event.clone();
+                handles.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    super::run_on_quota_failure_with(&ctx, &event, &passive_settings())
+                        .await
+                        .unwrap();
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            assert_eq!(
+                live_blob(&env),
+                r#"{"label":"bob","access_token":"tok-bob"}"#,
+                "并发触发后应稳定在排序最优的 bob（已用最低）：{event}"
+            );
+            let audits = auto_swap_audits();
+            assert_eq!(audits.len(), 1, "只产生必要次数的切换：{audits:?}");
+            assert_eq!(audits[0].result, "ok");
+            assert_eq!(audits[0].account.as_deref(), Some("bob"));
+            assert!(audits[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("trigger=passive"));
+
+            // 全部完成后：冷却期内再触发，落空。
+            super::run_on_quota_failure_with(&ctx, &event, &passive_settings())
+                .await
+                .unwrap();
+            assert_eq!(
+                auto_swap_audits().len(),
+                1,
+                "冷却收敛后的触发不得再切换：{event}"
+            );
         }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        assert_eq!(
-            live_blob(&env),
-            r#"{"label":"bob","access_token":"tok-bob"}"#,
-            "并发触发后应稳定在排序最优的 bob（已用最低）"
-        );
-        let audits = auto_swap_audits();
-        assert_eq!(audits.len(), 1, "只产生必要次数的切换：{audits:?}");
-        assert_eq!(audits[0].result, "ok");
-        assert_eq!(audits[0].account.as_deref(), Some("bob"));
-        assert!(audits[0]
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("trigger=passive"));
-
-        // 全部完成后：冷却期内再触发，落空。
-        super::run_on_quota_failure_with(&ctx, &event_403_5h(), &passive_settings())
-            .await
-            .unwrap();
-        assert_eq!(auto_swap_audits().len(), 1, "冷却收敛后的触发不得再切换");
     }
 
     // -----------------------------------------------------------------------
