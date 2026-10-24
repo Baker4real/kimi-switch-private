@@ -6,10 +6,9 @@
 //! 在案；#158 续跑裁定只认指纹、不认 JWT exp）不作为任何自动路径的候选，
 //! 见 [`crate::credential_health`]。
 //! 配额失败被动切换（issue #162，spec #152 决策 14；#184 改认官方 429）：Kimi Code
-//! `StopFailure` hook 的额度耗尽原文（官方 429 "You've reached your … usage limit"，
-//! 兼容旧口径 403）是当前账号耗尽的权威证据，经 [`classify_stop_failure`] 分类、
-//! [`overlay_exhausted_snapshot`] 合成耗尽快照后，走 [`decide_auto_swap_passive_from_state`]
-//! 进入与轮询路径同一判定单点。
+//! `StopFailure` hook 的额度耗尽原文是当前账号耗尽的权威证据，经 [`classify_stop_failure`]
+//! 分类（命中条件见该函数）、[`overlay_exhausted_snapshot`] 合成耗尽快照后，走
+//! [`decide_auto_swap_passive_from_state`] 进入与轮询路径同一判定单点。
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -1080,102 +1079,146 @@ fn decide_auto_swap_from_state_with_trigger(
 /// StopFailure hook 事件对「当前账号配额耗尽」信号的分类结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopFailureSignal {
-    /// 额度耗尽：官方 429 "You've reached your … usage limit"，或旧口径 403 +
-    /// "usage limit"（命中条件见 [`classify_stop_failure`]）。
-    /// `window` 是文案中可辨认的耗尽窗口（5 小时 / 7 天 / 月度），辨认不出为 `None`。
+    /// 额度耗尽（命中条件见 [`classify_stop_failure`]）。`window` 是命中文案里
+    /// 可辨认的耗尽窗口（5 小时 / 7 天 / 月度），辨认不出为 `None`。
     QuotaExhausted { window: Option<QuotaWindow> },
-    /// 其他：不是额度耗尽的 429（并发上限 / 请求过多 / 引擎过载）、非配额错误，
-    /// 或 stdin 不是合法 JSON（畸形静默）。
+    /// 其他：未命中 [`classify_stop_failure`] 的事件，含 stdin 不是合法 JSON（畸形静默）。
     Other,
 }
 
-/// Kimi Code `StopFailure` hook 事件分类（纯函数，stdin 原文 → 分类）。
+/// Kimi Code `StopFailure` hook 事件分类（纯函数，stdin 原文 → 分类）。命中规则只在
+/// 这里写，别处注释指向本函数。
 ///
-/// 官方错误参考（2026-10-24 核对，#184）把额度耗尽归为 HTTP 429，文案固定为
-/// "You've reached your … usage limit"（5 小时 / weekly (7-day) / 月度各一条）；
-/// 并发上限、请求过多、引擎过载也是 429，但不是额度耗尽；403 改为套餐权益类错误。
-/// 事件 JSON 的错误字段官方文档未枚举，因此对整份 JSON 递归扫描，满足任一口径才判
-/// 耗尽（都大小写不敏感）：
-/// - 新口径：同一字符串同时含官方耗尽措辞 "reached your" 与 "usage limit"，且存在
-///   429 信号；
-/// - 旧口径（保留兜底）：任一字符串含 "usage limit"，且存在 403 信号。
+/// 官方[错误参考](https://www.kimi.com/code/docs/kimi-code/error-reference.html)
+/// （2026-10-24 核对，#184）把额度耗尽归为 HTTP 429，文案固定为 "You've reached your
+/// … usage limit"（5 小时 / weekly (7-day) / 月度各一条）；并发上限、请求过多、引擎过载
+/// 也是 429，但不是额度耗尽；403 归入该页的「权限错误」（当前会员等级不含所请求的能力）。
 ///
-/// 状态信号是数值 403 / 429，或任一字符串里作为独立 token 的 "403" / "429"（见
-/// [`contains_status_token`]——时间戳 / request id 等数字串里的子串不算）。其余一律归
-/// [`StopFailureSignal::Other`]：hook schema 变化最坏漏触发，不会误触发。原文不是
-/// 合法 JSON 同样归 Other。
+/// 递归遍历事件 JSON，但跳过承载用户内容的字段（[`USER_CONTENT_KEYS`]）。某个字符串
+/// 满足下面任一口径即判耗尽（文案大小写不敏感）：
+/// - 新口径：含官方耗尽措辞 "reached your" 与 "usage limit"，且带 429 信号；
+/// - 旧口径（保留兜底）：含 "usage limit"，且带 403 信号。
+///
+/// 信号局部性（#182 评审）：状态信号只认命中文案本地的两处——同一字符串里作为独立
+/// token 的 "429" / "403"（见 [`contains_status_token`]），或与该字符串同处一个 JSON
+/// 对象的状态码（见 [`is_status_code`]）。别的字段、别的对象里的数字不算。这偏离了
+/// spec #182「对整份事件 JSON 递归扫描」的原措辞：Kimi Code 2.3.0 的载荷是平铺对象，
+/// 首句用户提示就在 `session_title` 里，全文扫描时用户贴一句耗尽报错，这个会话之后
+/// 任意一次瞬时 429 都会被判成耗尽（ADR-0017 裁定变迁）。
+///
+/// 其余一律归 [`StopFailureSignal::Other`]，宁漏勿误；原文不是合法 JSON 同样归 Other。
+/// `error_type`（如 `APIProviderQuotaExhaustedError`）不作独立信号：余额不足这类不触发
+/// 切换的 429 可能同属该类型。残留：SDK 若去掉 error_message 的 "429 " 前缀会漏认（待证）。
 pub fn classify_stop_failure(raw: &str) -> StopFailureSignal {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return StopFailureSignal::Other;
     };
-    let mut scan = StopFailureScan::default();
-    scan.visit(&value);
-    let official_429 = scan.saw_429 && scan.saw_exhaustion_phrase;
-    let legacy_403 = scan.saw_403 && !scan.usage_limit_texts.is_empty();
-    if !official_429 && !legacy_403 {
+    let mut matched = Vec::new();
+    collect_exhaustion_texts(&value, &mut matched);
+    if matched.is_empty() {
         return StopFailureSignal::Other;
     }
     StopFailureSignal::QuotaExhausted {
-        window: window_from_usage_limit_texts(scan.usage_limit_texts),
+        window: window_from_usage_limit_texts(matched),
     }
 }
 
-/// 对事件 JSON 递归扫描收集的分类证据。
-#[derive(Default)]
-struct StopFailureScan<'a> {
-    /// 含 "usage limit" 的字符串：旧口径的文案条件，也供窗口辨认。
-    usage_limit_texts: Vec<&'a str>,
-    /// 某个字符串同时含 "reached your" 与 "usage limit"（新口径的文案条件）。
-    saw_exhaustion_phrase: bool,
-    saw_403: bool,
-    saw_429: bool,
+/// 承载用户内容的字段：分类时连同其子树一起跳过。来源是 #182 评审对本机 Kimi Code
+/// CLI 2.3.0 kimi.exe 内嵌源码的阅读（withSessionFacts / notifyStopFailure /
+/// titleFromPromptMetadataText；没有抓过真机事件）：StopFailure 载荷是平铺对象
+/// `{hook_event_name, session_id, cwd, session_title, error_type, error_message}`，
+/// `session_title` 是首句用户提示的前 200 字，`cwd` 是会话工作目录。名单保持最短，
+/// 只收这两个用户能写进内容的字段。
+const USER_CONTENT_KEYS: [&str; 2] = ["session_title", "cwd"];
+
+/// 字符串所在 JSON 对象里的状态码（见 [`is_status_code`]）；不在对象里的字符串为全无。
+#[derive(Debug, Clone, Copy, Default)]
+struct SiblingStatus {
+    has_403: bool,
+    has_429: bool,
 }
 
-impl<'a> StopFailureScan<'a> {
-    fn visit(&mut self, value: &'a serde_json::Value) {
-        match value {
-            serde_json::Value::String(text) => {
-                let lower = text.to_lowercase();
-                if lower.contains("usage limit") {
-                    self.usage_limit_texts.push(text.as_str());
-                    self.saw_exhaustion_phrase |= lower.contains("reached your");
-                }
-                self.saw_403 = self.saw_403 || contains_status_token(text, "403");
-                self.saw_429 = self.saw_429 || contains_status_token(text, "429");
+/// 递归收集带本地状态信号的耗尽文案，跳过 [`USER_CONTENT_KEYS`]。
+fn collect_exhaustion_texts<'a>(value: &'a serde_json::Value, matched: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if is_exhaustion_text(text, SiblingStatus::default()) {
+                matched.push(text);
             }
-            serde_json::Value::Number(number) => {
-                self.saw_403 |= number.as_i64() == Some(403);
-                self.saw_429 |= number.as_i64() == Some(429);
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    self.visit(item);
-                }
-            }
-            serde_json::Value::Object(map) => {
-                for item in map.values() {
-                    self.visit(item);
-                }
-            }
-            _ => {}
         }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_exhaustion_texts(item, matched);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let scanned = || {
+                map.iter()
+                    .filter(|(key, _)| !USER_CONTENT_KEYS.contains(&key.as_str()))
+                    .map(|(_, item)| item)
+            };
+            let sibling = SiblingStatus {
+                has_403: scanned().any(|item| is_status_code(item, "403")),
+                has_429: scanned().any(|item| is_status_code(item, "429")),
+            };
+            for item in scanned() {
+                match item {
+                    serde_json::Value::String(text) => {
+                        if is_exhaustion_text(text, sibling) {
+                            matched.push(text);
+                        }
+                    }
+                    nested => collect_exhaustion_texts(nested, matched),
+                }
+            }
+        }
+        _ => {}
     }
 }
 
-/// 字符串里的状态码 `code`（"403" / "429"）是否作为独立 token 出现：前后都不是
-/// ASCII 字母数字（字符串首尾视为边界；非 ASCII 字符也视为边界）。时间戳（epoch 秒
-/// 如 `1760004031`）、request id（`req-1403f8`）、行号（`line 1429`）等数字串里的
-/// 子串不算状态信号；`403 Forbidden`、`status code: 429,`、`(403)`、`status=429`
-/// 这类写法算。
+/// 字符串是否为带本地状态信号的耗尽文案（口径见 [`classify_stop_failure`]）。
+fn is_exhaustion_text(text: &str, sibling: SiblingStatus) -> bool {
+    let lower = text.to_lowercase();
+    if !lower.contains("usage limit") {
+        return false;
+    }
+    let official_429 =
+        lower.contains("reached your") && (sibling.has_429 || contains_status_token(text, "429"));
+    let legacy_403 = sibling.has_403 || contains_status_token(text, "403");
+    official_429 || legacy_403
+}
+
+/// JSON 对象成员本身是否就是状态码 `code`：数值，或去掉首尾空白后整串就是该状态码的
+/// 字符串（`"code": "429"`）。状态码之外还带别的字的字符串不算（`"HTTP 429"`）。
+fn is_status_code(value: &serde_json::Value, code: &str) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .is_some_and(|status| status.to_string() == code),
+        serde_json::Value::String(text) => text.trim() == code,
+        _ => false,
+    }
+}
+
+/// 字符串里的状态码 `code`（"403" / "429"）是否作为独立 token 出现：前后都不与词或
+/// 数字相连。相连指紧挨 ASCII 字母数字或 `_`，或隔着一个两边都是数字的 `.`（小数、
+/// ISO 毫秒）；字符串首尾与非 ASCII 字符算边界。时间戳（`1760004031`、`12:39:42.429`）、
+/// request id（`req-1403f8`、`req_429_ab`）、行号（`line 1429`）里的子串不算状态信号；
+/// `403 Forbidden`、`status code: 429,`、`(403)`、`status=429`、句末的 `429.` 算。
 fn contains_status_token(text: &str, code: &str) -> bool {
     let bytes = text.as_bytes();
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
     let mut from = 0;
     while let Some(offset) = text[from..].find(code) {
         let start = from + offset;
         let end = start + code.len();
-        let boundary_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
-        let boundary_after = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
-        if boundary_before && boundary_after {
+        let joined_before = start > 0
+            && (is_word(bytes[start - 1])
+                || (bytes[start - 1] == b'.' && start >= 2 && bytes[start - 2].is_ascii_digit()));
+        let joined_after = end < bytes.len()
+            && (is_word(bytes[end])
+                || (bytes[end] == b'.' && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)));
+        if !joined_before && !joined_after {
             return true;
         }
         from = start + 1;
@@ -1183,10 +1226,9 @@ fn contains_status_token(text: &str, code: &str) -> bool {
     false
 }
 
-/// 从官方耗尽文案辨认窗口："month" → 月度；"5"+"hour" → 5 小时；"7"+"day" → 7 天。
-/// 只看含 "usage limit" 的字符串（不扫整份文档，避免会话标题之类误供词）；
-/// 多条不一致取首条可辨认者；辨认不出返回 `None`（只影响合成证据标注哪个窗口，
-/// 不影响切换与否）。
+/// 从命中的耗尽文案辨认窗口："month" → 月度；"5"+"hour" → 5 小时；"7"+"day" → 7 天。
+/// 只看 [`collect_exhaustion_texts`] 命中的字符串（用户内容字段不参与）；多条不一致
+/// 取首条可辨认者；辨认不出返回 `None`（只影响合成证据标注哪个窗口，不影响切换与否）。
 fn window_from_usage_limit_texts<'a>(
     texts: impl IntoIterator<Item = &'a str>,
 ) -> Option<QuotaWindow> {

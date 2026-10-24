@@ -22,10 +22,10 @@
 //!   与 GUI 设置页同源：都是 `<config_dir>/config.toml`。
 //! - `kimi-switch on-quota-failure` — 配额失败被动切换（issue #162，spec #152 决策 14；
 //!   #184 改认官方 429）：Kimi Code `StopFailure` hook 观察型入口，stdin 读事件 JSON，
-//!   命中额度耗尽（官方 429 "You've reached your … usage limit"，兼容旧口径 403 +
-//!   "usage limit"）即以该原文为当前账号耗尽的权威证据，零新增网络查询，按耗尽
-//!   路径语义（安顿宽限与手动保持期不阻挡、冷却照常）复用既有自动切换判定与
-//!   activate。任何情况下退出码恒 0；stdin 畸形静默放行。
+//!   命中额度耗尽（命中条件见 [`kimi_switch_core::auto_swap::classify_stop_failure`]）
+//!   即以该原文为当前账号耗尽的权威证据，零新增网络查询，按耗尽路径语义（安顿宽限与
+//!   手动保持期不阻挡、冷却照常）复用既有自动切换判定与 activate。任何情况下退出码
+//!   恒 0；stdin 畸形静默放行。
 //! - `kimi-switch install-hook [--uninstall]` — 幂等写入 / 卸载 Kimi Code
 //!   `config.toml` 的 `[[hooks]]` StopFailure 条目（指向 `on-quota-failure`）。
 //!   除此命令外，工具任何路径不得隐式修改 Kimi Code 配置（spec #152 决策 16）。
@@ -1166,8 +1166,9 @@ fn render_config() -> Result<String> {
 // on-quota-failure（配额失败被动切换，issue #162 / spec #152 决策 14）
 // ---------------------------------------------------------------------------
 
-/// Kimi Code `StopFailure` hook 观察型入口：stdin 读事件 JSON → 分类 → 命中额度
-/// 耗尽（官方 429 / 旧口径 403）时按耗尽路径语义复用既有自动切换判定与 activate。
+/// Kimi Code `StopFailure` hook 观察型入口：stdin 读事件 JSON → 分类（见
+/// [`kimi_switch_core::auto_swap::classify_stop_failure`]）→ 命中额度耗尽时按耗尽路径
+/// 语义复用既有自动切换判定与 activate。
 /// 零新增网络查询；任何错误只写 stderr 日志，退出码由调用方恒置 0；stdin 畸形静默放行。
 async fn on_quota_failure(ctx: &AppContext) {
     use std::io::Read;
@@ -1195,8 +1196,7 @@ async fn run_on_quota_failure_with(
         StopFailureSignal,
     };
 
-    // 1. 分类：官方 429 "reached your … usage limit" 或旧口径 403 + "usage limit" 命中；
-    //    非耗尽 429（过载 / 请求过多 / 并发上限）/ 其他 / 畸形静默放行。
+    // 1. 分类（命中条件见 classify_stop_failure）：未命中与畸形 stdin 静默放行。
     let window = match classify_stop_failure(raw) {
         StopFailureSignal::QuotaExhausted { window } => window,
         StopFailureSignal::Other => {
@@ -3021,10 +3021,29 @@ mod tests {
         r#"{"hook_event_name":"StopFailure","session_id":"s-1","client_type":"kimi_code_cli","error":{"status":403,"message":"You have reached your 5-hour usage limit"}}"#.into()
     }
 
-    /// 官方现行额度耗尽事件（#184）：文案取 2026-10-24 真机会话日志 errorMessage 原文
-    /// （Kimi Code CLI 2.3.0），429 只出现在文案里；载荷字段名未经真机核实。
+    /// Kimi Code CLI 2.3.0 的 StopFailure 载荷形态：平铺对象，`session_title` 是首句用户
+    /// 提示的前 200 字（用户内容）。形态出自 #182 评审对本机 kimi.exe 内嵌源码的阅读，
+    /// 未抓过真机事件。
+    fn stop_failure_event(session_title: &str, error_type: &str, error_message: &str) -> String {
+        serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "session_id": "0b7c2f9e-5d1a-4c3b-9e8f-1a2b3c4d5e6f",
+            "cwd": r"D:\agents\projects\kimi-switch",
+            "session_title": session_title,
+            "error_type": error_type,
+            "error_message": error_message,
+        })
+        .to_string()
+    }
+
+    /// 官方现行额度耗尽事件（#184）：真实平铺载荷，error_message 取 2026-10-24 真机
+    /// 会话日志原文，429 只出现在文案前缀里。
     fn event_429_5h() -> String {
-        r#"{"hook_event_name":"StopFailure","session_id":"s-1","client_type":"kimi_code_cli","error":{"name":"APIProviderQuotaExhaustedError","message":"429 You've reached your 5-hour usage limit"}}"#.into()
+        stop_failure_event(
+            "修一下 README",
+            "APIProviderQuotaExhaustedError",
+            "429 You've reached your 5-hour usage limit",
+        )
     }
 
     fn live_blob(env: &passive_env::IsolatedHomes) -> String {
@@ -3040,6 +3059,21 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
             .filter(|event| event.action == "auto_swap")
             .collect()
+    }
+
+    /// 静默放行零副作用：live 仍是 alice、无 auto_swap 审计、无自动切换状态文件。
+    fn assert_passive_silent(env: &passive_env::IsolatedHomes, raw: &str) {
+        use kimi_switch_core::paths::AppPaths;
+        assert_eq!(
+            live_blob(env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#,
+            "不得切换：{raw}"
+        );
+        assert!(auto_swap_audits().is_empty(), "不得写审计：{raw}");
+        assert!(
+            !AppPaths::resolve().unwrap().auto_swap_state_file().exists(),
+            "不得写状态文件：{raw}"
+        );
     }
 
     /// 端到端：403 usage limit 事件 → 与耗尽路径语义一致的自动切换。当前账号缓存
@@ -3321,6 +3355,34 @@ mod tests {
                 !AppPaths::resolve().unwrap().auto_swap_state_file().exists(),
                 "不得写状态文件：{raw}"
             );
+        }
+    }
+
+    /// 会话标题是用户内容（#182 评审）：用户在首句提示里贴额度耗尽报错排查之后，这个
+    /// 会话撞上过载 429 或网络错误都不得切换——无审计、无状态文件、live 不动。
+    #[tokio::test]
+    async fn passive_session_title_quoting_exhaustion_is_silent() {
+        for raw in [
+            stop_failure_event(
+                "You've reached your 5-hour usage limit 之后自动切换没切，帮我查",
+                "APIProviderOverloadedError",
+                "429 The engine is currently overloaded, please try again later",
+            ),
+            stop_failure_event(
+                "429 You've reached your 5-hour usage limit 是什么意思",
+                "APIConnectionError",
+                "Connection error.",
+            ),
+        ] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+            super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_passive_silent(&env, &raw);
         }
     }
 
