@@ -122,6 +122,9 @@ export interface SilentQuotaHost {
   /** 静默列出并收集额度。scope 声明本轮收集范围（issue #161）：
    * "all" 全量收集；"current" 只对当前账号发网络请求、停泊账号用缓存行组装快照。 */
   listAccounts(scope: SilentQuotaScope): Promise<Snapshot>;
+  /** 应用调度器自身轮次（全量轮与加密轮）的快照。契约（issue #183）：宿主可以绘制并重新
+   * `arm()`，但不得调用 `noteApplied()`——两条节奏的簿记归调度器，本轮完成后按本轮范围
+   * 自行记账。宿主若在这里重置节奏，加密档期间停泊账号的 90s 全量轮会被无限顺延。 */
   applySnapshot(snapshot: Snapshot, generation: number): void;
   toast(text: string, isError: boolean): void;
 }
@@ -136,6 +139,8 @@ export type SilentQuotaScope = "all" | "current";
 export interface SilentQuotaScheduler {
   readonly generation: SnapshotGenerationGuard;
   arm(): void;
+  /** 用户发起的全量快照（启动首载、刷新、账号操作、设备码授权、切换流）已应用：
+   * 两条节奏都从此刻起算。只服务用户发起的快照，调度器自身轮次的快照不得发出。 */
   noteApplied(): void;
   stop(): void;
 }

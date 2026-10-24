@@ -189,10 +189,13 @@ function createHarness(
     accountCount: () => flags.accountCount,
     accounts: () => flags.accounts,
     listAccounts,
+    // 按生产契约（issue #183）：应用调度器自身轮次的快照后可重新 arm，
+    // 但不发用户快照通知（noteApplied）；两条节奏的簿记归调度器。
     applySnapshot(snapshot, generation) {
       applied.push({ snapshot, generation });
       flags.accounts = snapshot.accounts;
       flags.accountCount = snapshot.accounts.length;
+      scheduler.arm();
     },
     toast(text, isError) {
       toasts.push({ text, isError });
