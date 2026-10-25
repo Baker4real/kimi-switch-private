@@ -1012,14 +1012,61 @@ mod tests {
         }
     }
 
-    fn provider(tmp: &Path) -> FileBlobProvider<FakeRuntime> {
+    /// 切换前快照根目录由 `AppPaths::resolve()` 读 `KIMI_SWITCH_HOME` 决定，未设置时落到
+    /// 真实用户数据目录。provider 夹具持有本守卫，把它收口到用例 tempdir；进程级 env
+    /// 在并行用例间共享一把锁，Drop 先恢复 env 再放锁（模式与 core `swap.rs` 夹具一致）。
+    struct IsolatedSwitchHome {
+        previous: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for IsolatedSwitchHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("KIMI_SWITCH_HOME", value),
+                None => std::env::remove_var("KIMI_SWITCH_HOME"),
+            }
+        }
+    }
+
+    fn isolate_switch_home(tmp: &Path) -> IsolatedSwitchHome {
+        static SWITCH_HOME_LOCK: Mutex<()> = Mutex::new(());
+        let guard = SWITCH_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("KIMI_SWITCH_HOME");
+        std::env::set_var("KIMI_SWITCH_HOME", tmp.join("switch-home"));
+        IsolatedSwitchHome {
+            previous,
+            _guard: guard,
+        }
+    }
+
+    /// 测试用 provider：带快照隔离守卫，随用例结束一起释放。守卫持锁到用例结束，
+    /// 所以每个用例只建一个 provider。
+    struct TestProvider {
+        inner: FileBlobProvider<FakeRuntime>,
+        _switch_home: IsolatedSwitchHome,
+    }
+
+    impl std::ops::Deref for TestProvider {
+        type Target = FileBlobProvider<FakeRuntime>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    fn provider(tmp: &Path) -> TestProvider {
         provider_with(tmp, FakeRuntime::new(tmp.join("home")))
     }
 
-    fn provider_with(tmp: &Path, runtime: FakeRuntime) -> FileBlobProvider<FakeRuntime> {
+    fn provider_with(tmp: &Path, runtime: FakeRuntime) -> TestProvider {
+        let switch_home = isolate_switch_home(tmp);
         let store = Arc::new(FileStore::new(tmp.join("creds.json")));
         let registry = Arc::new(AccountRegistry::new(tmp.join("registry.toml")));
-        FileBlobProvider::new(runtime, store, registry)
+        TestProvider {
+            inner: FileBlobProvider::new(runtime, store, registry),
+            _switch_home: switch_home,
+        }
     }
 
     fn fake_account(id: &str) -> Account {
@@ -2309,25 +2356,13 @@ mod tests {
     /// 注入旗标是线程本地：`activate` 把写入搬进 `spawn_blocking` 线程，测试线程
     /// 注入不可达，因此这里在测试线程直接以真实 `write_blob` 作为 SwapTarget 的
     /// writer 驱动 `swap_with_snapshot`（与 activate 内部同一结构），线程本地注入
-    /// 可见。快照根目录经 `KIMI_SWITCH_HOME` 收口到 tempdir，不触碰真实配置目录。
+    /// 可见。快照根目录由 provider 夹具经 `KIMI_SWITCH_HOME` 收口到用例 tempdir，
+    /// 不触碰真实数据目录。
     #[test]
     fn live_write_fsync_failure_rolls_back_swap() {
         use kimi_switch_core::swap::{swap_with_snapshot, SwapTarget};
 
         let tmp = tempfile::tempdir().unwrap();
-        let previous = std::env::var_os("KIMI_SWITCH_HOME");
-        std::env::set_var("KIMI_SWITCH_HOME", tmp.path());
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(value) => std::env::set_var("KIMI_SWITCH_HOME", value),
-                    None => std::env::remove_var("KIMI_SWITCH_HOME"),
-                }
-            }
-        }
-        let _restore = Restore(previous);
-
         let p = provider(tmp.path());
         fs::create_dir_all(p.test_home()).unwrap();
         let live = p.test_live_path();
@@ -2568,5 +2603,47 @@ mod tests {
         assert!(u1_after.active, "registry 保持切换前标记: {accounts:?}");
         assert!(!u2_after.active, "目标账号不得被标 active: {accounts:?}");
         assert_activate_made_no_network_calls(&p);
+    }
+
+    // --- 夹具隔离：切换前快照不进真实用户数据目录 ---
+
+    /// 切换前快照根目录由 `AppPaths::resolve()` 读 `KIMI_SWITCH_HOME` 决定，未设置时落到
+    /// 真实用户数据目录（曾在真实目录留下 `fake-*` 快照）。经 provider 夹具切换时，快照
+    /// 必须落在用例 tempdir。先断言快照根、再切换：隔离失效时在写盘前就失败。
+    #[tokio::test]
+    async fn activate_snapshot_stays_in_test_tempdir() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        let snapshots = AppPaths::resolve().unwrap().snapshots_dir();
+        assert!(
+            snapshots.starts_with(tmp.path()),
+            "快照根目录必须收口到用例 tempdir，不得落到真实用户数据目录: {}",
+            snapshots.display()
+        );
+
+        fs::create_dir_all(p.test_home()).unwrap();
+        let u1_live = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let u2_blob = r#"{"uid":"u2","refresh_token":"R2","access_token":"A2"}"#;
+        p.import_raw(u1_live.into(), None, Some(true)).unwrap();
+        let u2 = p.import_raw(u2_blob.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), u1_live).unwrap();
+
+        p.activate(&u2.id).await.unwrap();
+
+        let names: Vec<String> = fs::read_dir(&snapshots)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names.len(),
+            1,
+            "本次切换应在用例 tempdir 留下一份快照: {names:?}"
+        );
+        assert!(
+            names[0].starts_with("fake-"),
+            "快照目录按 provider 命名: {names:?}"
+        );
     }
 }
