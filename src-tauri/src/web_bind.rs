@@ -15,9 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use rand::TryRngCore;
 use serde::Serialize;
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
@@ -117,7 +115,8 @@ impl StatusBook {
     }
 
     fn notify(&self) {
-        self.changed.send_modify(|tick| *tick = tick.wrapping_add(1));
+        self.changed
+            .send_modify(|tick| *tick = tick.wrapping_add(1));
     }
 
     fn subscribe(&self) -> watch::Receiver<u64> {
@@ -217,7 +216,10 @@ impl StatusBook {
     }
 
     fn remove(&self, nonce: &str) {
-        self.slots.lock().expect("web bind status lock").remove(nonce);
+        self.slots
+            .lock()
+            .expect("web bind status lock")
+            .remove(nonce);
     }
 }
 
@@ -388,7 +390,9 @@ impl WebBindBroker {
 /// 这次没有留下可用绑定。
 fn map_bind_gui_message(message: &str) -> StatusKind {
     match message {
-        "网页身份与该账号不一致，未绑定" => StatusKind::Failure(STATUS_REASON_IDENTITY),
+        "网页身份与该账号不一致，未绑定" => {
+            StatusKind::Failure(STATUS_REASON_IDENTITY)
+        }
         "会员信息获取失败，请稍后再试" => StatusKind::Success,
         _ => StatusKind::Failure(STATUS_REASON_NO_CREDENTIAL),
     }
@@ -636,7 +640,9 @@ where
     if token.is_empty() {
         // nonce 正确但页面没有 token（未登录/无凭证）：立即失败直达等待方，
         // 不让用户等满 90s 泛化超时（issue #171 / #172 失败语义）。
-        return Err(CallbackError::Terminated(anyhow!("Edge 页面没有可用网页凭证")));
+        return Err(CallbackError::Terminated(anyhow!(
+            "Edge 页面没有可用网页凭证"
+        )));
     }
     let mut stream = reader.into_inner();
     stream
@@ -667,10 +673,7 @@ struct WebBindStatusBody<'a> {
     reason: &'a str,
 }
 
-async fn write_status_response<S>(
-    mut stream: S,
-    view: Option<(&str, &str)>,
-) -> std::io::Result<()>
+async fn write_status_response<S>(mut stream: S, view: Option<(&str, &str)>) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -739,12 +742,7 @@ mod tests {
     /// 测试用 broker：注入短会话时长，让失败路径快速失败而不是挂 90s。
     /// 状态保留窗口为 0，既有用例仍能在预算结束后马上看到监听关闭。
     fn test_broker(timeout: Duration) -> WebBindBroker {
-        WebBindBroker::for_test(
-            timeout,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-        )
+        WebBindBroker::for_test(timeout, Duration::ZERO, Duration::ZERO, Duration::ZERO)
     }
 
     /// 从挑战 URL fragment 提取回调端口：`v1.<48hex>.<port>` 的最后一段。
@@ -796,7 +794,10 @@ mod tests {
         let port = challenge_port(&challenge);
         assert_eq!(
             challenge.url,
-            format!("{CONSOLE_URL}#kimi-switch-bind=v1.{}.{}", challenge.nonce, port)
+            format!(
+                "{CONSOLE_URL}#kimi-switch-bind=v1.{}.{}",
+                challenge.nonce, port
+            )
         );
         assert_eq!(challenge.nonce.len(), 48);
         assert!(challenge.nonce.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -814,7 +815,10 @@ mod tests {
         let token = broker.wait(&challenge.nonce, "alice").await.unwrap();
         assert_eq!(token, TEST_TOKEN);
         let response = send.await.unwrap();
-        assert!(response.starts_with("HTTP/1.1 204"), "合法回调应收到 204：{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 204"),
+            "合法回调应收到 204：{response}"
+        );
 
         // 一次性消费：nonce 已作废，重复 wait 与 cancel 都无会话可用。
         assert!(broker.wait(&challenge.nonce, "alice").await.is_err());
@@ -884,7 +888,10 @@ mod tests {
         let port = challenge_port(&challenge);
 
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, TEST_TOKEN)));
-        assert_eq!(broker.wait(&challenge.nonce, "alice").await.unwrap(), TEST_TOKEN);
+        assert_eq!(
+            broker.wait(&challenge.nonce, "alice").await.unwrap(),
+            TEST_TOKEN
+        );
         send.await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -928,19 +935,28 @@ mod tests {
         let port = challenge_port(&challenge);
 
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, "   ")));
-        let error = tokio::time::timeout(Duration::from_secs(2), broker.wait(&challenge.nonce, "alice"))
-            .await
-            .expect("空 token 回调必须立即失败，而非等待超时")
-            .unwrap_err();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            broker.wait(&challenge.nonce, "alice"),
+        )
+        .await
+        .expect("空 token 回调必须立即失败，而非等待超时")
+        .unwrap_err();
         let text = error.to_string();
-        assert!(text.contains("没有可用网页凭证"), "应直达页面无凭证错误：{text}");
+        assert!(
+            text.contains("没有可用网页凭证"),
+            "应直达页面无凭证错误：{text}"
+        );
         assert!(!text.contains(TEST_TOKEN) && !text.contains(INTRUDER_TOKEN));
         send.await.unwrap();
 
         // 会话已终结：后续合法回调不再被接受，nonce 已作废。
         tokio::time::sleep(Duration::from_millis(50)).await;
         let response = send_raw(port, post_request(&challenge.nonce, TEST_TOKEN)).await;
-        assert!(!response.contains("204"), "终结后回调不得被消费：{response}");
+        assert!(
+            !response.contains("204"),
+            "终结后回调不得被消费：{response}"
+        );
         assert!(broker.wait(&challenge.nonce, "alice").await.is_err());
         assert!(!broker.cancel(&challenge.nonce));
     }
@@ -968,7 +984,10 @@ mod tests {
         // 收口后监听随会话关闭：新连接既得不到响应，也连不上端口。
         tokio::time::sleep(Duration::from_millis(100)).await;
         let response = send_raw(port, post_request(&challenge.nonce, INTRUDER_TOKEN)).await;
-        assert!(!response.contains("204"), "收口后回调不得被消费：{response}");
+        assert!(
+            !response.contains("204"),
+            "收口后回调不得被消费：{response}"
+        );
         assert!(
             TcpStream::connect(("127.0.0.1", port)).await.is_err(),
             "会话结束后监听应已关闭"
@@ -1031,12 +1050,18 @@ mod tests {
 
         assert!(broker.cancel(&challenge.nonce));
         let error = broker.wait(&challenge.nonce, "alice").await.unwrap_err();
-        assert!(error.to_string().contains("不存在"), "会话应已作废：{error}");
+        assert!(
+            error.to_string().contains("不存在"),
+            "会话应已作废：{error}"
+        );
 
         // 早取消也必须尽快关闭监听（不得残留到 90s 超时）。
         tokio::time::sleep(Duration::from_millis(50)).await;
         let response = send_raw(port, post_request(&challenge.nonce, INTRUDER_TOKEN)).await;
-        assert!(!response.contains("204"), "取消后合法回调也不得被消费：{response}");
+        assert!(
+            !response.contains("204"),
+            "取消后合法回调也不得被消费：{response}"
+        );
     }
 
     /// 等待中取消：等待方收到取消错误，此后再发的合法回调也不交付。
@@ -1059,7 +1084,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let response = send_raw(port, post_request(&challenge.nonce, INTRUDER_TOKEN)).await;
-        assert!(!response.contains("204"), "取消后合法回调也不得被消费：{response}");
+        assert!(
+            !response.contains("204"),
+            "取消后合法回调也不得被消费：{response}"
+        );
     }
 
     /// 跨账号串线：目标账号已变化时丢弃回调凭证并报错，token 不出现在错误文本。
@@ -1226,7 +1254,10 @@ mod tests {
 
     fn assert_no_secrets(response: &str) {
         assert!(!response.contains(TEST_TOKEN), "载荷泄漏凭证：{response}");
-        assert!(!response.contains(INTRUDER_TOKEN), "载荷泄漏凭证：{response}");
+        assert!(
+            !response.contains(INTRUDER_TOKEN),
+            "载荷泄漏凭证：{response}"
+        );
         assert!(!response.contains("alice"), "载荷泄漏账号 id：{response}");
         assert!(!response.contains("bob"), "载荷泄漏账号 id：{response}");
         assert!(!response.contains("eyJ"), "载荷泄漏 JWT：{response}");
@@ -1237,21 +1268,31 @@ mod tests {
             response.starts_with("HTTP/1.1 404"),
             "未知或过期应不存在：{response}"
         );
-        assert!(status_body(response).is_empty(), "不存在响应不得带载荷：{response}");
+        assert!(
+            status_body(response).is_empty(),
+            "不存在响应不得带载荷：{response}"
+        );
         assert_no_secrets(response);
     }
 
     /// 还没收到合法回调：等待中。回查无副作用，随后的合法回调仍只交付一次。
     #[tokio::test(flavor = "multi_thread")]
     async fn status_before_callback_is_pending_and_has_no_side_effect() {
-        let broker = status_broker(Duration::from_secs(5), Duration::from_secs(3), Duration::from_secs(1));
+        let broker = status_broker(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
         let challenge = broker.begin("alice").await.unwrap();
         let port = challenge_port(&challenge);
 
         let first = get_status(port, &challenge.nonce).await;
         assert_public_status(&first, "pending", "等待中");
         assert_no_secrets(&first);
-        assert!(!first.contains(&challenge.nonce), "载荷不得回显 nonce：{first}");
+        assert!(
+            !first.contains(&challenge.nonce),
+            "载荷不得回显 nonce：{first}"
+        );
         let second = get_status(port, &challenge.nonce).await;
         assert_eq!(first, second, "重复回查不得改变等待中");
 
@@ -1264,7 +1305,11 @@ mod tests {
     /// 回调已收下、bind_web 还没返回：仍然是等待中。
     #[tokio::test(flavor = "multi_thread")]
     async fn status_after_accept_before_bind_is_pending() {
-        let broker = status_broker(Duration::from_secs(5), Duration::from_secs(3), Duration::from_secs(1));
+        let broker = status_broker(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
         let challenge = broker.begin("alice").await.unwrap();
         let port = challenge_port(&challenge);
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, TEST_TOKEN)));
@@ -1326,14 +1371,21 @@ mod tests {
     /// 空 token → 失败：无可用网页凭证。
     #[tokio::test(flavor = "multi_thread")]
     async fn status_empty_token_is_no_credential() {
-        let broker = status_broker(Duration::from_secs(5), Duration::from_secs(3), Duration::from_secs(1));
+        let broker = status_broker(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
         let challenge = broker.begin("alice").await.unwrap();
         let port = challenge_port(&challenge);
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, "   ")));
-        let error = tokio::time::timeout(Duration::from_secs(2), broker.wait(&challenge.nonce, "alice"))
-            .await
-            .expect("空 token 必须立即失败")
-            .unwrap_err();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            broker.wait(&challenge.nonce, "alice"),
+        )
+        .await
+        .expect("空 token 必须立即失败")
+        .unwrap_err();
         assert!(error.to_string().contains("没有可用网页凭证"), "{error}");
         send.await.unwrap();
         let response = get_status(port, &challenge.nonce).await;
@@ -1414,7 +1466,11 @@ mod tests {
     /// 目标已变化：凭证丢弃，管道未跑，回查为无可用网页凭证。
     #[tokio::test(flavor = "multi_thread")]
     async fn status_target_changed_is_no_credential() {
-        let broker = status_broker(Duration::from_secs(5), Duration::from_secs(3), Duration::from_secs(1));
+        let broker = status_broker(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
         let challenge = broker.begin("alice").await.unwrap();
         let port = challenge_port(&challenge);
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, TEST_TOKEN)));
@@ -1457,7 +1513,11 @@ mod tests {
     /// 伪造 nonce 看不到真实会话的结果、凭证或账号。
     #[tokio::test(flavor = "multi_thread")]
     async fn forged_nonce_does_not_leak_session() {
-        let broker = status_broker(Duration::from_secs(5), Duration::from_secs(3), Duration::from_secs(1));
+        let broker = status_broker(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
         let challenge = broker.begin("alice").await.unwrap();
         let port = challenge_port(&challenge);
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, TEST_TOKEN)));
@@ -1482,7 +1542,11 @@ mod tests {
     /// 成功载荷也不含凭证、账号 id、nonce。
     #[tokio::test(flavor = "multi_thread")]
     async fn status_payload_omits_credentials() {
-        let broker = status_broker(Duration::from_secs(5), Duration::from_secs(3), Duration::from_secs(1));
+        let broker = status_broker(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
         let challenge = broker.begin("alice").await.unwrap();
         let port = challenge_port(&challenge);
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, TEST_TOKEN)));
@@ -1499,7 +1563,11 @@ mod tests {
     /// 重复回调不改已终止状态，也不再交付 token。
     #[tokio::test(flavor = "multi_thread")]
     async fn repeat_callback_does_not_change_terminal_status() {
-        let broker = status_broker(Duration::from_secs(5), Duration::from_secs(3), Duration::from_secs(1));
+        let broker = status_broker(
+            Duration::from_secs(5),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
         let challenge = broker.begin("alice").await.unwrap();
         let port = challenge_port(&challenge);
         let send = tokio::spawn(send_raw(port, post_request(&challenge.nonce, TEST_TOKEN)));
@@ -1514,10 +1582,7 @@ mod tests {
 
         let repeat = send_raw(port, post_request(&challenge.nonce, INTRUDER_TOKEN)).await;
         assert!(!repeat.contains("204"), "重复回调不得再被消费：{repeat}");
-        broker.publish_bind_outcome(
-            &challenge.nonce,
-            Some("网页身份与该账号不一致，未绑定"),
-        );
+        broker.publish_bind_outcome(&challenge.nonce, Some("网页身份与该账号不一致，未绑定"));
         let second = get_status(port, &challenge.nonce).await;
         assert_eq!(first, second, "重复回调和再次发布不得改变已终止状态");
         assert_no_secrets(&second);

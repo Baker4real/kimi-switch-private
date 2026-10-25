@@ -256,7 +256,11 @@ mod tests {
         assert_eq!(events[0].result, "ok");
         assert_eq!(events[0].account.as_deref(), Some("bob"));
         assert!(
-            events[0].detail.as_deref().unwrap_or_default().contains("from=alice"),
+            events[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("from=alice"),
             "审计 detail 应记录纠正前标记: {:?}",
             events[0].detail
         );
@@ -351,7 +355,10 @@ mod tests {
         assert_eq!(events[0].result, "ok");
         let detail = events[0].detail.as_deref().unwrap_or_default();
         assert!(detail.contains("carol"), "detail 应含 live 身份: {detail}");
-        assert!(detail.contains("alice"), "detail 应记录被清除的标记: {detail}");
+        assert!(
+            detail.contains("alice"),
+            "detail 应记录被清除的标记: {detail}"
+        );
     }
 
     /// live 身份不在库且本无标记：不写注册表、不留审计，仍返回提示信号。
@@ -386,7 +393,11 @@ mod tests {
         let outcome = h.check("ghost");
 
         assert_eq!(outcome, StartupCheckOutcome::Consistent);
-        assert_eq!(h.active_ids(), vec!["alice".to_string()], "墓碑命中不得动标记");
+        assert_eq!(
+            h.active_ids(),
+            vec!["alice".to_string()],
+            "墓碑命中不得动标记"
+        );
         assert!(!h.audit.path().exists());
     }
 
@@ -396,13 +407,10 @@ mod tests {
         let h = Harness::new();
         h.seed("alice", true);
 
-        let outcome = startup_consistency_check(
-            "kimi",
-            &h.removed_path,
-            &h.registry,
-            &h.audit,
-            || Err(Error::provider("read live credentials failed")),
-        );
+        let outcome =
+            startup_consistency_check("kimi", &h.removed_path, &h.registry, &h.audit, || {
+                Err(Error::provider("read live credentials failed"))
+            });
 
         assert_eq!(outcome, StartupCheckOutcome::Consistent);
         assert_eq!(h.active_ids(), vec!["alice".to_string()]);

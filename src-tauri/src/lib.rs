@@ -150,7 +150,11 @@ async fn complete_web_bind(
     finish_edge_web_bind(
         settled,
         |outcome| state.web_bind.publish_bind_outcome(&nonce, outcome),
-        |message| state.backend.snapshot(Some(message), QuotaCollectReason::Scheduled),
+        |message| {
+            state
+                .backend
+                .snapshot(Some(message), QuotaCollectReason::Scheduled)
+        },
     )
     .await
     .map_err(map_err)

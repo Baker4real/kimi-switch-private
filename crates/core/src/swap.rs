@@ -163,7 +163,14 @@ pub fn swap_with_snapshot<'a, C>(
 where
     C: FnOnce() -> Result<()>,
 {
-    swap_with_snapshot_protected(provider_id, provider_home, lock_dir, targets, Vec::new(), commit)
+    swap_with_snapshot_protected(
+        provider_id,
+        provider_home,
+        lock_dir,
+        targets,
+        Vec::new(),
+        commit,
+    )
 }
 
 /// 同 [`swap_with_snapshot`]，但额外把 `protected` 里的文件纳入备份/回滚集。
@@ -1331,9 +1338,7 @@ mod tests {
                 "alice-live",
                 "live 应回滚为切换前内容"
             );
-            let accounts = AccountRegistry::new(paths.registry_file())
-                .load()
-                .unwrap();
+            let accounts = AccountRegistry::new(paths.registry_file()).load().unwrap();
             let active = accounts
                 .iter()
                 .find(|a| a.active)

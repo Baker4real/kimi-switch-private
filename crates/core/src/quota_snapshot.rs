@@ -105,15 +105,7 @@ pub async fn collect_detailed<P>(
 where
     P: Provider + 'static,
 {
-    collect_detailed_focused(
-        provider,
-        provider_id,
-        account_ids,
-        cache_path,
-        reason,
-        None,
-    )
-    .await
+    collect_detailed_focused(provider, provider_id, account_ids, cache_path, reason, None).await
 }
 
 /// 聚焦收集时目标账号（当前账号）的成功节流窗下限（issue #161）：与前端适应性
@@ -371,7 +363,10 @@ fn membership_of(quotas: &[Quota]) -> Option<String> {
 /// `user.membership.level`；档位来源迁到 `/me`（缓存在 extra）。快照自带档位
 /// （旧缓存行 / 未来接口回补）仍然优先，缺失时才回退 extra——GUI 档位行、
 /// 会员轨道与自动切换档位排序经此不断档。纯函数、不发网络。
-pub fn apply_cached_membership(snapshots: &mut [QuotaSnapshot], accounts: &[crate::model::Account]) {
+pub fn apply_cached_membership(
+    snapshots: &mut [QuotaSnapshot],
+    accounts: &[crate::model::Account],
+) {
     for snapshot in snapshots.iter_mut() {
         if snapshot.membership.is_some() {
             continue;
@@ -1684,7 +1679,11 @@ mod tests {
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         assert_eq!(full.stats.skipped_out_of_focus, 0);
 
-        age_all(&path, &["alice", "bob", "carol"], ChronoDuration::seconds(20));
+        age_all(
+            &path,
+            &["alice", "bob", "carol"],
+            ChronoDuration::seconds(20),
+        );
         let focus_id = AccountId("alice".into());
         let focused = collect_detailed_focused(
             provider.clone(),

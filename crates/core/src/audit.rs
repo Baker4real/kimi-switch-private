@@ -149,9 +149,7 @@ mod tests {
     fn activate_event_roundtrips_duration_ms() {
         let tmp = tempfile::tempdir().unwrap();
         let log = AuditLog::new(tmp.path().join("audit.log"));
-        log.append(
-            AuditEvent::ok("activate", "kimi", Some("alice")).with_duration_ms(37),
-        );
+        log.append(AuditEvent::ok("activate", "kimi", Some("alice")).with_duration_ms(37));
         let raw = std::fs::read_to_string(log.path()).unwrap();
         assert!(
             raw.contains("\"duration_ms\":37"),
@@ -168,8 +166,8 @@ mod tests {
             r#"{"timestamp":"2026-09-13T00:00:00Z","action":"activate","#,
             r#""provider":"kimi","account":"alice","result":"ok"}"#
         );
-        let event: AuditEvent = serde_json::from_str(legacy)
-            .expect("旧格式记录（无 duration_ms）必须能继续解析");
+        let event: AuditEvent =
+            serde_json::from_str(legacy).expect("旧格式记录（无 duration_ms）必须能继续解析");
         assert_eq!(event.action, "activate");
         assert_eq!(event.duration_ms, None);
     }

@@ -118,7 +118,10 @@ fn acquire_exclusive(file: &File, path: &Path) -> Result<()> {
                 std::thread::sleep(LOCK_POLL_INTERVAL);
             }
             Err(e) => {
-                return Err(Error::provider(format!("lock {} failed: {e}", path.display())))
+                return Err(Error::provider(format!(
+                    "lock {} failed: {e}",
+                    path.display()
+                )))
             }
         }
     }

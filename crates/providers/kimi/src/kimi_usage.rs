@@ -436,7 +436,8 @@ mod tests {
     #[test]
     fn parse_official_profile_reads_nickname_and_membership() {
         // 官方 0.43 客户端口径：snake_case 顶层字段，user_id 是有效性门槛。
-        let body = r#"{"user_id":"u1","nickname":"Baker","user_level_name":"Allegretto","user_level":2}"#;
+        let body =
+            r#"{"user_id":"u1","nickname":"Baker","user_level_name":"Allegretto","user_level":2}"#;
         assert_eq!(
             parse_official_profile(body),
             Some(OfficialProfile {
@@ -576,7 +577,10 @@ mod tests {
                 "200 OK",
                 r#"{"usage":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"}}"#,
             ),
-            ("200 OK", r#"{"user_id":"u-123","nickname":"Forever","phone":"+86","user_level_name":"Allegro"}"#),
+            (
+                "200 OK",
+                r#"{"user_id":"u-123","nickname":"Forever","phone":"+86","user_level_name":"Allegro"}"#,
+            ),
         ]);
 
         let quotas = fetch_quota_with_active_recovery_at(
@@ -663,7 +667,10 @@ mod tests {
                 "200 OK",
                 r#"{"usage":{"limit":"100","used":"7","remaining":"93","resetTime":"2026-07-24T07:52:15Z"}}"#,
             ),
-            ("200 OK", r#"{"user_id":"u-123","nickname":"Forever","user_level_name":"Allegretto"}"#),
+            (
+                "200 OK",
+                r#"{"user_id":"u-123","nickname":"Forever","user_level_name":"Allegretto"}"#,
+            ),
         ]);
 
         fetch_quota_with_active_recovery_at(

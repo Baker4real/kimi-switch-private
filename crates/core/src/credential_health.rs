@@ -116,7 +116,10 @@ fn credentials_file_from_state_path(state_path: &Path) -> PathBuf {
 /// 从凭证仓库文件（[`crate::store::FileStore`] 的磁盘格式：`{ "provider:account:field": value }`）
 /// 只读取出各 Kimi 账号的 blob。文件缺失 / 损坏 / 账号无条目 → 该账号无 blob（不进判定）。
 /// 直接按格式读文件而非走 `FileStore::get`：后者会创建锁文件与目录，决策路径不应有写副作用。
-fn load_credential_blobs(credentials_file: &Path, accounts: &[Account]) -> HashMap<AccountId, String> {
+fn load_credential_blobs(
+    credentials_file: &Path,
+    accounts: &[Account],
+) -> HashMap<AccountId, String> {
     let Ok(raw) = std::fs::read_to_string(credentials_file) else {
         return HashMap::new();
     };
@@ -128,7 +131,9 @@ fn load_credential_blobs(credentials_file: &Path, accounts: &[Account]) -> HashM
         .filter(|account| account.provider == KIMI_PROVIDER_ID)
         .filter_map(|account| {
             let key = format!("{}:{}:{}", account.provider, account.id.0, KIMI_STORE_FIELD);
-            map.get(&key).cloned().map(|blob| (account.id.clone(), blob))
+            map.get(&key)
+                .cloned()
+                .map(|blob| (account.id.clone(), blob))
         })
         .collect()
 }
@@ -191,8 +196,7 @@ pub(crate) mod test_env {
 
     /// 测试用 base64url 编码（无 padding）。
     pub(crate) fn b64url(input: &str) -> String {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut out = String::new();
         for chunk in input.as_bytes().chunks(3) {
             let b0 = u32::from(chunk[0]);
@@ -231,7 +235,7 @@ pub(crate) mod test_env {
 
 #[cfg(test)]
 mod tests {
-    use super::test_env::{blob_with_exp, b64url, jwt_with_exp, with_isolated_kimi_home};
+    use super::test_env::{b64url, blob_with_exp, jwt_with_exp, with_isolated_kimi_home};
     use super::*;
     use chrono::TimeZone;
 

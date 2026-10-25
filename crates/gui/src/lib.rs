@@ -31,12 +31,11 @@ mod tests {
         attach_auto_swap_message, attach_skip_message, auth_success_message,
         auto_swap_opt_out_message, auto_swap_success_message, bind_web_success_message,
         bind_web_user_message, cached_membership_plan, collect_account_rows,
-        finish_edge_web_bind, BindWebReady,
         collect_account_rows_scoped, credential_locally_dead, delete_success_message,
-        import_success_message, pre_reset_burn_message, pre_reset_burn_return_message,
-        reauth_success_message, rename_success_message, startup_notice_message,
-        swap_after_activate, swap_failure_message, swap_success_message,
-        AutoSwapSnapshotEffect, DEAD_CREDENTIAL_WARNING, WebMembershipRefresh,
+        finish_edge_web_bind, import_success_message, pre_reset_burn_message,
+        pre_reset_burn_return_message, reauth_success_message, rename_success_message,
+        startup_notice_message, swap_after_activate, swap_failure_message, swap_success_message,
+        AutoSwapSnapshotEffect, BindWebReady, WebMembershipRefresh, DEAD_CREDENTIAL_WARNING,
     };
     use kimi_switch_core::{AuditEvent, AuditLog};
 
@@ -633,10 +632,7 @@ mod tests {
         )
         .await;
         assert!(failed.is_err());
-        assert_eq!(
-            published.as_deref(),
-            Some("网页身份与该账号不一致，未绑定")
-        );
+        assert_eq!(published.as_deref(), Some("网页身份与该账号不一致，未绑定"));
         assert!(!snapshotted, "失败分支不得取额度快照");
 
         let mut membership = None;
@@ -714,7 +710,12 @@ mod tests {
         }
 
         fn calls_for(&self, id: &str) -> usize {
-            self.calls_by_id.lock().unwrap().get(id).copied().unwrap_or(0)
+            self.calls_by_id
+                .lock()
+                .unwrap()
+                .get(id)
+                .copied()
+                .unwrap_or(0)
         }
     }
 
@@ -790,7 +791,9 @@ mod tests {
         // 快照仍覆盖全部账号：停泊行来自窗内缓存，自动切换判定与展示不受聚焦影响。
         assert_eq!(rows.len(), 2);
         assert_eq!(snapshots.len(), 2);
-        assert!(rows.iter().all(|row| row.error.is_none() && !row.quotas.is_empty()));
+        assert!(rows
+            .iter()
+            .all(|row| row.error.is_none() && !row.quotas.is_empty()));
     }
 
     /// current_only = false 与既有全量行为等价：20s 旧缓存仍在 90s 窗内，第二轮全量零查询。
@@ -1324,10 +1327,15 @@ mod tests {
                 cache_dir: tmp.path().join("cache"),
             };
             // 拒止文件里只有 bob 的 refresh 指纹。
-            let dead_file = kimi_home.join("credentials").join(".kimi-switch-dead-refresh");
+            let dead_file = kimi_home
+                .join("credentials")
+                .join(".kimi-switch-dead-refresh");
             std::fs::create_dir_all(dead_file.parent().unwrap()).unwrap();
-            std::fs::write(&dead_file, format!("{}\n", refresh_fingerprint("refresh-bob")))
-                .unwrap();
+            std::fs::write(
+                &dead_file,
+                format!("{}\n", refresh_fingerprint("refresh-bob")),
+            )
+            .unwrap();
 
             assert!(
                 credential_locally_dead(&paths, &sample_account("bob")),
@@ -2857,11 +2865,10 @@ mod tests {
 
         assert!(startup_notice_message(&StartupCheckOutcome::Consistent).is_none());
 
-        let untracked =
-            startup_notice_message(&StartupCheckOutcome::UntrackedLiveIdentity {
-                live: AccountId("carol".into()),
-            })
-            .expect("工具外身份应有提示");
+        let untracked = startup_notice_message(&StartupCheckOutcome::UntrackedLiveIdentity {
+            live: AccountId("carol".into()),
+        })
+        .expect("工具外身份应有提示");
         assert!(untracked.text.contains("工具外身份"), "{}", untracked.text);
         assert!(untracked.text.contains("导入"), "{}", untracked.text);
         assert_eq!(untracked.tone, MessageTone::Info);

@@ -207,7 +207,8 @@ impl FileStore {
         };
         fs::write(&tmp, raw).map_err(|e| Error::Credential(format!("write {what} failed: {e}")))?;
         restrict_permissions(&tmp)?;
-        fs::rename(&tmp, path).map_err(|e| Error::Credential(format!("commit {what} failed: {e}")))?;
+        fs::rename(&tmp, path)
+            .map_err(|e| Error::Credential(format!("commit {what} failed: {e}")))?;
         // 文件级 fsync（issue #153）：capture-on-leave 回灌等凭证写入在临时文件 +
         // rename 之后落盘。capture 路径上的失败维持 warn 不阻断（spec #152 决策 10）。
         crate::swap::sync_file(path)

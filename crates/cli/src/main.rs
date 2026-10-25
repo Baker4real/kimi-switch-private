@@ -713,9 +713,7 @@ where
                         match target.kind {
                             AutoSwapKind::Pace => StatusJsonEvent::swap_pace(&target),
                             AutoSwapKind::Burn => StatusJsonEvent::swap_burn(&target),
-                            AutoSwapKind::BurnReturn => {
-                                StatusJsonEvent::swap_burn_return(&target)
-                            }
+                            AutoSwapKind::BurnReturn => StatusJsonEvent::swap_burn_return(&target),
                             AutoSwapKind::Exhausted => StatusJsonEvent::swap_exhausted(&target),
                         },
                     )
@@ -961,7 +959,8 @@ fn dead_credential_warning(account: &Account) -> Option<&'static str> {
         std::slice::from_ref(account),
         Utc::now(),
     );
-    dead.contains(&account.id).then_some(DEAD_CREDENTIAL_WARNING)
+    dead.contains(&account.id)
+        .then_some(DEAD_CREDENTIAL_WARNING)
 }
 
 /// 把死卡警告写往 stderr（issue #156）：`None` 零输出；写失败由调用方忽略——
@@ -3906,10 +3905,7 @@ mod tests {
         let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
 
         super::swap(&ctx, Some("bob")).await.unwrap();
-        assert!(
-            live_blob(&env).contains("tok-bob"),
-            "切换本身必须照常成功"
-        );
+        assert!(live_blob(&env).contains("tok-bob"), "切换本身必须照常成功");
 
         let bob = super::resolve_account(&ctx, "bob").unwrap();
         assert!(

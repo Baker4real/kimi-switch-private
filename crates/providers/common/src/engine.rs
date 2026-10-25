@@ -1247,11 +1247,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
         fs::create_dir_all(p.test_home()).unwrap();
-        fs::write(
-            p.test_live_path(),
-            r#"{"uid":"u1","access_token":"A1"}"#,
-        )
-        .unwrap();
+        fs::write(p.test_live_path(), r#"{"uid":"u1","access_token":"A1"}"#).unwrap();
         p.import_active(None).unwrap();
 
         let mut bound = p
@@ -1274,11 +1270,7 @@ mod tests {
         );
         p.test_registry_upsert(bound).unwrap();
 
-        fs::write(
-            p.test_live_path(),
-            r#"{"uid":"u1","access_token":"A2"}"#,
-        )
-        .unwrap();
+        fs::write(p.test_live_path(), r#"{"uid":"u1","access_token":"A2"}"#).unwrap();
         p.import_active(None).unwrap();
 
         let extra = p
@@ -2427,11 +2419,7 @@ mod tests {
             "activate 全程不得调用 refresh（网络入口之一）"
         );
         assert!(
-            p.test_runtime()
-                .last_access_token
-                .lock()
-                .unwrap()
-                .is_none(),
+            p.test_runtime().last_access_token.lock().unwrap().is_none(),
             "activate 全程不得调用 fetch_quota（网络入口之一）"
         );
     }
@@ -2555,14 +2543,16 @@ mod tests {
     /// 抢救进 u1 的 store（保留新 token，而非 capture-on-leave 早先灌入的切换前
     /// 副本），再恢复备份；错误仍按 mismatch 报告，live 与注册表恢复切换前状态。
     #[tokio::test]
-    async fn activate_mismatch_salvages_official_rotated_live_of_previous_account_before_rollback() {
+    async fn activate_mismatch_salvages_official_rotated_live_of_previous_account_before_rollback()
+    {
         let tmp = tempfile::tempdir().unwrap();
         let mut runtime = FakeRuntime::new(tmp.path().join("home"));
         let u1_live = r#"{"uid":"u1","refresh_token":"T1","access_token":"A1"}"#;
         let u2_blob = r#"{"uid":"u2","refresh_token":"RT-TARGET","access_token":"A2"}"#;
         // 官方为 u1 轮换出的新一次性 refresh token 版本（合成占位值）。
         let u1_rotated = r#"{"uid":"u1","refresh_token":"RT-ROTATED","access_token":"A1-NEW"}"#;
-        runtime.official_overwrite_when_live_is = Some((u2_blob.to_string(), u1_rotated.to_string()));
+        runtime.official_overwrite_when_live_is =
+            Some((u2_blob.to_string(), u1_rotated.to_string()));
         let p = provider_with(tmp.path(), runtime);
         fs::create_dir_all(p.test_home()).unwrap();
 

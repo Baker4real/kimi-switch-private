@@ -18,8 +18,8 @@ pub mod quota_snapshot;
 pub mod remove_account;
 pub mod removed;
 pub mod settings;
-pub mod store;
 pub mod startup_check;
+pub mod store;
 pub mod swap;
 mod switch_lock;
 pub mod time;
@@ -54,8 +54,8 @@ pub use error::{
 pub use membership_expiry::{
     format_membership_expiry, membership_expiry_from_extra, membership_period_days,
     membership_remaining_days, membership_start_from_extra, normalize_membership_level,
-    prettify_membership, write_membership_extra, EXTRA_CURRENT_END_TIME,
-    EXTRA_CURRENT_START_TIME, EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
+    prettify_membership, write_membership_extra, EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME,
+    EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
 };
 pub use model::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
 pub use provider::Provider;
@@ -67,5 +67,5 @@ pub use quota_snapshot::{
 };
 pub use remove_account::remove_account;
 pub use removed::RemovedAccounts;
-pub use store::{CredentialStore, FileStore, KeyringStore};
 pub use startup_check::{startup_consistency_check, StartupCheckOutcome};
+pub use store::{CredentialStore, FileStore, KeyringStore};

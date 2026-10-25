@@ -1067,9 +1067,7 @@ mod tests {
         // 有 web field：刷新 Bearer 只用网页凭证。blob 换成带蜜罐标记的
         // 另一 JWT——若误用 blob，蜜罐会出现在请求头里。
         let honeypot_blob = format!("{}.sig-HONEYPOT-BLOB", token_for("honeypot"));
-        h.store
-            .set("kimi", "u1", "blob", &honeypot_blob)
-            .unwrap();
+        h.store.set("kimi", "u1", "blob", &honeypot_blob).unwrap();
         let web_token = token_for("u1");
         h.store
             .set("kimi", "u1", WEB_STORE_FIELD, &web_token)

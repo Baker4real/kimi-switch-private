@@ -422,9 +422,7 @@ mod tests {
         reg.upsert(make_account("alpha", "b")).unwrap();
 
         crate::swap::fail_next_sync();
-        let err = reg
-            .set_active("alpha", &AccountId("b".into()))
-            .unwrap_err();
+        let err = reg.set_active("alpha", &AccountId("b".into())).unwrap_err();
         assert!(
             err.to_string().contains("injected fsync failure"),
             "fsync 失败必须上抛: {err}"

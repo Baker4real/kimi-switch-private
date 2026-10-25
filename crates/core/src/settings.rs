@@ -701,7 +701,10 @@ threshold = 0.5
         let explicit = tmp.path().join("explicit.toml");
         std::fs::write(&explicit, "[auto_swap]\npre_reset_burn_min_ratio = 0.8\n").unwrap();
         assert_eq!(
-            load_from(&explicit).unwrap().auto_swap.pre_reset_burn_min_ratio,
+            load_from(&explicit)
+                .unwrap()
+                .auto_swap
+                .pre_reset_burn_min_ratio,
             0.8
         );
     }

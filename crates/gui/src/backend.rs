@@ -17,9 +17,9 @@ use kimi_switch_core::{
     read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
     set_manual_hold_until, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
     AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason,
-    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota,
-    QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState,
-    QuotaWindow, RemovedAccounts, StartupCheckOutcome, WEB_STORE_FIELD,
+    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
+    QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
+    StartupCheckOutcome, WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
@@ -297,7 +297,10 @@ impl Backend {
             || self.kimi.live_account_id(),
         );
         if let Some(message) = startup_notice_message(&outcome) {
-            *self.startup_notice.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+            *self
+                .startup_notice
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(message);
         }
     }
 
@@ -996,7 +999,12 @@ where
     };
 
     let mut outcome = kimi_switch_core::quota_snapshot::collect_detailed_focused(
-        provider, "kimi", &ids, cache_path, reason, focus.as_ref(),
+        provider,
+        "kimi",
+        &ids,
+        cache_path,
+        reason,
+        focus.as_ref(),
     )
     .await;
     // 官方 `/usages` 移除 `user` 对象（2026-09-14）后查询结果不带档位：用账号
@@ -1055,12 +1063,12 @@ pub(crate) fn account_for_notice(registry: &AccountRegistry, account: Account) -
 pub(crate) fn startup_notice_message(outcome: &StartupCheckOutcome) -> Option<UiMessage> {
     match outcome {
         StartupCheckOutcome::Consistent => None,
-        StartupCheckOutcome::CorrectedActive { account, previous } => Some(UiMessage::info(
-            match previous {
+        StartupCheckOutcome::CorrectedActive { account, previous } => {
+            Some(UiMessage::info(match previous {
                 Some(prev) => format!("已按登录文件纠正当前账号：{prev} → {account}"),
                 None => format!("已按登录文件标记当前账号：{account}"),
-            },
-        )),
+            }))
+        }
         StartupCheckOutcome::UntrackedLiveIdentity { live } => Some(UiMessage::info(format!(
             "检测到工具外身份 {live}，不在账号库；可在账号库导入收进账号库"
         ))),

@@ -110,9 +110,7 @@ mod tests {
         // 官网名归一成 LEVEL_* 存档，只动档位键。
         write_official_membership_extra(&mut extra, Some("Allegretto"));
         assert_eq!(
-            extra
-                .get(EXTRA_OFFICIAL_MEMBERSHIP)
-                .and_then(Value::as_str),
+            extra.get(EXTRA_OFFICIAL_MEMBERSHIP).and_then(Value::as_str),
             Some("LEVEL_INTERMEDIATE")
         );
         assert_eq!(
