@@ -1,0 +1,4 @@
+#!/bin/sh
+# 推送前跑全量检查（npm run check），任一步失败即拒绝推送。
+# 每个克隆启用一次：git config core.hooksPath .githooks
+exec npm run check

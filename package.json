@@ -9,6 +9,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "check:ui": "npm run typecheck && npm test && npm run build",
+    "check": "npm run check:ui && cargo fmt --all -- --check && cargo check --workspace && cargo test --workspace",
     "build:desktop": "pwsh -NoProfile -File scripts/build-desktop.ps1",
     "tauri": "tauri"
   },
