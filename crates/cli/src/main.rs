@@ -24,8 +24,9 @@
 //!   #184 改认官方 429）：Kimi Code `StopFailure` hook 观察型入口，stdin 读事件 JSON，
 //!   命中额度耗尽（命中条件见 [`kimi_switch_core::auto_swap::classify_stop_failure`]）
 //!   即以该原文为当前账号耗尽的权威证据，零新增网络查询，按耗尽路径语义（安顿宽限与
-//!   手动保持期不阻挡、冷却照常）复用既有自动切换判定与 activate。任何情况下退出码
-//!   恒 0；stdin 畸形静默放行。
+//!   手动保持期不阻挡、冷却照常）复用既有自动切换判定与 activate。每个事件在审计日志
+//!   追加一行留痕（action `on_quota_failure`：分类与最终决定，不含会话标题与工作目录）；
+//!   任何情况下退出码恒 0，stdin 畸形同样只留痕放行。
 //! - `kimi-switch install-hook [--uninstall]` — 幂等写入 / 卸载 Kimi Code
 //!   `config.toml` 的 `[[hooks]]` StopFailure 条目（指向 `on-quota-failure`）。
 //!   除此命令外，工具任何路径不得隐式修改 Kimi Code 配置（spec #152 决策 16）。
@@ -137,7 +138,9 @@ enum Cmd {
     /// quota-exhaustion signal (429 "You've reached your ... usage limit", or
     /// legacy 403 + "usage limit"), run one passive auto-swap reusing the
     /// existing exhaustion-path decision. Other 429s (overloaded, too many
-    /// requests, concurrent limit) are ignored. Zero new network queries.
+    /// requests, concurrent limit) are ignored. Every event appends one
+    /// `on_quota_failure` trace line to the audit log (classification and final
+    /// decision; never the session title or cwd). Zero new network queries.
     /// Always exits 0 (observer hook; never blocks the session).
     OnQuotaFailure,
 
@@ -1167,8 +1170,8 @@ fn render_config() -> Result<String> {
 
 /// Kimi Code `StopFailure` hook 观察型入口：stdin 读事件 JSON → 分类（见
 /// [`kimi_switch_core::auto_swap::classify_stop_failure`]）→ 命中额度耗尽时按耗尽路径
-/// 语义复用既有自动切换判定与 activate。
-/// 零新增网络查询；任何错误只写 stderr 日志，退出码由调用方恒置 0；stdin 畸形静默放行。
+/// 语义复用既有自动切换判定与 activate；每个事件在审计日志留一行痕（见 [`passive_trace`]）。
+/// 零新增网络查询；任何错误只写 stderr 日志，退出码由调用方恒置 0；stdin 畸形只留痕放行。
 async fn on_quota_failure(ctx: &AppContext) {
     use std::io::Read;
 
@@ -1182,7 +1185,7 @@ async fn on_quota_failure(ctx: &AppContext) {
     }
 }
 
-/// `on-quota-failure` 的可测内核：事件原文 → 被动切换编排。测试直接喂伪造 hook
+/// `on-quota-failure` 的可测内核：事件原文 → 被动切换编排 → 留痕。测试直接喂伪造 hook
 /// 事件与显式 AutoSwap 设置（tempdir 双隔离），与 `apply_status_auto_swap` 同一
 /// 测试形态。观察型约定：内部任何失败都不向上抛给退出码之外的主流程语义。
 async fn run_on_quota_failure_with(
@@ -1190,24 +1193,43 @@ async fn run_on_quota_failure_with(
     raw: &str,
     auto_swap: &kimi_switch_core::settings::AutoSwap,
 ) -> Result<()> {
+    use kimi_switch_core::auto_swap::{classify_stop_failure_verdict, StopFailureVerdict};
+
+    // 1. 分类（命中条件见 classify_stop_failure）：未命中与畸形 stdin 不切换。
+    let verdict = classify_stop_failure_verdict(raw);
+    let decision = match verdict {
+        StopFailureVerdict::Exhausted { window, .. } => passive_swap(ctx, window, auto_swap).await,
+        StopFailureVerdict::Miss(_) => Ok(PassiveDecision::Stay("not_exhausted")),
+    };
+    // 每个事件恰好一行留痕，写在最终决定之后；写失败只 warn（AuditLog::append），不影响 hook。
+    ctx.audit.append(passive_trace(raw, verdict, &decision));
+    decision.map(drop)
+}
+
+/// 被动触发的最终决定（留痕用）。
+enum PassiveDecision {
+    /// 不切换及原因：`not_exhausted` / `disabled` / `busy` / `no_active_account` /
+    /// `superseded`，或判定的跳过原因（[`skip_reason_json`]）。
+    Stay(&'static str),
+    /// 已切换。
+    Swap { from: AccountId, to: AccountId },
+    /// 判定要切，activate 失败（错误原文另记 auto_swap 审计）。
+    SwapFailed { from: AccountId, to: AccountId },
+}
+
+/// 命中额度耗尽之后的被动切换编排，返回最终决定。
+async fn passive_swap(
+    ctx: &AppContext,
+    window: Option<QuotaWindow>,
+    auto_swap: &kimi_switch_core::settings::AutoSwap,
+) -> Result<PassiveDecision> {
     use kimi_switch_core::auto_swap::{
-        classify_stop_failure, decide_auto_swap_passive_from_state, overlay_exhausted_snapshot,
-        StopFailureSignal,
+        decide_auto_swap_passive_from_state, overlay_exhausted_snapshot,
     };
 
-    // 1. 分类（命中条件见 classify_stop_failure）：未命中与畸形 stdin 静默放行。
-    let window = match classify_stop_failure(raw) {
-        StopFailureSignal::QuotaExhausted { window } => window,
-        StopFailureSignal::Other => {
-            tracing::debug!("on-quota-failure: not a quota-exhaustion signal; ignoring");
-            return Ok(());
-        }
-    };
-
-    // 2. 总开关沿用既有语义：自动切换关闭时被动路径同闸，零副作用。
+    // 2. 总开关沿用既有语义：自动切换关闭时被动路径同闸，切换侧零副作用。
     if !auto_swap.enabled {
-        tracing::debug!("on-quota-failure: auto_swap disabled; ignoring");
-        return Ok(());
+        return Ok(PassiveDecision::Stay("disabled"));
     }
 
     let paths = AppPaths::resolve()?;
@@ -1223,8 +1245,7 @@ async fn run_on_quota_failure_with(
         .ok()
         .flatten();
     let Some(_serialized) = guard else {
-        tracing::debug!("on-quota-failure: another passive trigger in flight; skipping");
-        return Ok(());
+        return Ok(PassiveDecision::Stay("busy"));
     };
 
     // 4. 以 live 为准一致性自检（ADR-0002 / issue #155），再取账号列表与缓存快照
@@ -1234,7 +1255,7 @@ async fn run_on_quota_failure_with(
     tracing::debug!(outcome = ?startup_check(ctx), "startup check (passive)");
     let accounts = ctx.list_ordered()?;
     let Some(current) = accounts.iter().find(|account| account.active) else {
-        return Ok(());
+        return Ok(PassiveDecision::Stay("no_active_account"));
     };
     let state_path = paths.auto_swap_state_file();
     let cache = QuotaCache::load(&paths.quota_cache_file());
@@ -1283,10 +1304,12 @@ async fn run_on_quota_failure_with(
                 Some(current.id.0.as_str()),
                 "no eligible candidate",
             ));
-            Ok(())
+            Ok(PassiveDecision::Stay(skip_reason_json(
+                AutoSwapSkipReason::NoEligibleCandidate,
+            )))
         }
-        // 冷却 / 无当前账号等其余 Stay：静默落空（观察型，不打扰会话）。
-        AutoSwapDecision::Stay { .. } => Ok(()),
+        // 冷却等其余 Stay：会话侧静默落空（观察型，不打扰会话），只留痕。
+        AutoSwapDecision::Stay { reason } => Ok(PassiveDecision::Stay(skip_reason_json(reason))),
         AutoSwapDecision::Swap(target) => {
             // 决定之后、真正 activate 之前重读当前账号与冷却（GUI 编排同款防线）：
             // 并发的 GUI/CLI 轮询切换已完成时放弃，不重复 activate、不审计。
@@ -1298,7 +1321,7 @@ async fn run_on_quota_failure_with(
                 Utc::now() < at + chrono::Duration::milliseconds(auto_swap.cooldown_ms)
             });
             if !still_current || cooldown_held {
-                return Ok(());
+                return Ok(PassiveDecision::Stay("superseded"));
             }
             // activate 段计时（issue #153 续跑）：被动路径与轮询 / 手动切换同口径，
             // 耗时写入审计 duration_ms。
@@ -1314,7 +1337,10 @@ async fn run_on_quota_failure_with(
                             ))
                             .with_duration_ms(activate_started.elapsed().as_millis() as u64),
                     );
-                    Ok(())
+                    Ok(PassiveDecision::Swap {
+                        from: target.from,
+                        to: target.to,
+                    })
                 }
                 Err(err) => {
                     // activate 失败不写冷却（与既有路径一致）；观察型不影响退出码。
@@ -1324,10 +1350,91 @@ async fn run_on_quota_failure_with(
                         Some(target.to.0.as_str()),
                         &err.to_string(),
                     ));
-                    Ok(())
+                    Ok(PassiveDecision::SwapFailed {
+                        from: target.from,
+                        to: target.to,
+                    })
                 }
             }
         }
+    }
+}
+
+/// 被动触发留痕（审计 action `on_quota_failure`，每个 StopFailure 恰好一行）：事件名、
+/// error_type、分类判词、辨认出的窗口与最终决定，空格分隔的 key=value。事件只读这两个
+/// 字段（见 [`trace_field`]），会话标题、工作目录与错误原文一概不写。
+fn passive_trace(
+    raw: &str,
+    verdict: kimi_switch_core::auto_swap::StopFailureVerdict,
+    decision: &Result<PassiveDecision>,
+) -> AuditEvent {
+    use kimi_switch_core::auto_swap::{ExhaustionRule, StopFailureMiss, StopFailureVerdict};
+
+    let event = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let (signal, window) = match verdict {
+        StopFailureVerdict::Exhausted { rule, window } => (
+            match rule {
+                ExhaustionRule::Official429 => "quota_429",
+                ExhaustionRule::Legacy403 => "quota_403",
+            },
+            window
+                .map(|window| format!(" window={}", quota_window_short(window)))
+                .unwrap_or_default(),
+        ),
+        StopFailureVerdict::Miss(miss) => (
+            match miss {
+                StopFailureMiss::MalformedStdin => "malformed_stdin",
+                StopFailureMiss::NoUsageLimit => "no_usage_limit",
+                StopFailureMiss::NoStatusSignal => "no_status_signal",
+                StopFailureMiss::NoOfficialWording => "no_official_wording",
+            },
+            String::new(),
+        ),
+    };
+    let outcome = match decision {
+        Ok(PassiveDecision::Stay(reason)) => format!("decision=stay reason={reason}"),
+        Ok(PassiveDecision::Swap { from, to }) => format!("decision=swap from={from} to={to}"),
+        Ok(PassiveDecision::SwapFailed { from, to }) => {
+            format!("decision=swap_failed from={from} to={to}")
+        }
+        Err(_) => "decision=error".into(),
+    };
+    let detail = format!(
+        "hook_event={} error_type={} signal={signal}{window} {outcome}",
+        trace_field(event.as_ref(), "hook_event_name"),
+        trace_field(event.as_ref(), "error_type"),
+    );
+    match decision {
+        Ok(PassiveDecision::Stay(_) | PassiveDecision::Swap { .. }) => {
+            AuditEvent::ok("on_quota_failure", "kimi", None).with_detail(detail)
+        }
+        Ok(PassiveDecision::SwapFailed { .. }) | Err(_) => {
+            AuditEvent::err("on_quota_failure", "kimi", None, &detail)
+        }
+    }
+}
+
+/// 留痕里事件字段的写法：只留 `[A-Za-z0-9_.:-]`（其余字符换成 `_`），至多 64 字符，
+/// detail 因此仍是空格分隔的 key=value；字段缺失、不是字符串或 stdin 畸形记 `-`。
+fn trace_field(event: Option<&serde_json::Value>, key: &str) -> String {
+    let token: String = event
+        .and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_.:-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if token.is_empty() {
+        "-".into()
+    } else {
+        token
     }
 }
 
@@ -3049,18 +3156,36 @@ mod tests {
         std::fs::read_to_string(env.kimi_home.join("credentials").join("kimi-code.json")).unwrap()
     }
 
-    fn auto_swap_audits() -> Vec<AuditEvent> {
+    fn audit_log_text() -> String {
         use kimi_switch_core::paths::AppPaths;
-        let path = AppPaths::resolve().unwrap().audit_log();
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
+        std::fs::read_to_string(AppPaths::resolve().unwrap().audit_log()).unwrap_or_default()
+    }
+
+    fn audits(action: &str) -> Vec<AuditEvent> {
+        audit_log_text()
             .lines()
             .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
-            .filter(|event| event.action == "auto_swap")
+            .filter(|event| event.action == action)
             .collect()
     }
 
-    /// 静默放行零副作用：live 仍是 alice、无 auto_swap 审计、无自动切换状态文件。
+    fn auto_swap_audits() -> Vec<AuditEvent> {
+        audits("auto_swap")
+    }
+
+    /// 被动触发留痕：恰好一行 on_quota_failure 记录，detail 与期望逐字一致。
+    fn assert_one_trace(raw: &str, expected: &str) {
+        let traces = audits("on_quota_failure");
+        assert_eq!(
+            traces.len(),
+            1,
+            "每个 StopFailure 恰好一行留痕：{raw}\n{traces:?}"
+        );
+        assert_eq!(traces[0].detail.as_deref(), Some(expected), "{raw}");
+    }
+
+    /// 不切换且切换侧零副作用：live 仍是 alice、无 auto_swap 审计、无自动切换状态文件
+    /// （留痕另由 `assert_one_trace` 断言）。
     fn assert_passive_silent(env: &passive_env::IsolatedHomes, raw: &str) {
         use kimi_switch_core::paths::AppPaths;
         assert_eq!(
@@ -3255,7 +3380,7 @@ mod tests {
     }
 
     /// 冷却收敛：第一次切换完成后，后续触发（新当前账号健康 + 冷却未过）自然落空，
-    /// 不再产生任何切换或审计。
+    /// 不再产生切换或切换审计（只留痕）。
     #[tokio::test]
     async fn passive_second_trigger_after_swap_falls_through() {
         let env = passive_env::isolate();
@@ -3278,8 +3403,8 @@ mod tests {
         assert_eq!(auto_swap_audits().len(), 1, "冷却期内不得再次切换");
     }
 
-    /// 畸形 stdin / 总开关关闭：全部静默放行，零副作用（无审计、无状态文件、live
-    /// 不动）。不是额度耗尽的 429 见 `passive_non_exhaustion_429_is_silent`。
+    /// 畸形 stdin / 总开关关闭：切换侧零副作用（无切换审计、无状态文件、live 不动，
+    /// 只留一行痕）。不是额度耗尽的 429 见 `passive_non_exhaustion_429_is_silent`。
     #[tokio::test]
     async fn passive_malformed_and_disabled_are_silent() {
         for (raw, settings) in [
@@ -3303,8 +3428,8 @@ mod tests {
         }
     }
 
-    /// 不是额度耗尽的 429（#184）：引擎过载、请求过多、并发上限全部静默放行——
-    /// 无审计、无状态文件、live 不动（停泊账号 bob 明明合格也不切）。
+    /// 不是额度耗尽的 429（#184）：引擎过载、请求过多、并发上限一律不切换——
+    /// 无切换审计、无状态文件、live 不动（停泊账号 bob 明明合格也不切）。
     #[tokio::test]
     async fn passive_non_exhaustion_429_is_silent() {
         for raw in [
@@ -3325,7 +3450,7 @@ mod tests {
     }
 
     /// 会话标题是用户内容（#182 评审）：用户在首句提示里贴额度耗尽报错排查之后，这个
-    /// 会话撞上过载 429 或网络错误都不得切换——无审计、无状态文件、live 不动。
+    /// 会话撞上过载 429 或网络错误都不得切换——无切换审计、无状态文件、live 不动。
     #[tokio::test]
     async fn passive_session_title_quoting_exhaustion_is_silent() {
         for raw in [
@@ -3407,6 +3532,218 @@ mod tests {
                 1,
                 "冷却收敛后的触发不得再切换：{event}"
             );
+        }
+    }
+
+    /// 留痕（未命中的 429）：不是额度耗尽的 429 也追加恰好一行 on_quota_failure 记录，
+    /// 写明事件名、error_type、未命中原因与不切换的决定；切换侧照旧静默。
+    #[tokio::test]
+    async fn passive_trace_records_unmatched_429() {
+        for (error_type, message, expected) in [
+            (
+                "APIProviderOverloadedError",
+                "429 The engine is currently overloaded, please try again later",
+                "hook_event=StopFailure error_type=APIProviderOverloadedError signal=no_usage_limit decision=stay reason=not_exhausted",
+            ),
+            (
+                "APIProviderRateLimitError",
+                "429 You've reached your concurrent request limit.",
+                "hook_event=StopFailure error_type=APIProviderRateLimitError signal=no_usage_limit decision=stay reason=not_exhausted",
+            ),
+        ] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+            let raw = stop_failure_event("修一下 README", error_type, message);
+
+            super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_passive_silent(&env, &raw);
+            assert_one_trace(&raw, expected);
+        }
+    }
+
+    /// 留痕（stdin 畸形）：不是合法 JSON 也留一行，未命中原因记 malformed_stdin，
+    /// 事件字段读不到记 `-`；切换侧照旧静默。
+    #[tokio::test]
+    async fn passive_trace_records_malformed_stdin() {
+        for raw in ["not json at all", ""] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+            super::run_on_quota_failure_with(&ctx, raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_passive_silent(&env, raw);
+            assert_one_trace(
+                raw,
+                "hook_event=- error_type=- signal=malformed_stdin decision=stay reason=not_exhausted",
+            );
+        }
+    }
+
+    /// 留痕（有 usage limit 文案仍未命中）：没带本地 429 / 403 信号记 no_status_signal
+    /// （如 SDK 去掉了 "429 " 前缀）；带 429 却缺官方措辞 "reached your" 记
+    /// no_official_wording（如官方改了文案）。两种都不切换。
+    #[tokio::test]
+    async fn passive_trace_names_usage_limit_miss() {
+        for (message, expected) in [
+            (
+                "You've reached your 5-hour usage limit",
+                "hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=no_status_signal decision=stay reason=not_exhausted",
+            ),
+            (
+                "429 You have hit your 5-hour usage limit",
+                "hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=no_official_wording decision=stay reason=not_exhausted",
+            ),
+        ] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+            let raw = stop_failure_event("修一下 README", "APIProviderQuotaExhaustedError", message);
+
+            super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_passive_silent(&env, &raw);
+            assert_one_trace(&raw, expected);
+        }
+    }
+
+    /// 留痕（命中并切换）：写明命中的口径（官方 429 / 旧口径 403）、辨认出的窗口与切换的
+    /// 起止账号；标题引用别的窗口的耗尽文案时，记录里同样找不到它。
+    #[tokio::test]
+    async fn passive_trace_records_swap() {
+        for (raw, expected) in [
+            (
+                stop_failure_event(
+                    "You've reached your monthly usage limit 是什么意思",
+                    "APIProviderQuotaExhaustedError",
+                    "429 You've reached your 5-hour usage limit",
+                ),
+                "hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=swap from=alice to=bob",
+            ),
+            (
+                event_403_5h(),
+                "hook_event=StopFailure error_type=- signal=quota_403 window=5h decision=swap from=alice to=bob",
+            ),
+        ] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+
+            super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_passive_swapped_to_bob(&env, &ctx);
+            assert_one_trace(&raw, expected);
+            let log = audit_log_text();
+            for fragment in ["monthly", "是什么意思", "reached your", "projects"] {
+                assert!(!log.contains(fragment), "留痕不得含用户内容「{fragment}」：{log}");
+            }
+        }
+    }
+
+    /// 留痕（命中但不切换）：总开关关闭记 reason=disabled；无合格候选记
+    /// reason=no_eligible_candidate；冷却期内的第二次触发记 reason=cooldown。
+    #[tokio::test]
+    async fn passive_trace_records_stay_reason() {
+        // 总开关关闭：判定之前放行，切换侧零副作用。
+        {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+            let raw = event_403_5h();
+            let mut off = passive_settings();
+            off.enabled = false;
+
+            super::run_on_quota_failure_with(&ctx, &raw, &off)
+                .await
+                .unwrap();
+
+            assert_passive_silent(&env, &raw);
+            assert_one_trace(
+                &raw,
+                "hook_event=StopFailure error_type=- signal=quota_403 window=5h decision=stay reason=disabled",
+            );
+        }
+        // 无合格候选：与 auto_swap 的无候选审计并存。
+        {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 99, 100)]);
+            let raw = event_429_5h();
+
+            super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_no_candidate_kept_alice(&env);
+            assert_one_trace(
+                &raw,
+                "hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=stay reason=no_eligible_candidate",
+            );
+        }
+        // 冷却期内的第二次触发：同一会话切到 bob 后紧接着又撞耗尽。
+        {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+            let raw = event_429_5h();
+
+            for _ in 0..2 {
+                super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+                    .await
+                    .unwrap();
+            }
+
+            let traces = audits("on_quota_failure");
+            assert_eq!(traces.len(), 2, "{traces:?}");
+            assert_eq!(
+                traces[1].detail.as_deref(),
+                Some("hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=stay reason=cooldown")
+            );
+        }
+    }
+
+    /// 留痕不含用户内容：会话标题引用额度耗尽文案时照常留一行，但审计日志里找不到
+    /// 标题与工作目录的任何片段。
+    #[tokio::test]
+    async fn passive_trace_omits_user_content() {
+        for (title, error_type, message, expected) in [
+            (
+                "You've reached your 5-hour usage limit 之后自动切换没切，帮我查",
+                "APIProviderOverloadedError",
+                "429 The engine is currently overloaded, please try again later",
+                "hook_event=StopFailure error_type=APIProviderOverloadedError signal=no_usage_limit decision=stay reason=not_exhausted",
+            ),
+            (
+                "429 You've reached your 5-hour usage limit 是什么意思",
+                "APIConnectionError",
+                "Connection error.",
+                "hook_event=StopFailure error_type=APIConnectionError signal=no_usage_limit decision=stay reason=not_exhausted",
+            ),
+        ] {
+            let env = passive_env::isolate();
+            let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+            seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+            let raw = stop_failure_event(title, error_type, message);
+
+            super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+                .await
+                .unwrap();
+
+            assert_one_trace(&raw, expected);
+            let log = audit_log_text();
+            for fragment in ["reached your", "usage limit", "帮我查", "是什么意思", "projects"] {
+                assert!(!log.contains(fragment), "留痕不得含用户内容「{fragment}」：{log}");
+            }
         }
     }
 

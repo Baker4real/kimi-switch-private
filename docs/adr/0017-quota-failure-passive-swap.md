@@ -3,10 +3,12 @@ type: adr
 title: 配额失败被动切换：StopFailure hook 秒级唤起，403 原文即权威耗尽证据
 status: accepted
 tags: [auto-swap, passive-swap, stop-failure-hook, install-hook, credential-health]
-intent: Record the quota-failure passive swap trigger (spec #152 decisions 14-17): Kimi Code 0.42.0 provides the official StopFailure hook channel, reversing CONTEXT.md's old avoidance of "swap on 403"; an observer-only CLI subcommand always exits 0, classifies "usage limit" as a case-insensitive substring plus a word-boundary 403 token (official copy is "You've reached your ... usage limit"), overlays the authoritative exhaustion evidence without touching quota cache, inherits the exhaustion decision semantics via a dedicated serialization lock, installs the hook only through an idempotent install-hook subcommand, and narrows the local credential health check to invalid_grant fingerprints only (JWT exp excluded by an explicit, reversible ruling). Live 403 is manual acceptance and does not block release. Ruling change on 2026-10-24 (issue 184) - the official error reference moved quota exhaustion to HTTP 429, so a 429 signal now also matches when one string contains both "reached your" and "usage limit"; legacy 403 plus usage limit is kept, other 429s never match, and live 429 is manual acceptance. Same-day review tightening (issue 182) - Kimi Code 2.3.0 sends a flat payload whose session_title is the first user prompt, so the classifier skips the user-content fields session_title and cwd and requires the status signal to be local to the matched text (a standalone token in the same string, or a status code in the same JSON object), deliberately departing from spec 182's whole-JSON scan.
+intent: Record the quota-failure passive swap trigger (spec #152 decisions 14-17): Kimi Code 0.42.0 provides the official StopFailure hook channel, reversing CONTEXT.md's old avoidance of "swap on 403"; an observer-only CLI subcommand always exits 0, classifies "usage limit" as a case-insensitive substring plus a word-boundary 403 token (official copy is "You've reached your ... usage limit"), overlays the authoritative exhaustion evidence without touching quota cache, inherits the exhaustion decision semantics via a dedicated serialization lock, installs the hook only through an idempotent install-hook subcommand, and narrows the local credential health check to invalid_grant fingerprints only (JWT exp excluded by an explicit, reversible ruling). Live 403 is manual acceptance and does not block release. Ruling change on 2026-10-24 (issue 184) - the official error reference moved quota exhaustion to HTTP 429, so a 429 signal now also matches when one string contains both "reached your" and "usage limit"; legacy 403 plus usage limit is kept, other 429s never match, and live 429 is manual acceptance. Same-day review tightening (issue 182) - Kimi Code 2.3.0 sends a flat payload whose session_title is the first user prompt, so the classifier skips the user-content fields session_title and cwd and requires the status signal to be local to the matched text (a standalone token in the same string, or a status code in the same JSON object), deliberately departing from spec 182's whole-JSON scan. Trace addendum on 2026-10-25 - every StopFailure event, malformed stdin included, appends exactly one on_quota_failure audit line after the final decision (event name, error_type, matched rule or miss reason, recognized window, swap target or stay reason) and never writes session_title, cwd or the raw error message; a disabled switch still leaves that line, which amends decision 2's zero side effects for the audit log only.
 documents:
   symbols:
     - classify_stop_failure
+    - classify_stop_failure_verdict
+    - passive_trace
     - overlay_exhausted_snapshot
     - decide_auto_swap_passive_from_state
     - PassiveSwapLock
@@ -229,3 +231,64 @@ overloaded、403 的非配额文案、没有状态信号的耗尽文案。原决
 429，也不故意烧额度。官方 [hooks 文档](https://www.kimi.com/code/docs/kimi-code-cli/customization/hooks.html)
 仍没有列出 StopFailure 的 payload 字段，Kimi Code 2.3.0 的真实 StopFailure 样本尚未核实；
 真机没命中时，以真实样本为准补规则。
+
+## 留痕（2026-10-25）：每个 StopFailure 追加一行审计
+
+上面那次 429 被旧分类器放行时只打了 debug 日志，事后看不出 hook 有没有被唤起、为什么
+没切。被动切换没触发时，现在靠这一行痕排查。
+
+1. **每个事件恰好一行，写在最终决定之后。** `on-quota-failure` 每收到一个事件（含 stdin
+   畸形），就在审计日志追加一条 `action = "on_quota_failure"` 的记录，时间即记录的
+   `timestamp`。`detail` 是空格分隔的 key=value：
+   - `hook_event`、`error_type`：事件顶层这两个字段，只留 `[A-Za-z0-9_.:-]`（其余字符
+     换成 `_`）、至多 64 字符；缺失或 stdin 畸形记 `-`。
+   - `signal`：命中的口径 `quota_429` / `quota_403`；未命中的原因 `malformed_stdin`
+     （不是合法 JSON）、`no_usage_limit`（用户内容之外没有含 "usage limit" 的字符串）、
+     `no_status_signal`（有 usage limit 文案但没带本地 429 / 403 信号，SDK 去掉
+     "429 " 前缀就落在这里）、`no_official_wording`（带本地 429 但缺 "reached your"，
+     官方改文案就落在这里）。
+   - `window`：命中时辨认出的窗口（`5h` / `7d` / `30d`），辨认不出不写。
+   - `decision`：`swap from=<id> to=<id>`；`stay reason=<原因>`；`swap_failed from=<id>
+     to=<id>`（activate 失败，错误原文照旧记在 `auto_swap` 审计）；`error`（解析路径或
+     读账号库失败，原文只进 stderr 日志）。不切的原因：`not_exhausted`（未命中）、
+     `disabled`、`busy`（3 秒内没拿到被动锁）、`no_active_account`、`superseded`（决定
+     之后重读，发现并发切换已抢先），以及判定本身的跳过原因（`cooldown`、
+     `no_eligible_candidate` 等，与 CLI `--json` 的 skip reason 同名）。
+   - `result`：`swap_failed` 与 `error` 记 `error`，其余记 `ok`。
+
+   例：`hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429
+   window=5h decision=swap from=alice to=bob`。
+
+2. **不含用户内容。** 只读事件的 `hook_event_name` 与 `error_type`，不写 `session_title`、
+   `cwd` 和 `error_message` 原文。判词由 core `classify_stop_failure_verdict` 给出，与
+   `classify_stop_failure` 同一口径；命中规则仍只写在 `classify_stop_failure`。
+
+3. **进既有审计日志，不另开文件。** GUI 不展示审计，生产代码里也没有审计的读取方，新
+   action 不影响任何现有消费者；`auto_swap` 记录（`trigger=passive`、`no eligible
+   candidate`）原样保留。
+
+4. **hook 约束不变。** 写失败只 warn（`AuditLog::append`），不改变切换结果；退出码仍恒 0；
+   纯本地追加，零新增网络请求。
+
+5. **修订决策 1、2、6 的「静默」。** 总开关关闭时切换侧仍零副作用（不读账号库、不写状态、
+   不切换），但留一行 `decision=stay reason=disabled`：装了 hook 却没开自动切换，这一行
+   就能说明为什么没切。stdin 畸形、冷却、无当前账号等其余不切同理：对会话照旧静默，审计
+   里多一行痕。上文与「裁定变迁」里的「静默放行」「无审计」从本节起读作「不切换、无切换
+   审计，只留一行痕」；真机验收第 5 项「`audit.log` 字节与 SHA-256 不变」对重建后的 CLI
+   不再成立，改为追加一行 `signal=no_usage_limit` 或 `signal=malformed_stdin`。
+
+**Considered Options。**
+
+- **单独文件**（如 `<state_dir>/passive-trace.log`）：多一个要找、要清理的文件；审计既无
+  读取方也不进 GUI，没有隔离的必要。
+- **只记未命中**：命中之后的不切（冷却、busy、无当前账号）原本同样无痕，统一一行才答得上
+  「为什么没切」。
+- **记 error_message 原文**：排查最直接，但官方没有列出 StopFailure 的字段，原文是否夹带
+  用户内容无从保证；只记分类结论。
+
+**验收。** `crates/cli/src/main.rs` 的 tempdir 端到端用例，每条都先红后绿：
+`passive_trace_records_unmatched_429`、`passive_trace_records_malformed_stdin`、
+`passive_trace_names_usage_limit_miss`、`passive_trace_records_swap`（含标题引用别的窗口的
+耗尽文案）、`passive_trace_records_stay_reason`（disabled / no_eligible_candidate /
+cooldown）、`passive_trace_omits_user_content`。真机：hook 指向的 release CLI 重建后才带
+留痕；之后每次 StopFailure，无论切没切，审计里都应有一行 `on_quota_failure`。

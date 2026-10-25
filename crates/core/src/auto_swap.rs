@@ -1082,8 +1082,43 @@ pub enum StopFailureSignal {
     /// 额度耗尽（命中条件见 [`classify_stop_failure`]）。`window` 是命中文案里
     /// 可辨认的耗尽窗口（5 小时 / 7 天 / 月度），辨认不出为 `None`。
     QuotaExhausted { window: Option<QuotaWindow> },
-    /// 其他：未命中 [`classify_stop_failure`] 的事件，含 stdin 不是合法 JSON（畸形静默）。
+    /// 其他：未命中 [`classify_stop_failure`] 的事件，含 stdin 不是合法 JSON。
     Other,
+}
+
+/// StopFailure 事件分类的完整判词（见 [`classify_stop_failure_verdict`]）：切换与否只看
+/// 命中与否，判词另带未命中原因，供被动触发留痕。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopFailureVerdict {
+    /// 额度耗尽及命中的口径，`window` 同 [`StopFailureSignal::QuotaExhausted`]。
+    Exhausted {
+        rule: ExhaustionRule,
+        window: Option<QuotaWindow>,
+    },
+    /// 未命中及原因。
+    Miss(StopFailureMiss),
+}
+
+/// 命中额度耗尽的口径（见 [`classify_stop_failure`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExhaustionRule {
+    /// 官方现行口径：429 + "reached your … usage limit"（任一命中文案走这条即记它）。
+    Official429,
+    /// 旧口径兜底：403 + "usage limit"。
+    Legacy403,
+}
+
+/// StopFailure 事件未命中额度耗尽的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopFailureMiss {
+    /// stdin 不是合法 JSON。
+    MalformedStdin,
+    /// 用户内容字段之外没有含 "usage limit" 的字符串。
+    NoUsageLimit,
+    /// 有 "usage limit" 文案，但没带本地 429 / 403 信号（如 SDK 去掉了 "429 " 前缀）。
+    NoStatusSignal,
+    /// 有 "usage limit" 文案也带本地 429 信号，但缺官方措辞 "reached your"（如官方改了文案）。
+    NoOfficialWording,
 }
 
 /// Kimi Code `StopFailure` hook 事件分类（纯函数，stdin 原文 → 分类）。命中规则只在
@@ -1110,16 +1145,38 @@ pub enum StopFailureSignal {
 /// `error_type`（如 `APIProviderQuotaExhaustedError`）不作独立信号：余额不足这类不触发
 /// 切换的 429 可能同属该类型。残留：SDK 若去掉 error_message 的 "429 " 前缀会漏认（待证）。
 pub fn classify_stop_failure(raw: &str) -> StopFailureSignal {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return StopFailureSignal::Other;
-    };
-    let mut matched = Vec::new();
-    collect_exhaustion_texts(&value, &mut matched);
-    if matched.is_empty() {
-        return StopFailureSignal::Other;
+    match classify_stop_failure_verdict(raw) {
+        StopFailureVerdict::Exhausted { window, .. } => {
+            StopFailureSignal::QuotaExhausted { window }
+        }
+        StopFailureVerdict::Miss(_) => StopFailureSignal::Other,
     }
-    StopFailureSignal::QuotaExhausted {
-        window: window_from_usage_limit_texts(matched),
+}
+
+/// [`classify_stop_failure`] 的完整判词：同一口径，未命中时另给原因（被动触发留痕用）。
+pub fn classify_stop_failure_verdict(raw: &str) -> StopFailureVerdict {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return StopFailureVerdict::Miss(StopFailureMiss::MalformedStdin);
+    };
+    let mut scan = ExhaustionScan::default();
+    collect_exhaustion_texts(&value, &mut scan);
+    if scan.matched.is_empty() {
+        let miss = if !scan.usage_limit {
+            StopFailureMiss::NoUsageLimit
+        } else if scan.unofficial_429 {
+            StopFailureMiss::NoOfficialWording
+        } else {
+            StopFailureMiss::NoStatusSignal
+        };
+        return StopFailureVerdict::Miss(miss);
+    }
+    StopFailureVerdict::Exhausted {
+        rule: if scan.official {
+            ExhaustionRule::Official429
+        } else {
+            ExhaustionRule::Legacy403
+        },
+        window: window_from_usage_limit_texts(scan.matched),
     }
 }
 
@@ -1138,17 +1195,26 @@ struct SiblingStatus {
     has_429: bool,
 }
 
-/// 递归收集带本地状态信号的耗尽文案，跳过 [`USER_CONTENT_KEYS`]。
-fn collect_exhaustion_texts<'a>(value: &'a serde_json::Value, matched: &mut Vec<&'a str>) {
+/// [`collect_exhaustion_texts`] 的遍历结果。
+#[derive(Debug, Default)]
+struct ExhaustionScan<'a> {
+    /// 带本地状态信号的耗尽文案。
+    matched: Vec<&'a str>,
+    /// `matched` 里有走官方 429 口径的（否则全是旧口径 403）。
+    official: bool,
+    /// 见过含 "usage limit" 的字符串。
+    usage_limit: bool,
+    /// 见过带本地 429 信号、却缺官方措辞 "reached your" 的 "usage limit" 字符串。
+    unofficial_429: bool,
+}
+
+/// 递归扫描事件里的字符串，跳过 [`USER_CONTENT_KEYS`]。
+fn collect_exhaustion_texts<'a>(value: &'a serde_json::Value, scan: &mut ExhaustionScan<'a>) {
     match value {
-        serde_json::Value::String(text) => {
-            if is_exhaustion_text(text, SiblingStatus::default()) {
-                matched.push(text);
-            }
-        }
+        serde_json::Value::String(text) => scan_text(text, SiblingStatus::default(), scan),
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_exhaustion_texts(item, matched);
+                collect_exhaustion_texts(item, scan);
             }
         }
         serde_json::Value::Object(map) => {
@@ -1163,12 +1229,8 @@ fn collect_exhaustion_texts<'a>(value: &'a serde_json::Value, matched: &mut Vec<
             };
             for item in scanned() {
                 match item {
-                    serde_json::Value::String(text) => {
-                        if is_exhaustion_text(text, sibling) {
-                            matched.push(text);
-                        }
-                    }
-                    nested => collect_exhaustion_texts(nested, matched),
+                    serde_json::Value::String(text) => scan_text(text, sibling, scan),
+                    nested => collect_exhaustion_texts(nested, scan),
                 }
             }
         }
@@ -1176,16 +1238,23 @@ fn collect_exhaustion_texts<'a>(value: &'a serde_json::Value, matched: &mut Vec<
     }
 }
 
-/// 字符串是否为带本地状态信号的耗尽文案（口径见 [`classify_stop_failure`]）。
-fn is_exhaustion_text(text: &str, sibling: SiblingStatus) -> bool {
+/// 按 [`classify_stop_failure`] 的口径检查一个字符串：带本地状态信号的耗尽文案收进
+/// `matched`，未命中的 "usage limit" 文案只记下缺了什么。
+fn scan_text<'a>(text: &'a str, sibling: SiblingStatus, scan: &mut ExhaustionScan<'a>) {
     let lower = text.to_lowercase();
     if !lower.contains("usage limit") {
-        return false;
+        return;
     }
-    let official_429 =
-        lower.contains("reached your") && (sibling.has_429 || contains_status_token(text, "429"));
+    scan.usage_limit = true;
+    let has_429 = sibling.has_429 || contains_status_token(text, "429");
+    let official_429 = has_429 && lower.contains("reached your");
     let legacy_403 = sibling.has_403 || contains_status_token(text, "403");
-    official_429 || legacy_403
+    if official_429 || legacy_403 {
+        scan.matched.push(text);
+        scan.official |= official_429;
+    } else if has_429 {
+        scan.unofficial_429 = true;
+    }
 }
 
 /// JSON 对象成员本身是否就是状态码 `code`：数值，或去掉首尾空白后整串就是该状态码的
