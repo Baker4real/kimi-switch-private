@@ -48,7 +48,7 @@ npm run tauri build
 
 产物：`target/release/kimi-switch.exe`（图形界面）、`target/release/kimi-switch-cli.exe`（命令行）、`target/release/bundle/`（MSI/NSIS 安装包）。
 
-Windows 上更新桌面快捷方式指向的本地 GUI 时，先退出正在运行的 `kimi-switch.exe`，再运行 `npm run build:desktop`。该命令会先完成前端检查，若目标程序仍在运行会明确报错，成功后更新固定路径 `target/release/kimi-switch.exe`。
+Windows 上更新桌面快捷方式指向的本地 GUI 时，先退出正在运行的 `kimi-switch.exe`，再运行 `npm run build:desktop`。该命令会先完成前端检查，若目标程序仍在运行会明确报错，成功后更新固定路径 `target/release/kimi-switch.exe`。它只更新 GUI：装过 hook 时，hook 调用的是执行 `install-hook` 时那个 `kimi-switch-cli.exe`（路径写在 `~/.kimi-code/config.toml` 里），从源码更新后还要再跑 `cargo build --release -p kimi-switch-cli`，被动切换才会用上新逻辑。
 
 ### Edge 扩展（Windows GUI）
 
@@ -89,7 +89,7 @@ kimi-switch-cli config           # 打印生效设置（只读，与 GUI 同源�
 kimi-switch-cli install-hook     # 安装配额失败被动切换 hook（写入 ~/.kimi-code/config.toml 的 StopFailure 条目，幂等；--uninstall 还原）
 ```
 
-被动切换子命令 `on-quota-failure` 由 hook 自动唤起，无需（也不应）手动执行；它任何情况下都以退出码 0 结束，绝不打断 Kimi Code 会话。
+被动切换子命令 `on-quota-failure` 由 hook 自动唤起，无需（也不应）手动执行；它任何情况下都以退出码 0 结束，绝不打断 Kimi Code 会话。每次唤起都会在审计日志（见下方「数据目录」）追加一行 `on_quota_failure` 记录：事件名、命中的口径或未命中的原因、最终决定（切到哪个账号，或不切的原因）；不记会话标题、工作目录和错误原文。
 
 GUI 与 CLI 共用同一份账号库和设置，可以混用。
 
@@ -121,7 +121,7 @@ refresh token 有有效期，长期未使用的账号凭证会过期。在账号
 分两种：装了 hook 会，没装不会。默认不装：GUI 运行时静默查询会判定（默认 90 秒、当前账号用量高时自动加密到 30/10 秒，最小化不暂停），CLI 无参列表时也会。执行过 `kimi-switch-cli install-hook` 后，即使 GUI 没开，Kimi Code 会话撞上额度耗尽的那一刻也会由 hook 秒级唤起切换（见下一条）。手动「切换」始终可用，不依赖额度查询。
 
 **Kimi Code 提示 "You've reached your … usage limit"（额度耗尽）时能自动换号吗？**
-可以，这叫「配额失败被动切换」。前提：「额度耗尽自动切换」开着，且执行过一次 `kimi-switch-cli install-hook`（幂等；`--uninstall` 还原）。安装只写入 `~/.kimi-code/config.toml` 里属于本工具的一条 StopFailure hook，不动其他内容。命中条件是官方额度耗尽错误：同一条错误文案里同时有 "reached your" 和 "usage limit"，且这条错误本身带 429（5 小时、7 天、月度三种耗尽文案都是这样）；旧版 Kimi Code 报的 403 + "usage limit" 也照样识别。会话标题（你的首句提示）和工作目录不参与识别，在提示里贴报错文案排查不会误触发。过载、请求过多、并发上限这类不是额度耗尽的 429 不会误触发；切换不新增任何网络请求，冷却与候选合格线和轮询切换一致，但安顿宽限不挡这次切换；多个会话同时撞上额度耗尽只切一次；hook 绝不打断你的会话。
+可以，这叫「配额失败被动切换」。前提：「额度耗尽自动切换」开着，且执行过一次 `kimi-switch-cli install-hook`（幂等；`--uninstall` 还原）。安装只写入 `~/.kimi-code/config.toml` 里属于本工具的一条 StopFailure hook，不动其他内容。命中条件是官方额度耗尽错误：同一条错误文案里同时有 "reached your" 和 "usage limit"，且这条错误本身带 429（5 小时、7 天、月度三种耗尽文案都是这样）；旧版 Kimi Code 报的 403 + "usage limit" 也照样识别。会话标题（你的首句提示）和工作目录不参与识别，在提示里贴报错文案排查不会误触发。过载、请求过多、并发上限这类不是额度耗尽的 429 不会误触发；切换不新增任何网络请求，冷却与候选合格线和轮询切换一致，但安顿宽限不挡这次切换；多个会话同时撞上额度耗尽只切一次；hook 绝不打断你的会话。撞上了却没切换时，原因记在审计日志的 `on_quota_failure` 行里。
 
 ## 免责声明
 

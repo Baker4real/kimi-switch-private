@@ -1,8 +1,10 @@
-//! 审计日志：append-only JSON Lines，记录所有改变激活态或凭证的操作。
+//! 审计日志：append-only JSON Lines，记录所有改变激活态或凭证的操作，
+//! 以及配额失败被动切换给每个 StopFailure 事件留的一行痕（`on_quota_failure`，本身不改状态）。
 //!
 //! 目的：
 //! - 出问题时能复盘「什么时候、谁、切到了哪个账号」
 //! - CLI / GUI 自动切换时能反查来源与目标
+//! - hook 撞上额度耗尽时能看出切没切、为什么（ADR-0017「留痕」）
 //!
 //! 设计：
 //! - 每条事件一行 JSON（JSON Lines / NDJSON），方便 `tail -f` 与 `jq` 处理
@@ -21,7 +23,7 @@ use crate::paths::AppPaths;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub timestamp: DateTime<Utc>,
-    /// 操作类型，例如 "activate" / "refresh" / "auto_swap" / "rm" / "add"。
+    /// 操作类型，例如 "activate" / "refresh" / "auto_swap" / "on_quota_failure" / "rm" / "add"。
     pub action: String,
     pub provider: String,
     /// 目标账号 id；删除/创建场景可空。
