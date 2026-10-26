@@ -86,14 +86,29 @@ const MEASURE = `(() => {
   };
 })()`;
 
-function chromePath(): string {
-  const candidates = [
+const CHROME_CANDIDATES: Record<string, string[]> = {
+  win32: [
     "C:/Program Files/Google/Chrome/Application/chrome.exe",
     "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-  ];
+  ],
+  linux: ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"],
+};
+
+/** Chrome 可执行文件：`CHROME_PATH` 优先（指向不存在的文件直接报错，不回退），否则按平台找常见安装位置。 */
+function chromePath(): string {
+  const override = process.env.CHROME_PATH;
+  if (override) {
+    if (!existsSync(override)) {
+      throw new Error(`CHROME_PATH 指向的 Chrome 不存在：${override}`);
+    }
+    return override;
+  }
+  const candidates = CHROME_CANDIDATES[process.platform] ?? [];
   const found = candidates.find((path) => existsSync(path));
   if (!found) {
-    throw new Error("未找到 Chrome，无法在真实布局里测量缩放");
+    throw new Error(
+      `未找到 Chrome，无法在真实布局里测量缩放（试过：${candidates.join("、") || "无"}；可用 CHROME_PATH 指定）`,
+    );
   }
   return found;
 }
