@@ -18,6 +18,8 @@ try {
     Assert-TargetAvailable
     cargo build --release -p kimi-switch
     if ($LASTEXITCODE -ne 0) { throw "GUI build failed (exit $LASTEXITCODE)" }
+    cargo build --release -p kimi-switch-cli
+    if ($LASTEXITCODE -ne 0) { throw "CLI build failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
 }

@@ -48,7 +48,7 @@ npm run tauri build
 
 产物：`target/release/kimi-switch.exe`（图形界面）、`target/release/kimi-switch-cli.exe`（命令行）、`target/release/bundle/`（MSI/NSIS 安装包）。
 
-Windows 上更新桌面快捷方式指向的本地 GUI 时，先退出正在运行的 `kimi-switch.exe`，再运行 `npm run build:desktop`。该命令会先完成前端检查，若目标程序仍在运行会明确报错，成功后更新固定路径 `target/release/kimi-switch.exe`。它只更新 GUI：装过 hook 时，hook 调用的是执行 `install-hook` 时那个 `kimi-switch-cli.exe`（路径写在 `~/.kimi-code/config.toml` 里），从源码更新后还要再跑 `cargo build --release -p kimi-switch-cli`，被动切换才会用上新逻辑。
+Windows 上更新桌面快捷方式指向的本地 GUI 时，先退出正在运行的 `kimi-switch.exe`，再运行 `npm run build:desktop`。该命令会先完成前端检查，若目标程序仍在运行会明确报错，成功后更新固定路径 `target/release/kimi-switch.exe`，接着重建 `target/release/kimi-switch-cli.exe`。装过 hook 时，hook 调用的是执行 `install-hook` 时那个 `kimi-switch-cli.exe`（路径写在 `~/.kimi-code/config.toml` 里）：用这里 `target/release` 的 CLI 装的，被动切换随之用上新逻辑；用别处的 CLI 装的，要更新那份 exe，或用这里的 CLI 重新执行一次 `install-hook`（只刷新本工具那一条的路径）。
 
 ### Edge 扩展（Windows GUI）
 
