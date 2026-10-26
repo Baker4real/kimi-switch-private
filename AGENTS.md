@@ -35,6 +35,7 @@ cargo test --workspace
 npx tsc --noEmit && npm test && npm run build   # src-ui 类型检查 + vitest + 前端产物
 cargo build --release -p kimi-switch-cli
 cargo build --release -p kimi-switch   # GUI：须带 default feature custom-protocol，禁止连 127.0.0.1:1420
+npm run build:desktop                  # 本机更新：check:ui → GUI → hook 所调的 release CLI；先退出运行中的 kimi-switch.exe
 npm install && npm run tauri build     # 等价官方打包入口；npm 侧 @tauri-apps/api、cli 必须与 crate tauri 同 minor（crate exact 钉版，不一致时 CLI 预检直接中止）
 node scripts/generate-icons.mjs        # 重生成 src-tauri/icons（零依赖，输出确定性）
 ```
