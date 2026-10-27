@@ -360,10 +360,10 @@ describe("交互状态与可达性（issue #126）", () => {
     expect(reduce).toMatch(/transform:\s*none/);
   });
 
-  it("账号行为折叠行悬停有背景或边框反馈", () => {
+  it("账号行为折叠行悬停只改文字颜色，不显示整条底色", () => {
     const hover = ruleBody(".settings-disclosure:hover");
-    expect(hover).toMatch(/var\(--/);
-    expect(`${hover}`).toMatch(/(background|border(?:-color)?):/);
+    expect(hover).toMatch(/color:\s*var\(--primary-background\)/);
+    expect(hover).not.toMatch(/(?:background|border(?:-color)?):/);
   });
 
   it("危险按钮悬停用 --danger-hover-background，不改淡", () => {

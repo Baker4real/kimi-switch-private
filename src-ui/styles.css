@@ -1713,7 +1713,7 @@ p {
 }
 
 .settings-disclosure:hover {
-  background: var(--window-control-hover-background);
+  color: var(--primary-background);
 }
 
 .settings-disclosure-caret {
