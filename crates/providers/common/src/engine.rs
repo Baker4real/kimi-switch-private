@@ -581,7 +581,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// - 解析出的官方账号 id 与目标不同、或无法辨认 → 返回 [`kimi_switch_core::ReauthError`]；不写库存、不写 live、不增删账号；
     /// - 相同 → 替换该账号的库存 blob；registry 原样保留（别名、active 标记不变，
     ///   同一官方身份仍是一条）；JSON 非法的 blob 解析不出主键，自然落入「无法辨认」拒绝路径；
-    /// - 目标是当前活跃账号 → 再把新 blob 原子写进 live 登录文件；非当前则完全不碰 live。
+    /// - 目标在交换锁内重读仍是当前账号 → 再把新 blob 原子写进 live 登录文件；非当前（含重新授权
+    ///   期间被别处切走）则完全不碰 live。
     ///
     /// 注意：这里严禁调用 capture-on-leave 之类的旧态回灌——它们会把旧 live
     /// 盖进刚替换的库存副本。写顺序固定「先库存后 live」：
@@ -607,11 +608,22 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             self.runtime.store_field(),
             &raw,
         )?;
-        if account.active {
-            // 原子写（tmp + rename）：失败时旧 live 未被破坏，新凭证已在库存可重试。
-            // 窗口期对外行为见函数 doc：live 仍为旧凭证，查询照用它；错误文案必须把状态与补救讲清楚。
-            Self::write_blob(&self.live_path(), &raw).map_err(Error::reauth_live_write_failed)?;
-        }
+        // live 在交换锁内写，进锁后重读 active 标记（spec #185 对抗评审 4）：重新授权期间另一
+        // 进程刚把当前账号切走时，不覆盖它的当前登录文件，新凭证留在库存，切回即生效。
+        // 原子写（tmp + rename）：失败时旧 live 未被破坏，新凭证已在库存可重试。交换锁进不去
+        // 同样按 live 写失败报告。窗口期对外行为见函数 doc：live 仍为旧凭证，查询照用它；错误
+        // 文案必须把状态与补救讲清楚。
+        with_swap_lock(&Self::swap_lock_dir(&self.registry, &self.home), || {
+            if self
+                .registry
+                .find(self.runtime.id(), &account.id)?
+                .is_some_and(|current| current.active)
+            {
+                Self::write_blob(&self.live_path(), &raw)?;
+            }
+            Ok(())
+        })
+        .map_err(Error::reauth_live_write_failed)?;
         Ok(account)
     }
 }
@@ -2273,6 +2285,74 @@ mod tests {
             old_u1,
             "live 原子写失败不得破坏旧登录文件"
         );
+    }
+
+    /// 包一层 `FileStore`：下一次 `set` 写完之后运行一次登记的钩子，模拟另一进程恰在此刻完成一次
+    /// 切换（重新授权写完库存、还没写当前登录文件）。
+    struct SwitchAfterNextSetStore {
+        inner: FileStore,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl kimi_switch_core::CredentialStore for SwitchAfterNextSetStore {
+        fn set(&self, provider: &str, account: &str, field: &str, value: &str) -> Result<()> {
+            self.inner.set(provider, account, field, value)?;
+            if let Some(hook) = self.hook.lock().unwrap().take() {
+                hook();
+            }
+            Ok(())
+        }
+        fn get(&self, provider: &str, account: &str, field: &str) -> Result<Option<String>> {
+            self.inner.get(provider, account, field)
+        }
+        fn delete(&self, provider: &str, account: &str, field: &str) -> Result<()> {
+            self.inner.delete(provider, account, field)
+        }
+    }
+
+    /// 重新授权当前账号期间，另一进程（如 hook 唤起的被动切换）把当前账号切到了 u2（spec #185
+    /// 对抗评审 4）：库存写完、写当前登录文件之前，别处在交换锁内写了 u2 的登录文件并改了
+    /// registry。重新授权的结果只落库存，不得覆盖 u2 的当前登录文件，否则 registry 记 u2、
+    /// 当前登录文件却是 u1。
+    #[test]
+    fn reauth_of_current_account_keeps_live_of_concurrent_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _switch_home = isolate_switch_home(tmp.path());
+        let store = Arc::new(SwitchAfterNextSetStore {
+            inner: FileStore::new(tmp.path().join("creds.json")),
+            hook: Mutex::new(None),
+        });
+        let p = FileBlobProvider::new(
+            FakeRuntime::new(tmp.path().join("home")),
+            store.clone(),
+            Arc::new(AccountRegistry::new(tmp.path().join("registry.toml"))),
+        );
+        fs::create_dir_all(p.test_home()).unwrap();
+        p.import_raw(U1_BLOB.into(), None, Some(true)).unwrap();
+        p.import_raw(U2_BLOB.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+        let lock_dir = tmp.path().to_path_buf();
+        let live = p.test_live_path();
+        let registry_file = tmp.path().join("registry.toml");
+        *store.hook.lock().unwrap() = Some(Box::new(move || {
+            with_swap_lock(&lock_dir, || {
+                fs::write(&live, U2_BLOB)?;
+                AccountRegistry::new(registry_file).set_active("fake", &AccountId("u2".into()))
+            })
+            .unwrap();
+        }));
+        let reauthorized = r#"{"uid":"u1","refresh_token":"R1-REAUTH","access_token":"A1-REAUTH"}"#;
+
+        p.replace_account_blob(&AccountId("u1".into()), reauthorized.into())
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_BLOB,
+            "重新授权期间已切到 u2：不得把 u1 的新凭证写进当前登录文件"
+        );
+        assert_eq!(p.test_store_get("u1").unwrap(), reauthorized);
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
     }
 
     /// 回灌新旧比对（ADR-0019 决策 8，修订 ADR-0002）：重授权 live 写失败留下

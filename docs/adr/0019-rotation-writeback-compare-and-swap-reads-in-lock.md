@@ -17,6 +17,7 @@ documents:
     - backfill_live_into_store_with
     - backfill_verdict
     - migrate_legacy_copies_before_swap_lock
+    - replace_account_blob
     - credential_expiry
     - parked_rotation_due
     - forced_rotation_fits
@@ -109,6 +110,11 @@ legacy 钥匙串迁移在锁外：进交换锁之前，先经 `get` 读一次目
 
 手动切换零网络、不等待任何在途轮换的红线不变：轮换的网络请求不持锁，切换至多在另一次提交的
 本地写入上等毫秒级。
+
+重新授权（`replace_account_blob`）写当前登录文件同样进交换锁：库存照旧先写，之后进锁重读目标的
+active 标记，仍是当前账号才写当前登录文件。重新授权期间另一进程（如 hook 唤起的被动切换）刚把
+当前账号切走时，不再用旧账号的新凭证覆盖新账号的登录文件；新凭证留在库存，切回即生效。交换锁
+进不去按当前登录文件写失败报告（库存已是新凭证，提示重试）。
 
 ### 5. 锁顺序
 
@@ -276,6 +282,8 @@ runtime 返回 `None`，与旧版一样每次查询前都轮换。
 - `activate_reads_target_credentials_inside_swap_lock`：修复前为红。
 - `interleaved_switches_capture_on_leave_keeps_intermediate_account_credentials`：修复前为红。
 - `activate_still_switches_when_capture_on_leave_fails`
+- `reauth_of_current_account_keeps_live_of_concurrent_switch`：库存写完、写当前登录文件之前别处把
+  当前账号切到 u2。修复前为红：重新授权按进锁前读到的 active 标记覆盖了 u2 的当前登录文件。
 - `activate_migrates_legacy_keyring_copies_before_taking_swap_lock`：目标账号与当前登录文件所属
   账号的库存都还在 legacy 钥匙串里，探针在钥匙串访问时另开句柄 try-lock 交换锁。修复前为红：两次
   钥匙串访问都发生在交换锁内。
