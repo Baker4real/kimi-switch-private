@@ -658,7 +658,7 @@ where
                 current.map(|account| account.id.0.as_str()),
                 "no eligible candidate",
             ));
-            AutoSwapStatusEffect::no_candidate(earliest_recovery_at(snapshots, now))
+            AutoSwapStatusEffect::no_candidate(earliest_recovery_at(state_path, snapshots, now))
         }
         // 未达耗尽阈值 / 冷却 / 宽限期等 Stay：耗尽路径不动作，转交回驻判定。
         AutoSwapDecision::Stay { reason } => {
@@ -1253,7 +1253,7 @@ async fn passive_swap(
     auto_swap: &kimi_switch_core::settings::AutoSwap,
 ) -> Result<PassiveDecision> {
     use kimi_switch_core::auto_swap::{
-        decide_auto_swap_passive_from_state, overlay_exhausted_snapshot,
+        decide_auto_swap_passive_from_state, overlay_exhausted_snapshot, record_exhaustion,
     };
 
     // 2. 总开关沿用既有语义：自动切换关闭时被动路径同闸，切换侧零副作用。
@@ -1263,8 +1263,8 @@ async fn passive_swap(
 
     let paths = AppPaths::resolve()?;
 
-    // 3. 被动串行化锁（独立于交换锁，无嵌套）：把「读状态 → 判定 → activate →
-    //    写冷却」整段排成队列。并发触发时后到者在锁内重读状态，看到冷却或新
+    // 3. 被动串行化锁（独立于交换锁，无嵌套）：把「记耗尽账本 → 读状态 → 判定 →
+    //    activate → 写冷却」整段排成队列。并发触发时后到者在锁内重读状态，看到冷却或新
     //    当前账号健康即自然落空（issue #162 锁 + 冷却收敛；冷却写在 activate
     //    返回之后，没有这把锁时 [提交, 写冷却] 间隙里迟到的触发会把耗尽证据
     //    错按在新当前账号上再切一跳）。等待超时视为另一触发处理中：观察型放弃。
@@ -1296,17 +1296,16 @@ async fn passive_swap(
     // 保住被动判定的档位排序与回驻资格。
     kimi_switch_core::apply_cached_membership(&mut snapshots, &accounts);
 
-    // 5. 耗尽原文 = 当前账号耗尽的权威证据：合成/覆盖当前账号快照后进既有判定。
+    // 5. 耗尽原文 = 当前账号耗尽的权威证据：先记进耗尽账本（判定之前，无论最终切没切；
+    //    恢复前该账号不作任何自动路径的候选），再合成/覆盖当前账号快照后进既有判定。
     //    耗尽语义（冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆、候选本地
-    //    凭证快检）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。overlay 与
-    //    判定共用同一 `now`：过点重置按同一时刻划线，抵消不了覆写的耗尽窗口（ADR-0020）。
+    //    凭证快检、耗尽账本）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。账本、
+    //    overlay 与判定共用同一 `now`：过点重置按同一时刻划线，抵消不了覆写的耗尽窗口
+    //    （ADR-0020）。
     let now = Utc::now();
-    let overlay = overlay_exhausted_snapshot(
-        &current.id,
-        snapshots.iter().find(|item| item.account_id == current.id),
-        window,
-        now,
-    );
+    let cached_current = snapshots.iter().find(|item| item.account_id == current.id);
+    record_exhaustion(&state_path, &current.id, cached_current, window, now);
+    let overlay = overlay_exhausted_snapshot(&current.id, cached_current, window, now);
     match snapshots
         .iter_mut()
         .find(|item| item.account_id == current.id)
@@ -3558,6 +3557,110 @@ mod tests {
             std::fs::read(&cache_path).unwrap(),
             before,
             "被动路径不得回写额度缓存"
+        );
+    }
+
+    /// 耗尽账本（issue #192 / ADR-0020）：GUI 没开，额度缓存停在第一次触发之前。alice 撞上
+    /// 额度耗尽、被动切到 bob；冷却过后 bob 也撞上耗尽。alice 的缓存仍显示有余量，但它刚因
+    /// 耗尽被切走、之后没有更新的额度快照，不得被切回：不切换，留痕 no_eligible_candidate。
+    /// 额度缓存字节不变，内核不向上报错（入口恒退出码 0）；手动切换到有耗尽记录的 alice
+    /// 照常成功。
+    #[tokio::test]
+    async fn passive_does_not_swap_back_to_just_exhausted_account() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+        let paths = AppPaths::resolve().unwrap();
+        let cache_before = std::fs::read(paths.quota_cache_file()).unwrap();
+        let settings = passive_settings();
+        let raw = event_429_5h();
+
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#,
+            "alice 耗尽先切到 bob"
+        );
+
+        // 冷却过后：把上次自动切换时刻拨到冷却之前，bob 接着撞上额度耗尽。
+        kimi_switch_core::write_last_auto_swap_at(
+            &paths.auto_swap_state_file(),
+            Utc::now()
+                - chrono::Duration::milliseconds(settings.cooldown_ms)
+                - chrono::Duration::minutes(1),
+        );
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#,
+            "不得切回刚耗尽的 alice"
+        );
+        let traces = audits("on_quota_failure");
+        assert_eq!(traces.len(), 2, "{traces:?}");
+        assert_eq!(
+            traces[1].detail.as_deref(),
+            Some("hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=stay reason=no_eligible_candidate")
+        );
+        assert_eq!(
+            std::fs::read(paths.quota_cache_file()).unwrap(),
+            cache_before,
+            "被动路径不得回写额度缓存"
+        );
+
+        // 手动切换不看耗尽账本。
+        super::swap(&ctx, Some("alice"))
+            .await
+            .expect("手动切换到有耗尽记录的账号照常成功");
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#
+        );
+    }
+
+    /// 总开关关闭（issue #192）：撞上额度耗尽也不写耗尽账本——已有的状态文件与额度缓存
+    /// 字节都不变，内核不向上报错（入口恒退出码 0）。
+    #[tokio::test]
+    async fn passive_disabled_writes_no_exhaustion_ledger() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+        let paths = AppPaths::resolve().unwrap();
+        kimi_switch_core::set_manual_hold_until(
+            &paths.auto_swap_state_file(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        let state_before = std::fs::read(paths.auto_swap_state_file()).unwrap();
+        let cache_before = std::fs::read(paths.quota_cache_file()).unwrap();
+        let mut off = passive_settings();
+        off.enabled = false;
+
+        for raw in [event_429_5h(), event_403_5h()] {
+            super::run_on_quota_failure_with(&ctx, &raw, &off)
+                .await
+                .expect("观察型内核不得向上报错");
+        }
+
+        assert_eq!(
+            std::fs::read(paths.auto_swap_state_file()).unwrap(),
+            state_before,
+            "总开关关闭不写耗尽账本"
+        );
+        assert_eq!(
+            std::fs::read(paths.quota_cache_file()).unwrap(),
+            cache_before
+        );
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#
         );
     }
 
