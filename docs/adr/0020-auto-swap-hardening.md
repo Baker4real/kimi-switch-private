@@ -212,6 +212,10 @@ GUI 很久没开时，额度缓存停在上次真实查询的结果。缓存里 
   `decision=stay reason=no_eligible_candidate`；额度缓存字节不变，观察型内核不向上报错（入口
   恒退出码 0）；手动切到 alice 照常成功。`passive_disabled_writes_no_exhaustion_ledger`——
   总开关关闭时状态文件与额度缓存字节都不变。
+  `passive_swaps_back_once_exhausted_account_reset_has_passed`（spec #185 测试决策「A 的缓存
+  `reset_at` 已过 → 允许切回 A」）——alice 耗尽时缓存里的 `reset_at` 还在未来，账本按它记下
+  恢复时刻，切到 bob；过了这个时刻、冷却也过了，bob 耗尽时切回 alice；额度缓存字节不变。
+  修复前即为绿（补齐 spec 用例）；让账本记录永不到期，或让过点重置不生效，它都转红。
 
 ## 期望当前账号（#193，spec #185 决策 F）
 

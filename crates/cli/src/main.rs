@@ -3641,6 +3641,66 @@ mod tests {
         );
     }
 
+    /// 耗尽账本 × 过点重置（spec #185 测试决策「A 的缓存 `reset_at` 已过 → 允许切回 A」）：
+    /// alice 撞上额度耗尽时缓存里 5 小时窗的 `reset_at` 还在未来，账本按它记下 alice 的恢复
+    /// 时刻，被动切到 bob。到了那个时刻、冷却也过了，bob 撞上耗尽：alice 的缓存仍显示 100%，
+    /// 但窗口已过点重置、账本记录已到恢复时刻，被动切回 alice。额度缓存字节不变。
+    #[tokio::test]
+    async fn passive_swaps_back_once_exhausted_account_reset_has_passed() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        let alice_reset = Utc::now() + chrono::Duration::milliseconds(1_500);
+        seed_quota_cache_with_reset(&[
+            ("alice", 100, 100, Some(alice_reset)),
+            ("bob", 10, 100, None),
+        ]);
+        let paths = AppPaths::resolve().unwrap();
+        let cache_before = std::fs::read(paths.quota_cache_file()).unwrap();
+        let settings = passive_settings();
+        let raw = event_429_5h();
+
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#,
+            "alice 耗尽先切到 bob"
+        );
+
+        // 等到 alice 的 reset_at（即账本记下的恢复时刻）过去，再把冷却拨到过期。
+        let wait = (alice_reset - Utc::now()).to_std().unwrap_or_default();
+        tokio::time::sleep(wait + std::time::Duration::from_millis(50)).await;
+        kimi_switch_core::write_last_auto_swap_at(
+            &paths.auto_swap_state_file(),
+            Utc::now()
+                - chrono::Duration::milliseconds(settings.cooldown_ms)
+                - chrono::Duration::minutes(1),
+        );
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#,
+            "alice 的窗口已过点重置、账本记录已到恢复时刻：切回 alice"
+        );
+        let traces = audits("on_quota_failure");
+        assert_eq!(traces.len(), 2, "{traces:?}");
+        assert_eq!(
+            traces[1].detail.as_deref(),
+            Some("hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=swap from=bob to=alice")
+        );
+        assert_eq!(
+            std::fs::read(paths.quota_cache_file()).unwrap(),
+            cache_before,
+            "被动路径不得回写额度缓存"
+        );
+    }
+
     /// 迟到的被动触发（ADR-0020 自动切换串行化锁决策 9）：alice 撞上额度耗尽、被动切到 bob；
     /// alice 会话在切换前发出的请求随即也失败，hook 在安顿宽限内到达，此刻当前账号已是 bob。
     /// 这次耗尽归属不明，不记进耗尽账本，冷却照常挡住切换。之后用户手动切回 alice、冷却过后
