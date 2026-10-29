@@ -1,6 +1,7 @@
 //! 文件型 provider 的 adapter 契约：每个 runtime 只实现差异点，机制在 [`crate::engine`]。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use kimi_switch_core::error::{Error, Result};
@@ -18,6 +19,16 @@ pub struct BlobMetadata {
     pub dedup_key: Option<String>,
     /// 额外落进 registry.toml `extra` 的字段（provider 私有，如会员档/额度用 header）。
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// 凭证的过期信息（ADR-0019）：回灌新旧比对据过期时刻判断两份凭证谁更新，停泊按需轮换据它
+/// 与寿命判定临期。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialExpiry {
+    /// 过期时刻（Unix 秒）：access token 的 JWT `exp` 优先，缺失时回退凭证的 `expires_at`。
+    pub expires_at: i64,
+    /// 凭证声明的 access token 寿命（秒，即 `expires_in`）；缺失为 `None`。
+    pub expires_in: Option<i64>,
 }
 
 /// 刷新结果。
@@ -55,8 +66,9 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
     /// 刷新一个 blob，返回轮换后的完整 blob。对 parked 账号按需调用；
     /// 当前账号仅在主动续期判定通过时调用（见 `proactive_renewal_wanted`）。
     async fn refresh(&self, blob: &str) -> Result<RefreshOutcome>;
-    /// 查询额度。`access_token` 由引擎保证是新鲜的（parked 已按需刷新；
-    /// 当前账号开启主动续期时已按需轮换）。
+    /// 查询额度。parked 账号的 access token 临期时引擎已先轮换，未临期遇 401 时引擎强制
+    /// 轮换一次再重试一次（停泊按需轮换，ADR-0019；剩余时间不够时留给下次查询，见
+    /// [`Self::refresh_timeout`]）；当前账号开启主动续期时已按需轮换。
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>>;
 
     /// 可选：在 store/live 都拿不到时，从 provider 私有 legacy 布局恢复 blob。默认无。
@@ -64,11 +76,21 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
         None
     }
 
-    /// 凭证的过期时刻（Unix 秒）：优先取 access token 的 JWT `exp`，缺失时回退凭证里的
-    /// `expires_at`；解析不出为 `None`。回灌新旧比对（ADR-0019）用它判断两份凭证谁更新，
-    /// 任一方为 `None` 即不可比较、维持以 live 为准。默认 `None`。
-    fn credential_expiry(&self, blob: &str) -> Option<i64> {
+    /// 凭证的过期信息（ADR-0019）：过期时刻优先取 access token 的 JWT `exp`，缺失时回退凭证里的
+    /// `expires_at`，`expires_in` 一并读出；过期时刻解析不出为 `None`。阈值与比对都在引擎：
+    /// 回灌新旧比对任一方为 `None` 即不可比较、维持以 live 为准；停泊按需轮换为 `None` 时
+    /// 先轮换再查询。默认 `None`：不提供该能力的 runtime 回灌照旧以 live 为准，停泊账号与旧版
+    /// 一样每次查询前都轮换。
+    fn credential_expiry(&self, blob: &str) -> Option<CredentialExpiry> {
         let _ = blob;
+        None
+    }
+
+    /// 调用 [`Self::refresh`] 最多多久必定返回（响应或错误，含发请求前的本地准备）。停泊账号
+    /// 遇 401 的强制轮换只在本次额度查询剩余时间盖得住它加余量时才发，免得外层超时在响应返回前
+    /// 取消查询、丢掉服务端已消耗的一次性 refresh token（ADR-0019）。
+    /// 默认 `None`：上限不明，有外层超时时一律不强制轮换（fail-closed）。
+    fn refresh_timeout(&self) -> Option<Duration> {
         None
     }
 
