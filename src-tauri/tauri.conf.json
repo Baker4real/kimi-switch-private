@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Kimi 换号器",
         "width": 1280,
         "height": 880,
