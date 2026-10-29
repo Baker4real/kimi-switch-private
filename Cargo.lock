@@ -2219,6 +2219,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "fs2",
  "kimi-switch-core",
  "reqwest 0.12.28",
  "serde",

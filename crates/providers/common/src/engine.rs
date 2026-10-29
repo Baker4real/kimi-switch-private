@@ -484,9 +484,20 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         registry: &AccountRegistry,
         home: &Path,
     ) -> Result<()> {
-        let live_raw = match fs::read_to_string(runtime.live_cred_path(home)) {
-            Ok(r) => r,
-            Err(_) => return Ok(()),
+        let Some((owner, live_raw)) = Self::live_owner(runtime, registry, home)? else {
+            return Ok(());
+        };
+        Self::backfill_live_into_store_with(runtime, store, &owner.id, &live_raw)
+    }
+
+    /// 当前登录文件内容及其在 registry 里的 owner 账号；live 读不出或没有 owner 时为 `None`。
+    fn live_owner(
+        runtime: &A,
+        registry: &AccountRegistry,
+        home: &Path,
+    ) -> Result<Option<(Account, String)>> {
+        let Ok(live_raw) = fs::read_to_string(runtime.live_cred_path(home)) else {
+            return Ok(None);
         };
         let meta = runtime.parse_metadata(&live_raw);
         let dedup_extra_key = runtime.dedup_extra_key();
@@ -494,8 +505,27 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             .list_by_provider(runtime.id())?
             .into_iter()
             .find(|a| Self::metadata_matches(&meta, a, dedup_extra_key));
-        let Some(owner) = owner else { return Ok(()) };
-        Self::backfill_live_into_store_with(runtime, store, &owner.id, &live_raw)
+        Ok(owner.map(|owner| (owner, live_raw)))
+    }
+
+    /// 进交换锁之前把目标账号与当前登录文件所属账号的库存副本各经 `get` 读一次（ADR-0019
+    /// 决策 2、4）：还在 legacy 钥匙串里的副本借此迁进凭证文件，锁内的读取就只读凭证文件。
+    /// 钥匙串可能弹授权框，持交换锁等它会卡住轮换提交与手动切换。这里读失败不报：锁内的读取
+    /// 照常处理同样的错误。
+    fn migrate_legacy_copies_before_swap_lock(
+        runtime: &A,
+        store: &dyn CredentialStore,
+        registry: &AccountRegistry,
+        home: &Path,
+        target: &Account,
+    ) {
+        let field = runtime.store_field();
+        let _ = store.get(runtime.id(), target.id.0.as_str(), field);
+        if let Ok(Some((owner, _))) = Self::live_owner(runtime, registry, home) {
+            if owner.id != target.id {
+                let _ = store.get(runtime.id(), owner.id.0.as_str(), field);
+            }
+        }
     }
 
     /// 只 live→store，不碰 active 标记。
@@ -578,7 +608,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         live_raw: &str,
     ) -> Result<()> {
         // 先经 `get` 读一次：legacy 钥匙串里还没迁移的库存副本借此落进凭证文件，下面的 `set_if`
-        // 才比对得到它（`set_if` 锁内只看凭证文件，ADR-0019 决策 2）。
+        // 才比对得到它（`set_if` 锁内只看凭证文件，ADR-0019 决策 2）。交换锁内的回灌
+        // （capture-on-leave 与抢救）由 activate 在进锁前读过，这次读只命中凭证文件。
         store.get(runtime.id(), owner.0.as_str(), runtime.store_field())?;
         let verdict = std::cell::Cell::new(BackfillVerdict::Write);
         store.set_if(
@@ -663,6 +694,14 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 
         tokio::task::spawn_blocking(move || {
             let lock_dir = FileBlobProvider::<A>::swap_lock_dir(&registry, &home);
+            // legacy 钥匙串迁移在交换锁外完成，锁内只读凭证文件（ADR-0019 决策 2、4）。
+            FileBlobProvider::<A>::migrate_legacy_copies_before_swap_lock(
+                runtime.as_ref(),
+                store.as_ref(),
+                registry.as_ref(),
+                &home,
+                &account,
+            );
             #[cfg(test)]
             run_activate_lock_probe(&home);
             // 读取进锁（ADR-0019）：目标凭证读取、capture-on-leave、切换前身份记录，与写入、
@@ -4113,6 +4152,109 @@ mod tests {
             .expect("capture-on-leave 失败只 warn，不阻断切换");
 
         assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+    }
+
+    /// [`UnmigratedLegacyStore`] 的探针版：`get` 在凭证文件未命中、要去 legacy 钥匙串找时（生产中
+    /// 即访问钥匙串，可能弹授权框），另开句柄 try-lock 交换锁文件，记下此刻交换锁是否被占。
+    struct SwapLockProbingLegacyStore {
+        legacy: UnmigratedLegacyStore,
+        swap_lock_file: PathBuf,
+        legacy_reads_under_swap_lock: Mutex<Vec<String>>,
+    }
+
+    impl SwapLockProbingLegacyStore {
+        fn swap_lock_held(&self) -> bool {
+            use fs2::FileExt;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&self.swap_lock_file)
+                .unwrap();
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    FileExt::unlock(&file).unwrap();
+                    false
+                }
+                Err(_) => true,
+            }
+        }
+    }
+
+    impl kimi_switch_core::CredentialStore for SwapLockProbingLegacyStore {
+        fn set(&self, provider: &str, account: &str, field: &str, value: &str) -> Result<()> {
+            self.legacy.set(provider, account, field, value)
+        }
+        fn get(&self, provider: &str, account: &str, field: &str) -> Result<Option<String>> {
+            if self.legacy.inner.get(provider, account, field)?.is_none() && self.swap_lock_held() {
+                self.legacy_reads_under_swap_lock
+                    .lock()
+                    .unwrap()
+                    .push(account.to_string());
+            }
+            self.legacy.get(provider, account, field)
+        }
+        fn delete(&self, provider: &str, account: &str, field: &str) -> Result<()> {
+            self.legacy.delete(provider, account, field)
+        }
+        fn set_if(
+            &self,
+            provider: &str,
+            account: &str,
+            field: &str,
+            value: &str,
+            should_write: &dyn Fn(Option<&str>) -> bool,
+        ) -> Result<bool> {
+            self.legacy
+                .set_if(provider, account, field, value, should_write)
+        }
+    }
+
+    /// legacy 钥匙串迁移不在交换锁内（ADR-0019 决策 2、4）：目标账号 u2 与当前登录文件所属账号
+    /// u1 的库存副本都还在 legacy 钥匙串里。activate 进交换锁之前就经 `get` 把它们迁进凭证文件，
+    /// 锁内的读取只读凭证文件：钥匙串可能弹授权框，持交换锁等它会卡住轮换提交与手动切换。
+    #[tokio::test]
+    async fn activate_migrates_legacy_keyring_copies_before_taking_swap_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _switch_home = isolate_switch_home(tmp.path());
+        let legacy = [("u1", U1_BLOB), ("u2", U2_BLOB)].map(|(id, blob)| {
+            (
+                ("fake".to_string(), id.to_string(), "blob".to_string()),
+                blob.to_string(),
+            )
+        });
+        let store = Arc::new(SwapLockProbingLegacyStore {
+            legacy: UnmigratedLegacyStore {
+                inner: FileStore::new(tmp.path().join("creds.json")),
+                legacy: Mutex::new(legacy.into()),
+            },
+            // 交换锁文件在注册表同目录。
+            swap_lock_file: tmp.path().join(".kimi-switch.lock"),
+            legacy_reads_under_swap_lock: Mutex::new(Vec::new()),
+        });
+        let p = FileBlobProvider::new(
+            FakeRuntime::new(tmp.path().join("home")),
+            store.clone(),
+            Arc::new(AccountRegistry::new(tmp.path().join("registry.toml"))),
+        );
+        let mut u1 = fake_account("u1");
+        u1.active = true;
+        p.test_registry_upsert(u1).unwrap();
+        p.test_registry_upsert(fake_account("u2")).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+
+        p.activate(&AccountId("u2".into())).await.unwrap();
+
+        assert_eq!(
+            *store.legacy_reads_under_swap_lock.lock().unwrap(),
+            Vec::<String>::new(),
+            "交换锁内不得访问 legacy 钥匙串"
+        );
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
+        assert_eq!(p.test_store_get("u1").unwrap(), U1_BLOB);
         assert_eq!(active_ids(&p), vec!["u2".to_string()]);
     }
 
