@@ -28,6 +28,27 @@ pub trait CredentialStore: Send + Sync {
 
     /// 删除一个键值。不存在视为成功（幂等）。
     fn delete(&self, provider: &str, account: &str, field: &str) -> Result<()>;
+
+    /// 「读 → 比对 → 写」（ADR-0019）：读出当前值（不存在为 `None`）交给 `should_write`
+    /// 判定，判定通过才写入 `value`；返回是否已写入。比对口径由调用方决定。
+    ///
+    /// 默认实现读写之间不持锁，只给没有锁可用的后端（系统钥匙串、测试替身）兜底；
+    /// [`FileStore`] 覆盖为在存储自身排他锁下完成的原子实现。
+    fn set_if(
+        &self,
+        provider: &str,
+        account: &str,
+        field: &str,
+        value: &str,
+        should_write: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<bool> {
+        let current = self.get(provider, account, field)?;
+        if !should_write(current.as_deref()) {
+            return Ok(false);
+        }
+        self.set(provider, account, field, value)?;
+        Ok(true)
+    }
 }
 
 const SERVICE: &str = "kimi-switch";
@@ -228,8 +249,18 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-impl CredentialStore for FileStore {
-    fn set(&self, provider: &str, account: &str, field: &str, value: &str) -> Result<()> {
+impl FileStore {
+    /// `set` 与 `set_if` 的共同实现：读、判定、写都在 `<path>.lock` 排他锁内完成。
+    /// 只比对本文件里的当前值：legacy 钥匙串的迁移由 `get` 负责，锁内不碰钥匙串
+    /// （钥匙串可能弹授权框，持锁等它会卡住其他凭证读写）。
+    fn write_if(
+        &self,
+        provider: &str,
+        account: &str,
+        field: &str,
+        value: &str,
+        should_write: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<bool> {
         #[cfg(test)]
         if self.inject_write_error.load(Ordering::SeqCst) {
             return Err(Error::Credential("injected write failure".into()));
@@ -242,16 +273,37 @@ impl CredentialStore for FileStore {
             // 先读 sidecar：损坏时自愈，避免 set 在写完凭证后因旁路解析失败而整体报错。
             let mut deleted = self.read_deleted_keys()?;
             let mut map = self.read_map()?;
+            if !should_write(map.get(&key).map(String::as_str)) {
+                return Ok(false);
+            }
             map.insert(key.clone(), value.to_string());
             self.write_map(&map)?;
             // 重新导入/迁移成功后清掉旁路，允许该 key 再次作为有效凭证。
             if self.legacy.is_some() && deleted.remove(&key) {
                 self.write_deleted_keys(&deleted)?;
             }
-            Ok(())
+            Ok(true)
         })();
         let _ = FileExt::unlock(&lock);
         result
+    }
+}
+
+impl CredentialStore for FileStore {
+    fn set(&self, provider: &str, account: &str, field: &str, value: &str) -> Result<()> {
+        self.write_if(provider, account, field, value, &|_| true)
+            .map(|_| ())
+    }
+
+    fn set_if(
+        &self,
+        provider: &str,
+        account: &str,
+        field: &str,
+        value: &str,
+        should_write: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<bool> {
+        self.write_if(provider, account, field, value, should_write)
     }
 
     fn get(&self, provider: &str, account: &str, field: &str) -> Result<Option<String>> {
@@ -417,6 +469,70 @@ mod tests {
         assert_eq!(
             store.get("alpha", "b@x.com", "f").unwrap(),
             Some("other-acct".to_string())
+        );
+    }
+
+    /// ADR-0019：`set_if` 把当前值交给调用方判定，判定通过才写入，并如实返回是否写入。
+    #[test]
+    fn set_if_writes_only_when_caller_accepts_current_value() {
+        let (_dir, store) = temp_store();
+        let read = || store.get("alpha", "a@x.com", "f").unwrap();
+        let absent = |current: Option<&str>| current.is_none();
+        let holds_stale = |current: Option<&str>| current == Some("stale");
+        let holds_first = |current: Option<&str>| current == Some("first");
+
+        assert!(store
+            .set_if("alpha", "a@x.com", "f", "first", &absent)
+            .unwrap());
+        assert_eq!(read().as_deref(), Some("first"));
+
+        assert!(!store
+            .set_if("alpha", "a@x.com", "f", "second", &holds_stale)
+            .unwrap());
+        assert_eq!(read().as_deref(), Some("first"), "判定不通过时不得写入");
+
+        assert!(store
+            .set_if("alpha", "a@x.com", "f", "second", &holds_first)
+            .unwrap());
+        assert_eq!(read().as_deref(), Some("second"));
+    }
+
+    /// ADR-0019：读 → 比对 → 写在存储自身的锁下完成。多个写方各自按「读到的值」比对着
+    /// 递增同一个计数，原子时一次都不会丢；读写之间不持锁时，两个写方可能读到同一个旧值、
+    /// 都判定通过，其中一次递增被覆盖。
+    #[test]
+    fn set_if_is_atomic_across_concurrent_writers() {
+        let (_dir, store) = temp_store();
+        store.set("alpha", "a@x.com", "n", "0").unwrap();
+        let store = std::sync::Arc::new(store);
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        loop {
+                            let seen = store.get("alpha", "a@x.com", "n").unwrap().unwrap();
+                            let next = (seen.parse::<u32>().unwrap() + 1).to_string();
+                            if store
+                                .set_if("alpha", "a@x.com", "n", &next, &|current| {
+                                    current == Some(seen.as_str())
+                                })
+                                .unwrap()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(
+            store.get("alpha", "a@x.com", "n").unwrap().as_deref(),
+            Some("40"),
+            "并发比对写入不得丢失任何一次递增"
         );
     }
 

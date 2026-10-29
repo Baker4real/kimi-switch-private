@@ -173,6 +173,15 @@ where
     )
 }
 
+/// 在交换锁（`lock_dir/.kimi-switch.lock`）内执行 `f`，不做快照与写入。
+///
+/// 与 [`swap_with_snapshot`]、注册表写操作是同一临界区：同一线程可重入；获取排他锁最多等
+/// 3 秒，超时返回 [`Error::SwitchLockTimeout`]，此时 `f` 不会运行。轮换写回比对与 activate
+/// 的读取都在这把锁内进行（ADR-0019）。阻塞 IO，调用方需自己在 `spawn_blocking` 内。
+pub fn with_swap_lock<T>(lock_dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    crate::switch_lock::with_exclusive_lock(lock_dir, f)
+}
+
 /// 同 [`swap_with_snapshot`]，但额外把 `protected` 里的文件纳入备份/回滚集。
 ///
 /// 这些文件不由 `targets` 的 writer 写入（典型：registry.toml 由 `commit` 里的
