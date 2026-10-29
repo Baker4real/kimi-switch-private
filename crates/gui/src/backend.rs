@@ -1226,7 +1226,7 @@ where
             ));
             AutoSwapSnapshotEffect {
                 message: Some(UiMessage::auto_swap_no_candidate(earliest_recovery_at(
-                    snapshots, now,
+                    state_path, snapshots, now,
                 ))),
                 swapped: false,
             }
