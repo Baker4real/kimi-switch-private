@@ -2783,6 +2783,42 @@ mod tests {
         assert_eq!(event.detail.as_deref(), Some("no eligible candidate"));
     }
 
+    /// 「最早恢复」只给仍在未来的时刻（issue #191 / ADR-0020）：摘出的 bob 缓存里已过点的
+    /// reset_at 不进 toast，只给 alice 仍在未来的那个。
+    #[tokio::test]
+    async fn snapshot_auto_swap_no_candidate_skips_passed_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let passed = Utc.with_ymd_and_hms(2026, 9, 3, 11, 0, 0).unwrap();
+        let future = Utc.with_ymd_and_hms(2026, 9, 3, 16, 0, 0).unwrap();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            || Some(AccountId("alice".into())),
+            &[
+                auto_swap_acc("alice", true),
+                auto_swap_opted_out("bob", false),
+            ],
+            &[
+                auto_swap_ready_at("alice", 99, 100, Some(future)),
+                auto_swap_ready_at("bob", 100, 100, Some(passed)),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            |_id| async { panic!("无候选不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        let message = effect.message.expect("no-candidate toast");
+        assert_eq!(
+            message.text,
+            "没有可自动切换的账号，最早恢复 2026-09-04 00:00"
+        );
+    }
+
     /// 决定之后、activate 之前：pending / 当前账号已变则放弃，不 toast、不审计、不写冷却。
     #[tokio::test]
     async fn snapshot_auto_swap_stale_pending_or_current_skips_activate() {

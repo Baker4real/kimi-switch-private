@@ -704,8 +704,10 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 当前账号主动续期（issue #44，ADR-0003 第 2 条）：查询前轮换临期 live 凭证并写回。
     /// 仅当 runtime 报告 [`FileBlobRuntime::proactive_renewal_wanted`] 时由 `query_quota` 调用。
     ///
-    /// 写序遵守 ADR-0002：账号库为唯一真本，先落账号库槽位，再原子写 live（tmp+rename，
-    /// 沿用现有 swap 写序）。轮换被官方拒绝（invalid_grant）时记录指纹并停止重试，
+    /// 轮换结果经轮换写回比对提交（[`Self::commit_rotation`]，ADR-0019）。写序仍遵守 ADR-0002：
+    /// 账号库为唯一真本，先落账号库槽位，再原子写 live（tmp+rename+fsync，沿用切换写法）。
+    /// 续期在途时用户切走了：当前登录文件已经换人，不写它、不撤销切换；库存比对通过，新凭证
+    /// 照样落进该账号的库存。轮换被官方拒绝（invalid_grant）时记录指纹并停止重试，
     /// 本地凭证不删除不墓碑化，本次查询按「凭证过期型 401」（issue #41）呈现。
     ///
     /// 如实收录：live 原子写失败（本地 IO）**不是**可恢复窗口。live 保持旧内容，
@@ -739,17 +741,12 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         }
         match self.runtime.refresh(&live).await? {
             RefreshOutcome::Rotated(new_blob) => {
-                // ADR-0002 写序：先落账号库槽位，再原子写 live。live 写失败时
-                // live 保持旧内容不被破坏——但此窗口不可恢复（如实收录，见函数 doc）：
-                // 下一次当前账号查询的 live 回灌会销毁库中新凭证副本，随后收敛到
-                // invalid_grant → 记指纹停试 → 凭证过期型 401 引导重新授权。
-                self.store.set(
-                    self.runtime.id(),
-                    account.id.0.as_str(),
-                    self.runtime.store_field(),
-                    &new_blob,
-                )?;
-                Self::write_blob(&self.live_path(), &new_blob)?;
+                // 轮换写回比对（ADR-0019）：`live` 是本次消耗掉的那份凭证。交换锁内先按比对写库存，
+                // 再仅当该账号仍是当前账号、当前登录文件仍持被消耗的 token 时原子写 live；续期在途时
+                // 被切走就不碰当前登录文件，不撤销切换。live 写失败时 live 保持旧内容不被破坏——
+                // 但此窗口不可恢复（如实收录，见函数 doc）。
+                self.commit_rotation(account, &live, &new_blob).await?;
+                // 指纹清除规则不变：只清掉这次被消耗的 blob 的拒止指纹。
                 self.runtime.proactive_renewal_rotated(&self.home, &live)?;
                 Ok(new_blob)
             }
@@ -2793,6 +2790,46 @@ mod tests {
         assert!(
             !recorded.lines().any(|line| line.trim() == "R1"),
             "不得把当前号指纹误写入：{recorded}"
+        );
+    }
+
+    /// 复现（spec #185 问题 1，#187）：当前账号 u1 的主动续期请求已发出时，用户切到 u2。
+    /// 放行后续期结果不得写回当前登录文件、撤销切换：当前登录文件仍是 u2；续期得到的
+    /// 新凭证仍落进 u1 的库存凭证，一次性 refresh token 的唯一有效副本不丢。
+    #[tokio::test]
+    async fn proactive_renewal_in_flight_then_switch_away_keeps_switch_and_stores_new_token() {
+        const U1_RENEWED: &str = r#"{"uid":"u1","refresh_token":"R1-NEW","access_token":"A1-NEW"}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let runtime = FakeRuntime {
+            proactive_wanted: true,
+            ..FakeRuntime::with_rotation_gate(tmp.path().join("home"), gate.clone(), U1_RENEWED)
+        };
+        let p = provider_with(tmp.path(), runtime);
+        fs::create_dir_all(p.test_home()).unwrap();
+        let u1 = p.import_raw(U1_BLOB.into(), None, Some(true)).unwrap();
+        let u2 = p.import_raw(U2_BLOB.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+
+        let query = p.query_quota(&u1.id);
+        let switch_away = async {
+            gate.wait_sent().await;
+            p.activate(&u2.id).await.unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, switch_away);
+        quota.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_BLOB,
+            "续期在途时切走：续期结果不得写回当前登录文件、撤销切换"
+        );
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            U1_RENEWED,
+            "续期得到的新凭证必须落进原账号的库存凭证"
         );
     }
 
