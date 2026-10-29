@@ -614,7 +614,7 @@ async fn maybe_run_status_auto_swap(
 }
 
 /// collect 完成后的自动切换编排，整段在自动切换串行化锁内（ADR-0020）：拿锁 → 重读状态 →
-/// 判定 → 带期望当前账号的切换 → 写冷却。开关关闭立即返回，不拿锁。`serialize` 拿锁，3 秒
+/// 判定 → 带期望当前账号的切换 → 写冷却。开关关闭立即返回，不拿锁。`acquire_lock` 拿锁，3 秒
 /// 等不到（另一自动触发正在切换）时以 `busy` 为不切原因：退出码 2，与 `superseded` 同为 Stay，
 /// 不判定、不切换、不审计、不写状态。冷却与手动保持期在拿到锁之后才读，往返记忆、回驻确认计数
 /// 与耗尽账本由判定自己从状态文件读，前一个持锁者刚写下的状态因此都看得见。activate 失败不写
@@ -627,7 +627,7 @@ async fn apply_status_auto_swap<L, LFut, G, F, Fut>(
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
     now: DateTime<Utc>,
-    serialize: L,
+    acquire_lock: L,
     activate: F,
     audit: &AuditLog,
     state_path: &Path,
@@ -641,7 +641,7 @@ where
     if !auto_swap.enabled {
         return AutoSwapStatusEffect::stay("disabled");
     }
-    let Some(_serialized) = serialize().await else {
+    let Some(_serialized) = acquire_lock().await else {
         return AutoSwapStatusEffect::stay("busy");
     };
     let last_auto_swap_at = read_last_auto_swap_at(state_path);
