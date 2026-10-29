@@ -3,7 +3,7 @@ type: adr
 title: 凭证侧：轮换写回比对与切换读取进锁
 status: accepted
 tags: [token-rotation, swap, swap-lock, credential-store, race]
-intent: Record the credential-side decisions of spec 185, starting with ticket 186. Every token rotation the tool performs sends its network request outside any lock and commits inside the swap lock against the refresh token it consumed - the stored credential is replaced only while it still holds that token, the live credential is written only while the account is current, the live file is still that account's and still holds that token, store before live, and on a 3 s swap-lock timeout the store is still compare-written while live is left alone, so a new credential is never dropped. The credential store gains an atomic read-compare-write (set_if, atomic in FileStore under its own lock). activate's target read, capture-on-leave and pre-swap identity move into the same swap-lock critical section as the write, post-swap verify and registry commit, so a switch never writes a pre-rotation credential and never misses an intermediate account's live credential; manual swap stays network-free and never waits for an in-flight rotation. Ticket 187 routes the current account's proactive renewal through the same commit - switching away while a renewal is in flight no longer undoes the switch, and the renewed credential still lands in that account's store when the compare passes; dead-token fingerprint clearing and the renewal gate are unchanged. Ticket 190 makes parked rotation on-demand - a parked account rotates before a quota query only when its access token has less than max(300 s, expires_in x 0.5) left (JWT exp, else expires_at; unparsable expiry still rotates first), and a 401 before that forces one rotation plus one retry; both rotations commit through the writeback compare. Later credential-side tickets of spec 185 (401 coordinated recovery, backfill new-vs-old compare) extend this record.
+intent: Record the credential-side decisions of spec 185, starting with ticket 186. Every token rotation the tool performs sends its network request outside any lock and commits inside the swap lock against the refresh token it consumed - the stored credential is replaced only while it still holds that token, the live credential is written only while the account is current, the live file is still that account's and still holds that token, store before live, and on a 3 s swap-lock timeout the store is still compare-written while live is left alone, so a new credential is never dropped. The credential store gains an atomic read-compare-write (set_if, atomic in FileStore under its own lock). activate's target read, capture-on-leave and pre-swap identity move into the same swap-lock critical section as the write, post-swap verify and registry commit, so a switch never writes a pre-rotation credential and never misses an intermediate account's live credential; manual swap stays network-free and never waits for an in-flight rotation. Ticket 187 routes the current account's proactive renewal through the same commit - switching away while a renewal is in flight no longer undoes the switch, and the renewed credential still lands in that account's store when the compare passes; dead-token fingerprint clearing and the renewal gate are unchanged. Ticket 190 makes parked rotation on-demand - a parked account rotates before a quota query only when its access token has less than max(300 s, expires_in x 0.5) left (JWT exp, else expires_at; unparsable expiry still rotates first), and a 401 before that forces one rotation plus one retry; both rotations commit through the writeback compare. The forced rotation is sent only while the quota attempt's remaining time (deadline published by query_quota_with_retry) covers the runtime's declared refresh timeout plus 2 s, otherwise the first 401 is returned and the next query retries with a full budget, so the per-attempt timeout can never cancel a refresh whose request was already sent. Later credential-side tickets of spec 185 (401 coordinated recovery, backfill new-vs-old compare) extend this record.
 documents:
   symbols:
     - commit_rotation_with
@@ -14,6 +14,9 @@ documents:
     - renew_active_proactively
     - parked_rotation_due
     - access_token_expiry
+    - forced_rotation_fits
+    - attempt_time_left
+    - refresh_timeout
 ---
 # 凭证侧：轮换写回比对与切换读取进锁
 
@@ -122,6 +125,8 @@ spec #185 问题 1 的另一处：开启主动续期（ADR-0003 第 2 条）时�
     之后再遇 401 也不再轮换。
   - 重试仍是 401：原样返回。
   - 两种都按既有停泊 401 口径呈现（裸 401，即额度查询失败），不归为凭证待续期。
+  - 发出强制轮换前核对本次查询的剩余时间：至少是轮换请求的超时上限加 2 秒余量才发；不够就不发，
+    返回首个 401（同样按停泊 401 口径呈现），留给下次查询用完整预算再强制轮换。
 - 临期轮换与强制轮换都经决策 1 的轮换写回比对提交。
 - 当前账号的路径不变，主动续期门（开关 × 锁探测 × 临期 60 秒，ADR-0003）不动。
 - 阈值只写在本 ADR 与 CONTEXT.md，不进配置（AGENTS 规则 3）。
@@ -129,6 +134,21 @@ spec #185 问题 1 的另一处：开启主动续期（ADR-0003 第 2 条）时�
 分工：runtime 经 `FileBlobRuntime::access_token_expiry` 报告过期信息（Kimi 读 JWT `exp`、
 `expires_at` 与 `expires_in`），阈值判定在引擎（`parked_rotation_due`）。不提供这个钩子的 runtime
 返回 `None`，与旧版一样每次查询前都轮换。
+
+强制轮换的预算门：旧行为在单次查询开头轮换，轮换请求的 10 秒超时总落在 20 秒单次预算
+（`quota.fetch_timeout_ms` 默认值）之内，外层超时从不在轮换响应返回前取消它。强制轮换排在一次
+401 查询之后，起步时预算可能已所剩无几；照发就让「请求已发出、服务端已消耗一次性 refresh token、
+响应被外层超时丢掉、只能重新授权」变得可达。机制：
+
+- `query_quota_with_retry` 经 task-local 公布本次 attempt 的超时时刻，引擎经
+  `quota_query::attempt_time_left` 读剩余时间。
+- runtime 经 `FileBlobRuntime::refresh_timeout` 声明轮换请求发出后最多多久必定返回。Kimi 为 10 秒：
+  连接到响应体读完都在这一个超时里，代理回退直连也只用剩余时间（ADR-0005）。
+- 判定在引擎（`forced_rotation_fits`）：剩余时间 ≥ 上限 + 2 秒才发。2 秒余量盖住发请求前的本地
+  准备与调度抖动。没有外层超时（不经 `query_quota_with_retry` 的调用）时照发；有外层超时而 runtime
+  说不出上限时不发（fail-closed）。
+- 轮换响应一返回，提交即交给 `spawn_blocking`（决策 1）：外层超时这时取消查询也打断不了它。所以
+  只要响应在超时前返回，新凭证就一定落地。
 
 估算：15 分钟 access token（`expires_in` = 900）的阈值是 max(300, 450) = 450 秒。按 90 秒的停泊
 查询节奏，轮换后第 6 次查询（第 540 秒，剩 360 秒）才临期，每个停泊账号的轮换从约 40 次/小时降到
@@ -145,9 +165,13 @@ spec #185 问题 1 的另一处：开启主动续期（ADR-0003 第 2 条）时�
 - 401 协调恢复的写回点尚未改走本规则（spec #185 后续凭证侧票）。
 - 停泊账号未临期期间，refresh token 若被别处消耗（如跨设备共用同一账号，spec #185 Out of
   Scope），要到下一次临期轮换才被拒并记录指纹；在此之前它仍可能成为自动切换的停泊候选。
-- 强制轮换排在一次 401 查询之后，与它共用单次查询的超时预算（`quota.fetch_timeout_ms`，默认 20
-  秒）。401 查询若异常地慢，超时可能落在轮换响应返回之前，与其他轮换一样有「响应丢失即掉号」的
-  风险。
+- 临期轮换仍排在单次查询开头，靠 `quota.fetch_timeout_ms`（默认 20 秒）大于轮换请求的 10 秒超时，
+  保证外层超时不在响应返回前取消它。用户把单次超时调到 10 秒左右或更低时，这一处保留 #190 之前就有的
+  暴露面（旧行为每次查询都先轮换）。当前账号主动续期同样排在查询开头，不在本票范围。
+- 预算门只认 `query_quota_with_retry` 公布的超时时刻。以后若有调用方在 `Provider::query_quota`
+  外面另加超时，必须同样公布（见 `attempt_time_left` 的文档），否则强制轮换会当作没有外层超时照发。
+- 慢 401 之后的强制轮换被推迟到下次查询：该账号这一轮仍是 401，并进 90 秒鉴权退避（ADR-0009），
+  退避结束后的查询拿到完整预算再强制轮换。
 
 ## 验收
 
@@ -178,8 +202,8 @@ spec #185 问题 1 的另一处：开启主动续期（ADR-0003 第 2 条）时�
 切换零网络断言；主动续期三分支与先库存后 live 的写序、DeadToken 指纹、续期门纯判定
 （`proactive_renewal_wanted_decision_pins_all_branches`）。
 
-停泊按需轮换（#190），`crates/providers/common/src/engine.rs`（FakeRuntime 新增额度查询计数与
-「这些 access token 查询返回 401」）：
+停泊按需轮换（#190），`crates/providers/common/src/engine.rs`（FakeRuntime 新增额度查询计数、
+「这些 access token 查询返回 401」、首次额度查询延迟与轮换响应延迟）：
 
 - `parked_query_before_expiry_does_not_rotate`：修复前为红，轮换计数为 1。
 - `parked_query_near_or_past_expiry_rotates_first`
@@ -189,6 +213,13 @@ spec #185 问题 1 的另一处：开启主动续期（ADR-0003 第 2 条）时�
 - `parked_retry_still_401_keeps_parked_401_presentation`
 - `parked_forced_rotation_in_flight_then_switch_to_it_lands_new_token_in_live_and_store`：强制轮换
   同样走轮换写回比对。
+- `parked_slow_401_leaves_forced_rotation_to_next_query_with_full_budget`：慢 401，走生产的
+  `query_quota_with_retry`、暂停时钟，401 在 20 秒预算用掉 15 秒后才到。修复前为红：剩 5 秒照发
+  强制轮换，外层超时在响应返回前取消查询，重试的 attempt 又拿同一 refresh token 轮换一次（轮换
+  计数为 2，真实服务端上第二次必被拒）。
+- `forced_rotation_fits_only_when_time_left_covers_refresh_timeout_plus_margin`：预算门边界。
+
+`crates/core/src/quota_query.rs`：`attempt_time_left_is_published_only_inside_an_attempt`。
 
 `crates/providers/kimi/src/kimi_files.rs`：`access_token_expiry_prefers_jwt_exp_then_falls_back_to_expires_at`。
 没有过期信息仍先轮换由既有 `query_quota_refreshes_parked_account_and_persists_rotation` 覆盖；停泊
@@ -217,3 +248,9 @@ DeadToken 指纹用例与上面的竞态用例保持绿。
   （15 分钟 token 最长约 7 分半），期间还进 90 秒鉴权退避（ADR-0009）。
 - **强制轮换后多次重试**：每次轮换都消耗一次性 refresh token；新 access token 仍 401 说明问题不在
   access token，再轮换只会多消耗。
+- **强制轮换移出单次查询超时（另起后台任务）**：CLI 进程退出、运行时关闭时后台任务照样被丢弃，
+  还要给轮换结果另找交接路径；只为这一处改轮换的任务所有权模型，不划算。
+- **引擎按配置的单次超时自己推算剩余时间**：引擎与重试包装之间形成隐式耦合，包装改了预算、或另有
+  调用方加了别的超时，推算就悄悄失真。公布真实的超时时刻更直接。
+- **剩余时间不够就缩短轮换请求的超时**：请求一旦发出，超时只会更早放弃响应，服务端照样消耗了
+  refresh token，等于主动制造「响应丢失即掉号」。
