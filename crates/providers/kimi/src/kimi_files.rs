@@ -69,6 +69,23 @@ pub(crate) fn jwt_exp_claim(token: &str) -> Option<i64> {
     value.as_i64().or_else(|| value.as_f64().map(|f| f as i64))
 }
 
+/// 凭证的过期时刻（Unix 秒）：优先取 access token 的 JWT `exp`，缺失时回退凭证里的
+/// `expires_at`（整型或浮点取整）；都解析不出为 None。回灌新旧比对据此判断两份凭证谁更新
+/// （ADR-0019）。
+pub(crate) fn credential_expiry(blob: &str) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_str(blob).ok()?;
+    value
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .and_then(jwt_exp_claim)
+        .or_else(|| {
+            let expires_at = value.get("expires_at")?;
+            expires_at
+                .as_i64()
+                .or_else(|| expires_at.as_f64().map(|f| f as i64))
+        })
+}
+
 fn base64url_decode(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity((input.len() * 3) / 4);
     let mut buffer = 0u32;
@@ -197,6 +214,40 @@ mod tests {
         assert!(!jwt_needs_renewal(&fresh));
         let expired = crate::test_support::jwt_with_payload(r#"{"exp":1000000000}"#);
         assert!(jwt_needs_renewal(&expired));
+    }
+
+    /// 回灌新旧比对的过期时刻（ADR-0019）：JWT `exp` 优先，缺失时回退 `expires_at`。
+    #[test]
+    fn credential_expiry_prefers_jwt_exp_then_falls_back_to_expires_at() {
+        let jwt = crate::test_support::jwt_with_payload;
+        let blob = |access: &str, tail: &str| {
+            format!(r#"{{"access_token":"{access}","refresh_token":"R1"{tail}}}"#)
+        };
+
+        assert_eq!(
+            credential_expiry(&blob(
+                &jwt(r#"{"user_id":"u-1","exp":1000}"#),
+                r#","expires_at":2000"#
+            )),
+            Some(1000),
+            "JWT exp 优先于 expires_at"
+        );
+        assert_eq!(
+            credential_expiry(&blob(&jwt(r#"{"user_id":"u-1"}"#), r#","expires_at":2000"#)),
+            Some(2000),
+            "JWT 没有 exp 时回退 expires_at"
+        );
+        assert_eq!(
+            credential_expiry(&blob("opaque", r#","expires_at":2000.7"#)),
+            Some(2000),
+            "access token 不是 JWT 时回退 expires_at，浮点取整"
+        );
+        assert_eq!(
+            credential_expiry(&blob(&jwt(r#"{"user_id":"u-1"}"#), "")),
+            None,
+            "两处都没有：解析不出"
+        );
+        assert_eq!(credential_expiry("not json"), None);
     }
 
     #[test]
