@@ -311,7 +311,114 @@ fn abort_on_init_failure(err: &anyhow::Error) -> ! {
     std::process::exit(notice.exit_code);
 }
 
+/// 后台启动参数（issue #196）：跟随启动的拉起器（#197）带它拉起 GUI，手动带上也能验证。
+const BACKGROUND_ARG: &str = "--background";
+
+/// 一次启动的方式，由命令行参数决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    /// 普通启动：首次启动显示并聚焦主窗口。
+    Normal,
+    /// 后台启动：首次启动把主窗口最小化到任务栏，不激活、不抢焦点，也不先在前台闪现。
+    Background,
+}
+
+/// 判定启动方式。参数形如 `std::env::args_os()`，首项是程序路径，不参与判定；单实例
+/// 回调转交的第二次启动参数同形。
+fn launch_mode<I>(args: I) -> LaunchMode
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    if args
+        .into_iter()
+        .skip(1)
+        .any(|arg| arg.as_ref() == BACKGROUND_ARG)
+    {
+        LaunchMode::Background
+    } else {
+        LaunchMode::Normal
+    }
+}
+
+/// 第二次启动（单实例回调）是否改动已有窗口：普通启动还原、显示并聚焦；后台启动（如多个
+/// 会话同时开始时并发拉起）一律不动，已有窗口保持原状、不抢焦点。
+fn relaunch_reveals_window(mode: LaunchMode) -> bool {
+    mode == LaunchMode::Normal
+}
+
+/// 按启动方式创建主窗口（配置里 `create: false`，Tauri 不自动创建）。普通启动与配置一致：
+/// 创建即显示并聚焦。后台启动先不显示、不聚焦，再由 [`show_minimized_inactive`] 最小化显示；
+/// 不聚焦是为了让 WebView2 创建时不 MoveFocus：否则还隐藏着的窗口也会被激活，进程有前台
+/// 权限时还会拿走前台。
+fn build_main_window(
+    app: &tauri::App,
+    launch: LaunchMode,
+) -> Result<tauri::WebviewWindow, Box<dyn std::error::Error>> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .ok_or("tauri.conf.json 缺少 main 窗口配置")?;
+    let builder = tauri::WebviewWindowBuilder::from_config(app.handle(), config)?;
+    // 只有 Windows 实现了后台显示；其他平台照普通启动显示。
+    let builder = if cfg!(windows) && launch == LaunchMode::Background {
+        builder.visible(false).focused(false)
+    } else {
+        builder
+    };
+    Ok(builder.build()?)
+}
+
+/// 后台启动的首次显示（Windows）：最小化到任务栏，不激活、不抢焦点，也不先在前台闪现。
+///
+/// 窗口按 `visible(false)` 创建，这里直接 `ShowWindow(SW_SHOWMINNOACTIVE)`，让它从隐藏直接
+/// 变成最小化，与「以最小化方式运行」的快捷方式同一条路径。tao 的两个接口都不合用：
+/// `minimize()` 走 SW_MINIMIZE，会激活 Z 序里的下一个窗口；`show()` 在 `focused(false)` 下
+/// 走 SW_SHOWNOACTIVATE，会把窗口先以普通状态显示出来。
+///
+/// 绕开 tao 之后，它记的窗口标志与实际不符，要补两处：
+/// - MINIMIZED：随即 `minimize()`。tao 先按 IsIconic 原地同步，与目标一致就没有 diff，不发
+///   任何 Win32 调用。
+/// - VISIBLE：仍为假。tao 每次变更窗口标志时（标题栏的最小化 / 最大化按钮都会），只要它为假
+///   就补一次 SW_HIDE，窗口会从任务栏消失。能同步它的只有 `show()`，而 `show()` 会把最小化的
+///   窗口还原出来，所以等窗口首次离开最小化（用户从任务栏还原）时再补：此时窗口已在显示，
+///   SW_SHOWNOACTIVATE 是空操作。单实例回调先 `show()` 再 `unminimize()`，也先完成这次同步。
+#[cfg(windows)]
+fn show_minimized_inactive(window: &tauri::WebviewWindow) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWMINNOACTIVE};
+
+    let Ok(hwnd) = window.hwnd() else {
+        // 宁可普通显示（不激活），也不能让窗口一直隐藏着。
+        eprintln!("kimi-switch: 后台启动最小化跳过：拿不到窗口句柄");
+        let _ = window.show();
+        return;
+    };
+    unsafe {
+        ShowWindow(hwnd.0, SW_SHOWMINNOACTIVE);
+    }
+    let _ = window.minimize();
+
+    let visible_synced = AtomicBool::new(false);
+    let handle = window.clone();
+    window.on_window_event(move |event| {
+        let tauri::WindowEvent::Resized(size) = event else {
+            return;
+        };
+        if size.width == 0 || size.height == 0 || handle.is_minimized().unwrap_or(true) {
+            return;
+        }
+        if !visible_synced.swap(true, Ordering::Relaxed) {
+            let _ = handle.show();
+        }
+    });
+}
+
 pub fn run() {
+    let launch = launch_mode(std::env::args_os());
     let backend = match Backend::new() {
         Ok(backend) => {
             // 启动一致性自检（issue #155）：以 live 为准纠正 active / 提示工具外身份
@@ -323,10 +430,16 @@ pub fn run() {
     };
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !relaunch_reveals_window(launch_mode(&args)) {
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
+                // 先 show 再 unminimize：后台启动的窗口首次离开最小化前，tao 记的 VISIBLE 仍为
+                // 假（见 show_minimized_inactive），先 unminimize 会在还原后补一次 SW_HIDE。普通
+                // 启动的窗口 VISIBLE 一直为真，show 是空操作，顺序不影响。
                 let _ = window.show();
+                let _ = window.unminimize();
                 let _ = window.set_focus();
             }
         }))
@@ -334,12 +447,16 @@ pub fn run() {
             backend,
             web_bind: Arc::new(web_bind::WebBindBroker::default()),
         })
-        .setup(|app| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window
-                    .set_background_color(Some(tauri::utils::config::Color(244, 241, 236, 255)));
-                #[cfg(windows)]
+        .setup(move |app| {
+            let window = build_main_window(app, launch)?;
+            let _ =
+                window.set_background_color(Some(tauri::utils::config::Color(244, 241, 236, 255)));
+            #[cfg(windows)]
+            {
                 fix_taskbar_icon(&window);
+                if launch == LaunchMode::Background {
+                    show_minimized_inactive(&window);
+                }
             }
             Ok(())
         })
@@ -379,6 +496,58 @@ mod init_failure_tests {
         assert_eq!(notice.title, "kimi-switch");
         assert_eq!(notice.message, "初始化失败：凭证文件损坏");
         assert_eq!(notice.exit_code, 1);
+    }
+}
+
+#[cfg(test)]
+mod launch_mode_tests {
+    use super::{launch_mode, relaunch_reveals_window, LaunchMode};
+
+    const EXE: &str = r"C:\Program Files\kimi-switch\kimi-switch.exe";
+
+    /// 跟随启动的拉起器（#197）带 `--background` 拉起 GUI：首次启动走后台，最小化、不激活。
+    #[test]
+    fn first_launch_with_background_flag_is_background() {
+        assert_eq!(launch_mode([EXE, "--background"]), LaunchMode::Background);
+    }
+
+    /// 用户双击启动不带参数：首次启动照旧显示并聚焦。
+    #[test]
+    fn first_launch_without_flag_is_normal() {
+        assert_eq!(launch_mode([EXE]), LaunchMode::Normal);
+    }
+
+    /// GUI 已在运行时用户再双击启动：还原、显示并聚焦已有窗口（现状）。
+    #[test]
+    fn normal_relaunch_reveals_existing_window() {
+        assert!(relaunch_reveals_window(launch_mode([EXE])));
+    }
+
+    /// GUI 已在运行（最小化、在后台或在前台）时拉起器再带 `--background` 启动（如多个会话
+    /// 同时开始）：已有窗口不动，不还原、不抢焦点。
+    #[test]
+    fn background_relaunch_leaves_existing_window_untouched() {
+        assert!(!relaunch_reveals_window(launch_mode([EXE, "--background"])));
+    }
+}
+
+#[cfg(test)]
+mod window_config_tests {
+    /// 主窗口由 setup 按启动方式创建（后台启动先不显示）。配置若让 Tauri 自动创建，窗口会
+    /// 先以普通状态出现，setup 再建同名窗口也会失败，GUI 起不来。
+    #[test]
+    fn main_window_is_created_by_setup_not_by_config() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let main = config["app"]["windows"]
+            .as_array()
+            .and_then(|windows| windows.iter().find(|w| w["label"] == "main"))
+            .expect("配置里要有 main 窗口");
+        assert_eq!(
+            main["create"],
+            serde_json::Value::Bool(false),
+            "main 窗口必须 create: false，由 setup 创建"
+        );
     }
 }
 
