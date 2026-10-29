@@ -1,6 +1,7 @@
 //! 文件型 provider 的 adapter 契约：每个 runtime 只实现差异点，机制在 [`crate::engine`]。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use kimi_switch_core::error::{Error, Result};
@@ -65,7 +66,8 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
     /// 当前账号仅在主动续期判定通过时调用（见 `proactive_renewal_wanted`）。
     async fn refresh(&self, blob: &str) -> Result<RefreshOutcome>;
     /// 查询额度。parked 账号的 access token 临期时引擎已先轮换，未临期遇 401 时引擎强制
-    /// 轮换一次再重试一次（停泊按需轮换，ADR-0019）；当前账号开启主动续期时已按需轮换。
+    /// 轮换一次再重试一次（停泊按需轮换，ADR-0019；剩余时间不够时留给下次查询，见
+    /// [`Self::refresh_timeout`]）；当前账号开启主动续期时已按需轮换。
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>>;
 
     /// 可选：在 store/live 都拿不到时，从 provider 私有 legacy 布局恢复 blob。默认无。
@@ -78,6 +80,14 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
     /// 默认 `None`：不提供该能力的 runtime 与旧版一样每次查询前都轮换停泊账号。
     fn access_token_expiry(&self, blob: &str) -> Option<AccessTokenExpiry> {
         let _ = blob;
+        None
+    }
+
+    /// [`Self::refresh`] 发出请求后最多多久必定返回（响应或错误）。停泊账号遇 401 的强制轮换
+    /// 只在本次额度查询剩余时间盖得住它加余量时才发，免得外层超时在响应返回前取消查询、
+    /// 丢掉服务端已消耗的一次性 refresh token（ADR-0019）。
+    /// 默认 `None`：上限不明，有外层超时时一律不强制轮换（fail-closed）。
+    fn refresh_timeout(&self) -> Option<Duration> {
         None
     }
 

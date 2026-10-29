@@ -52,6 +52,10 @@ impl FileBlobRuntime for KimiRuntime {
     fn access_token_expiry(&self, blob: &str) -> Option<AccessTokenExpiry> {
         kimi_files::access_token_expiry(blob)
     }
+    // 轮换请求整体（含代理回退直连）受这一个超时约束，见 oauth::refresh_blob。
+    fn refresh_timeout(&self) -> Option<std::time::Duration> {
+        Some(oauth::REFRESH_HTTP_TIMEOUT)
+    }
 
     // 当前账号主动续期（issue #44）：判定与 DeadToken 纪律在 oauth，机制在引擎。
     async fn proactive_renewal_wanted(&self, blob: &str) -> bool {

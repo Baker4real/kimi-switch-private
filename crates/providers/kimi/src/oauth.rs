@@ -23,7 +23,9 @@ use crate::{kimi_files, paths};
 const MIN_COORDINATED_REFRESH_VERSION: (u64, u64, u64) = (1, 31, 0);
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// 轮换请求的总超时：连接到响应体读完，代理回退直连也只用剩余时间（net.rs）。停泊账号的
+/// 强制轮换据此核对剩余预算（ADR-0019）。
+pub(crate) const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const TYPESCRIPT_STALE_AFTER: Duration = Duration::from_secs(10);
 const STALE_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 const OFFICIAL_OAUTH_HOST: &str = "https://auth.kimi.com";

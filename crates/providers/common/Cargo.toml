@@ -18,3 +18,5 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 暂停时钟（`start_paused`）：慢 401 用例在虚拟时间里走完 20 秒单次超时预算。
+tokio = { workspace = true, features = ["test-util"] }
