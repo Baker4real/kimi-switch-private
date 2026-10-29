@@ -231,7 +231,7 @@ pub fn parse_usages(body: &str, provider: &str, id: &AccountId) -> Vec<Quota> {
 pub async fn fetch_quota_with_active_recovery(
     access_token: &str,
     account: &Account,
-    registry: &kimi_switch_core::AccountRegistry,
+    runtime: &crate::KimiRuntime,
 ) -> Result<Vec<Quota>> {
     let api_base = base_url();
     fetch_quota_with_active_recovery_at(
@@ -239,17 +239,21 @@ pub async fn fetch_quota_with_active_recovery(
         account,
         &api_base,
         &crate::paths::kimi_home(),
+        runtime,
         None,
-        Some(registry),
+        Some(&runtime.registry),
     )
     .await
 }
 
+/// `runtime` 供 401 协调恢复提交轮换结果；`registry` 是 `/me` 资料缓存的写入目标，
+/// 测试传 `None` 跳过 `/me`。
 async fn fetch_quota_with_active_recovery_at(
     access_token: &str,
     account: &Account,
     api_base: &str,
     home: &std::path::Path,
+    runtime: &crate::KimiRuntime,
     test_recovery: Option<(&str, crate::oauth::RefreshLockProtocol)>,
     registry: Option<&kimi_switch_core::AccountRegistry>,
 ) -> Result<Vec<Quota>> {
@@ -262,10 +266,11 @@ async fn fetch_quota_with_active_recovery_at(
                     home,
                     oauth_base,
                     protocol,
+                    runtime,
                 )
                 .await?
             } else {
-                crate::oauth::recover_active_401(access_token, account).await?
+                crate::oauth::recover_active_401(access_token, account, runtime).await?
             };
             let Some(fresh_access) = recovered else {
                 return Err(classify_unrecovered_401(error, access_token));
@@ -334,7 +339,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::test_support::MockServer;
+    use crate::test_support::{recovery_runtime, MockServer};
     use kimi_switch_core::error::QuotaFailureKind;
 
     const REAL: &str = r#"{
@@ -499,6 +504,7 @@ mod tests {
         let usages = r#"{"usage":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-07-24T07:52:15Z"}}"#;
         let server = MockServer::start_then_hang(vec![("200 OK", usages)]);
 
+        let runtime = recovery_runtime(temporary.path());
         let started = std::time::Instant::now();
         let quotas = tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -507,6 +513,7 @@ mod tests {
                 &active_account(),
                 server.base_url(),
                 temporary.path(),
+                &runtime,
                 None,
                 Some(&registry),
             ),
@@ -588,6 +595,7 @@ mod tests {
             &active_account(),
             server.base_url(),
             temporary.path(),
+            &recovery_runtime(temporary.path()),
             None,
             Some(&registry),
         )
@@ -631,6 +639,7 @@ mod tests {
             &active_account(),
             server.base_url(),
             temporary.path(),
+            &recovery_runtime(temporary.path()),
             None,
             Some(&registry),
         )
@@ -678,6 +687,7 @@ mod tests {
             &active_account(),
             server.base_url(),
             temporary.path(),
+            &recovery_runtime(temporary.path()),
             Some((
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
@@ -747,6 +757,9 @@ mod tests {
         let old = credential_blob("OLD", "R1");
         let old_access = extract_json_string(&old, "access_token");
         std::fs::write(&credentials, &old).unwrap();
+        // 未发生切换：恢复的账号仍是 registry 当前账号。
+        let runtime = recovery_runtime(temporary.path());
+        runtime.registry.upsert(active_account()).unwrap();
         let server = MockServer::start(vec![
             ("401 Unauthorized", r#"{"error":"expired"}"#),
             (
@@ -763,6 +776,7 @@ mod tests {
             &active_account(),
             server.base_url(),
             temporary.path(),
+            &runtime,
             Some((
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
@@ -804,6 +818,7 @@ mod tests {
             &active_account(),
             server.base_url(),
             temporary.path(),
+            &recovery_runtime(temporary.path()),
             Some((
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
@@ -841,6 +856,7 @@ mod tests {
             &active_account(),
             server.base_url(),
             temporary.path(),
+            &recovery_runtime(temporary.path()),
             Some((
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
@@ -893,6 +909,7 @@ mod tests {
             &active_account(),
             server.base_url(),
             temporary.path(),
+            &recovery_runtime(temporary.path()),
             Some((
                 server.base_url(),
                 crate::oauth::RefreshLockProtocol::TypeScriptDirectory,
@@ -930,6 +947,7 @@ mod tests {
             &parked_account(),
             server.base_url(),
             temporary.path(),
+            &recovery_runtime(temporary.path()),
             None, // 停泊账号本就不进协调恢复；显式 None 钉住
             None,
         )
