@@ -1,7 +1,9 @@
 //! 额度耗尽自动切换、pace 预切换、重置前抢用、回驻与配额失败被动切换：纯决策 +
 //! 上次切换时刻 / 手动保持期 / 回驻确认计数 / 抢用往返记忆的可丢弃状态。
 //!
-//! 决策函数无 IO、无网络；状态文件读写失败静默忽略。停泊候选另经本地凭证快检
+//! 决策函数无 IO、无网络；状态文件读写失败静默忽略。判定读快照前先过点重置
+//! （ADR-0020）：`reset_at` 已过的窗口按已用 0、下次重置未知参与判定，见
+//! [`reset_passed_windows`]。停泊候选另经本地凭证快检
 //! （issue #158）：`locally_invalid` 集合里的「已确认失效」账号（invalid_grant 指纹
 //! 在案；#158 续跑裁定只认指纹、不认 JWT exp）不作为任何自动路径的候选，
 //! 见 [`crate::credential_health`]。
@@ -113,6 +115,7 @@ enum TriggerSource {
 /// 不影响它被切走；手动切换不经此过滤。
 ///
 /// 停泊候选须先过阈值资格线，再满足最大已用比例 ≤ 当前最大已用 − [`AutoSwap::candidate_margin`]。
+/// 比例一律按过点重置后的快照计算（ADR-0020），当前账号与停泊账号同口径。
 /// 已达 `threshold` 走耗尽路径（[`AutoSwapKind::Exhausted`]）。未达阈值时，若开启
 /// [`AutoSwap::pace_pre_swap`] 且当前账号预测撑不到 reset、候选更健康，则返回
 /// `Swap` 且 [`AutoSwapTarget::kind`] 为 [`AutoSwapKind::Pace`]。pace 不抢占耗尽。
@@ -180,6 +183,10 @@ fn decide_auto_swap_with_trip(
     {
         return stay(AutoSwapSkipReason::SettleGrace);
     }
+
+    // 过点重置（ADR-0020）：耗尽、pace、抢用与回程都只读过点重置后的视图。
+    let view = past_reset_view(snapshots, now);
+    let snapshots = view.as_slice();
 
     let Some(current_snap) = snapshot_of(snapshots, &current.id) else {
         return stay(AutoSwapSkipReason::CurrentUnavailable);
@@ -548,6 +555,9 @@ pub fn decide_resident_return(
     if manual_hold_until.is_some_and(|until| now < until) {
         return None;
     }
+    // 过点重置（ADR-0020）：回驻资格与耗尽路径读同一视图。
+    let view = past_reset_view(snapshots, now);
+    let snapshots = view.as_slice();
     let Some(current_snap) = snapshot_of(snapshots, &current.id) else {
         return None;
     };
@@ -647,6 +657,35 @@ fn usable_quotas(snapshot: &QuotaSnapshot) -> Option<&[Quota]> {
         QuotaState::Cached(_) if snapshot.stale => None,
         QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => Some(quotas.as_slice()),
     }
+}
+
+/// 过点重置（ADR-0020）：`reset_at` 早于或等于此刻的窗口已经翻篇，判定按已重置处理——
+/// 已用按 0 计（上限不变），下一次重置时刻未知，`reset_at` 置空，按缺 `reset_at` 处理：
+/// pace 与重置前抢用本就跳过已过的时刻，口径不变；快重置偏好不再把已过的时刻排成最早；
+/// 回程「翻过记录的重置点」仍只认快照里比记录值更晚的 `reset_at`。
+fn reset_passed_windows(quotas: &mut [Quota], now: DateTime<Utc>) {
+    for quota in quotas {
+        if quota.reset_at.is_some_and(|reset_at| reset_at <= now) {
+            quota.used = 0;
+            quota.reset_at = None;
+        }
+    }
+}
+
+/// 判定读快照时的过点重置视图（ADR-0020）：Ready / Cached 快照逐窗口套用
+/// [`reset_passed_windows`]，失败快照原样保留。只供判定与「最早恢复」提示使用，
+/// 不写回额度缓存、不进界面展示。
+fn past_reset_view(snapshots: &[QuotaSnapshot], now: DateTime<Utc>) -> Vec<QuotaSnapshot> {
+    snapshots
+        .iter()
+        .map(|snapshot| {
+            let mut view = snapshot.clone();
+            if let QuotaState::Ready(quotas) | QuotaState::Cached(quotas) = &mut view.state {
+                reset_passed_windows(quotas, now);
+            }
+            view
+        })
+        .collect()
 }
 
 fn known_ratios(quotas: &[Quota]) -> Vec<(QuotaWindow, f64)> {
@@ -1072,6 +1111,21 @@ fn decide_auto_swap_from_state_with_trigger(
     decision
 }
 
+/// 无合格候选提示里的「最早恢复」时刻（ADR-0020）：过点重置后，可用快照（`Ready` /
+/// 非 stale `Cached`）窗口上仍在未来的最早 `reset_at`；没有就返回 `None`，提示不写时刻。
+/// GUI 无候选 toast 与 CLI 无候选提示（含 `--json` 的 `earliestReset`）共用本函数。
+pub fn earliest_recovery_at(
+    snapshots: &[QuotaSnapshot],
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let view = past_reset_view(snapshots, now);
+    view.iter()
+        .filter_map(usable_quotas)
+        .flatten()
+        .filter_map(|quota| quota.reset_at)
+        .min()
+}
+
 // ---------------------------------------------------------------------------
 // 配额失败被动切换（issue #162，spec #152 实现决策 14/16）
 // ---------------------------------------------------------------------------
@@ -1324,6 +1378,10 @@ fn window_from_usage_limit_texts<'a>(
 /// - 底上没有该窗口则追加一条合成窗口（已用 = 上限 = 1，`reset_at` 未知）；
 /// - 无可用缓存时整条合成，窗口缺省 5 小时。
 /// 合成结果 `reset_at` / 档位沿用缓存已知值，未知即 `None`，不凭空捏造。
+///
+/// 底先按 `now` 过点重置（ADR-0020）：已过点窗口不带陈旧比例参与「已用最高」的挑选；
+/// 被覆写的耗尽窗口若 `reset_at` 已过，那个时刻属于已翻篇的旧窗口，随过点重置置空，
+/// 判定的过点重置因此抵消不了这份权威证据。调用方须以同一 `now` 进判定。
 pub fn overlay_exhausted_snapshot(
     account_id: &AccountId,
     cached: Option<&QuotaSnapshot>,
@@ -1337,6 +1395,7 @@ pub fn overlay_exhausted_snapshot(
     if let Some(snapshot) = cached {
         if let Some(cached_quotas) = usable_quotas(snapshot) {
             quotas = cached_quotas.to_vec();
+            reset_passed_windows(&mut quotas, now);
             fetched_at = snapshot.fetched_at;
             membership = snapshot.membership.clone();
         }
@@ -4779,5 +4838,346 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_last_auto_swap_at(dir.path(), now());
         assert_eq!(read_last_auto_swap_at(dir.path()), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // 过点重置（issue #191 / ADR-0020）
+    // -----------------------------------------------------------------------
+
+    /// 过点重置：`reset_at` 早于或等于此刻的窗口按已用 0 进判定（limit 不变），
+    /// 当前账号与停泊账号一视同仁：耗尽触发线、候选合格线、防抖边际与抢用候选合格线
+    /// 同口径；抢用触发本就跳过已过的窗口，口径不变；已过点窗口的下次重置时刻未知，
+    /// 不占快重置优先位。
+    #[test]
+    fn decide_auto_swap_past_reset_table() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let passed = now() - chrono::Duration::hours(1);
+        let soon = now() + chrono::Duration::hours(1);
+        let near = now() + chrono::Duration::minutes(30);
+        let days = now() + chrono::Duration::days(3);
+
+        let cases = [
+            Case {
+                name: "停泊账号缓存显示耗尽但 reset_at 已过 → 重新合格",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", &[(five, 99, 100)]),
+                    ready_resets("bob", &[(five, 100, 100, Some(passed))]),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "reset_at 恰好等于此刻也算已重置",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", &[(five, 99, 100)]),
+                    ready_resets("bob", &[(five, 100, 100, Some(now()))]),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "当前账号耗尽窗口 reset_at 已过 → 不触发耗尽切换",
+                settings: on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready_resets(
+                        "alice",
+                        &[(five, 100, 100, Some(passed)), (seven, 30, 100, Some(days))],
+                    ),
+                    ready("bob", &[(five, 10, 100)]),
+                ],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+            Case {
+                name: "防抖边际按过点重置后的最大已用比较",
+                settings: with_margin(0.3),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", &[(five, 99, 100)]),
+                    ready_resets(
+                        "bob",
+                        &[(five, 90, 100, Some(passed)), (seven, 50, 100, Some(days))],
+                    ),
+                ],
+                expect: Expect::Swap("alice", "bob", five),
+            },
+            Case {
+                name: "快重置偏好：已过点窗口不占优先位",
+                settings: prefer_soonest(),
+                last_auto_swap_at: None,
+                accounts: vec![
+                    settled("alice", true),
+                    settled("bob", false),
+                    settled("carol", false),
+                ],
+                snapshots: vec![
+                    ready("alice", &[(five, 99, 100)]),
+                    ready_resets(
+                        "bob",
+                        &[(five, 20, 100, Some(passed)), (seven, 30, 100, Some(days))],
+                    ),
+                    ready_resets(
+                        "carol",
+                        &[(five, 40, 100, Some(soon)), (seven, 30, 100, Some(days))],
+                    ),
+                ],
+                expect: Expect::Swap("alice", "carol", five),
+            },
+            Case {
+                name: "抢用候选合格线按过点重置：7d 已过点不再挡住抢用",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", &[(five, 10, 100)]),
+                    ready_resets(
+                        "bob",
+                        &[(five, 80, 100, Some(near)), (seven, 100, 100, Some(passed))],
+                    ),
+                ],
+                expect: Expect::Burn("alice", "bob", five),
+            },
+            Case {
+                name: "抢用触发口径不变：已过点的窗口不算临近重置",
+                settings: burn_on(),
+                last_auto_swap_at: None,
+                accounts: vec![settled("alice", true), settled("bob", false)],
+                snapshots: vec![
+                    ready("alice", &[(five, 10, 100)]),
+                    ready_resets("bob", &[(five, 80, 100, Some(passed))]),
+                ],
+                expect: Expect::Stay(AutoSwapSkipReason::BelowThreshold),
+            },
+        ];
+
+        for case in &cases {
+            check(case);
+        }
+    }
+
+    /// 过点重置作用于回程：原账号合格线与目标账号耗尽线同口径；「翻过记录的重置点」
+    /// 判定不变（过点本身不算翻过）。
+    #[test]
+    fn decide_auto_swap_burn_return_past_reset() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let passed = now() - chrono::Duration::hours(1);
+        let recorded = now() + chrono::Duration::days(1);
+        let flipped = recorded + chrono::Duration::days(7);
+        let accounts = vec![settled("alice", false), settled("bob", true)];
+
+        // 目标窗口已翻过记录值；原账号缓存显示耗尽但 reset_at 已过 → 照常回程。
+        let mut memory = Some(trip("alice", "bob", seven, recorded));
+        let got = decide_auto_swap_with_trip(
+            &accounts,
+            &[
+                ready_resets("alice", &[(five, 100, 100, Some(passed))]),
+                ready_resets("bob", &[(seven, 10, 100, Some(flipped))]),
+            ],
+            &on(),
+            now(),
+            None,
+            None,
+            &mut memory,
+            &HashSet::new(),
+            TriggerSource::Snapshot,
+        );
+        match got {
+            AutoSwapDecision::Swap(target) => {
+                assert_eq!(target.kind, AutoSwapKind::BurnReturn);
+                assert_eq!(target.to.0, "alice");
+            }
+            other => panic!("原账号过点重置后合格，应回程：{other:?}"),
+        }
+        assert!(memory.is_some(), "回程判定阶段不清记忆");
+
+        // 目标账号 5 小时窗缓存显示耗尽但已过点：不算达耗尽线，7 天窗未翻过 → 继续烧。
+        let mut memory = Some(trip("alice", "bob", seven, recorded));
+        let got = decide_auto_swap_with_trip(
+            &accounts,
+            &[
+                ready("alice", &[(five, 10, 100)]),
+                ready_resets(
+                    "bob",
+                    &[
+                        (five, 99, 100, Some(passed)),
+                        (seven, 80, 100, Some(recorded)),
+                    ],
+                ),
+            ],
+            &on(),
+            now(),
+            None,
+            None,
+            &mut memory,
+            &HashSet::new(),
+            TriggerSource::Snapshot,
+        );
+        assert_eq!(
+            got,
+            AutoSwapDecision::Stay {
+                reason: AutoSwapSkipReason::BelowThreshold
+            }
+        );
+        assert_eq!(
+            memory,
+            Some(trip("alice", "bob", seven, recorded)),
+            "未到回程时机，记忆保留"
+        );
+    }
+
+    /// 「最早恢复」只给过点重置后仍在未来的时刻：已过点（含恰好等于此刻）的 `reset_at`
+    /// 不再给出；全部已过点时不显示时刻。
+    #[test]
+    fn earliest_recovery_at_skips_passed_resets() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let passed = now() - chrono::Duration::hours(1);
+        let soon = now() + chrono::Duration::hours(1);
+        let later = now() + chrono::Duration::hours(4);
+
+        assert_eq!(
+            earliest_recovery_at(
+                &[
+                    ready_resets("alice", &[(five, 99, 100, Some(later))]),
+                    ready_resets(
+                        "bob",
+                        &[(five, 99, 100, Some(passed)), (seven, 99, 100, Some(soon))],
+                    ),
+                ],
+                now(),
+            ),
+            Some(soon)
+        );
+        assert_eq!(
+            earliest_recovery_at(
+                &[ready_resets("bob", &[(five, 99, 100, Some(now()))])],
+                now()
+            ),
+            None,
+            "恰好等于此刻也算已过点"
+        );
+        assert_eq!(
+            earliest_recovery_at(
+                &[ready_resets("bob", &[(five, 99, 100, Some(passed))])],
+                now()
+            ),
+            None,
+            "全部已过点不显示时刻"
+        );
+    }
+
+    /// 可用快照（Ready / 非 stale Cached）的窗口取 `reset_at` 最小值；Failed 与 stale
+    /// Cached 不计入；可用窗口都缺 `reset_at` 时为 None（原 `earliest_reset_at` 用例迁入）。
+    #[test]
+    fn earliest_recovery_at_counts_only_usable_windows() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let at = |hours: i64| now() + chrono::Duration::hours(hours);
+        let cached_at = |id: &str, stale: bool, reset_at: Option<DateTime<Utc>>| {
+            let mut window = quota(id, five, 99, 100);
+            window.reset_at = reset_at;
+            snap(id, stale, QuotaState::Cached(vec![window]))
+        };
+
+        assert_eq!(
+            earliest_recovery_at(
+                &[
+                    ready_resets("alice", &[(five, 99, 100, Some(at(8)))]),
+                    ready_resets("bob", &[(five, 99, 100, Some(at(4)))]),
+                    ready_resets(
+                        "carol",
+                        &[
+                            (five, 99, 100, Some(at(20))),
+                            (seven, 99, 100, Some(at(20)))
+                        ],
+                    ),
+                ],
+                now(),
+            ),
+            Some(at(4))
+        );
+        assert_eq!(
+            earliest_recovery_at(
+                &[
+                    cached_at("cached", false, Some(at(3))),
+                    cached_at("stale", true, Some(at(1))),
+                    failed_other("failed"),
+                    ready_resets("ready", &[(five, 99, 100, Some(at(6)))]),
+                ],
+                now(),
+            ),
+            Some(at(3))
+        );
+        assert_eq!(earliest_recovery_at(&[], now()), None);
+        assert_eq!(
+            earliest_recovery_at(
+                &[
+                    ready("alice", &[(five, 99, 100)]),
+                    cached_at("stale", true, Some(at(1))),
+                    failed_other("failed"),
+                ],
+                now(),
+            ),
+            None
+        );
+    }
+
+    /// 过点重置作用于回驻资格：停泊目标的合格线与当前账号「任一窗口已达阈值则不回驻」
+    /// 同口径。
+    #[test]
+    fn decide_resident_return_past_reset() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let passed = now() - chrono::Duration::hours(1);
+        let days = now() + chrono::Duration::days(3);
+        let accounts = vec![settled("alice", true), settled("bob", false)];
+        let membered_resets =
+            |id: &str, parts: &[(QuotaWindow, u64, u64, Option<DateTime<Utc>>)], level: &str| {
+                let mut snap = ready_resets(id, parts);
+                snap.membership = Some(level.into());
+                snap
+            };
+        let decide = |snapshots: &[QuotaSnapshot]| {
+            decide_resident_return(
+                &accounts,
+                snapshots,
+                &resident(),
+                now(),
+                None,
+                None,
+                &HashSet::new(),
+                &mut HashMap::new(),
+            )
+        };
+
+        // 低档停泊账号缓存显示耗尽但 reset_at 已过 → 回驻目标重新合格。
+        let got = decide(&[
+            membered_resets("alice", &[(five, 30, 100, Some(days))], "LEVEL_ADVANCED"),
+            membered_resets(
+                "bob",
+                &[(five, 100, 100, Some(passed))],
+                "LEVEL_INTERMEDIATE",
+            ),
+        ]);
+        assert_eq!(got.map(|target| target.to.0), Some("bob".to_string()));
+
+        // 当前账号的耗尽窗口已过点 → 不再算「已达阈值」，照常回驻。
+        let got = decide(&[
+            membered_resets(
+                "alice",
+                &[(five, 100, 100, Some(passed)), (seven, 30, 100, Some(days))],
+                "LEVEL_ADVANCED",
+            ),
+            membered_resets("bob", &[(five, 10, 100, Some(days))], "LEVEL_INTERMEDIATE"),
+        ]);
+        assert_eq!(got.map(|target| target.to.0), Some("bob".to_string()));
     }
 }

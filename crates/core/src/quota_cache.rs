@@ -113,6 +113,28 @@ impl QuotaCache {
         })
     }
 
+    /// 同 [`get`](Self::get)，但保留 `reset_at` 已过的窗口（原样返回缓存值）；无 `reset_at`
+    /// 的窗口仍按兜底 TTL 失效。供只读缓存的自动切换判定（配额失败被动切换）使用：判定按
+    /// 「过点重置」把这些窗口当作已重置（ADR-0020），缓存层若先丢掉它们，窗口全部过点的
+    /// 账号会整条失去快照、被误判为不可用。展示路径仍用 [`get`](Self::get)。
+    pub fn get_keeping_past_resets(&self, provider: &str, account_id: &str) -> Option<ValidEntry> {
+        let entry = self.entries.get(&cache_key(provider, account_id))?;
+        let now = Utc::now();
+        let quotas: Vec<Quota> = entry
+            .quotas
+            .iter()
+            .filter(|q| q.reset_at.is_some() || !quota_expired(q, entry.cached_at, now))
+            .cloned()
+            .collect();
+        if quotas.is_empty() {
+            return None;
+        }
+        Some(ValidEntry {
+            quotas,
+            cached_at: entry.cached_at,
+        })
+    }
+
     /// 若缓存足够新(`cached_at` 距今 < `max_age`)且仍有有效窗口，返回快照；否则 None。
     /// 用于「缓存节流」：够新就直接复用、跳过真实 quota 查询，避免高频打 usage 端点。
     ///
@@ -474,6 +496,40 @@ mod tests {
         }
         assert!(cache
             .fresh("alpha", "a@x.com", std::time::Duration::from_secs(90))
+            .is_none());
+    }
+
+    /// 判定用读取（issue #191 / ADR-0020）：`reset_at` 已过的窗口原样保留（展示用的 `get`
+    /// 照旧丢掉）；无 `reset_at` 的窗口仍按兜底 TTL 失效；一个窗口都不剩时返回 None。
+    #[test]
+    fn get_keeping_past_resets_keeps_reset_passed_windows_only() {
+        let passed = Utc::now() - Duration::hours(1);
+        let mut reset_passed = sample_quota();
+        reset_passed.reset_at = Some(passed);
+        let mut no_reset = sample_quota();
+        no_reset.window = QuotaWindow::FiveHour;
+        no_reset.reset_at = None;
+
+        let mut cache = QuotaCache::default();
+        cache.set("alpha", "a@x.com", vec![reset_passed, no_reset.clone()]);
+        // 6 小时前写入：无 reset_at 的 5 小时窗已过兜底 TTL。
+        cache.age_success("alpha", "a@x.com", Duration::hours(6));
+        assert!(cache.get("alpha", "a@x.com").is_none(), "展示路径照旧丢掉");
+        let entry = cache
+            .get_keeping_past_resets("alpha", "a@x.com")
+            .expect("reset_at 已过的窗口应保留");
+        assert_eq!(entry.quotas.len(), 1, "TTL 过期的无 reset_at 窗口仍丢掉");
+        assert_eq!(entry.quotas[0].reset_at, Some(passed));
+        assert_eq!(entry.quotas[0].used, 10, "原样返回缓存值，不改写");
+
+        let mut ttl_only = QuotaCache::default();
+        ttl_only.set("alpha", "b@x.com", vec![no_reset]);
+        ttl_only.age_success("alpha", "b@x.com", Duration::hours(6));
+        assert!(ttl_only
+            .get_keeping_past_resets("alpha", "b@x.com")
+            .is_none());
+        assert!(cache
+            .get_keeping_past_resets("alpha", "nobody@x.com")
             .is_none());
     }
 

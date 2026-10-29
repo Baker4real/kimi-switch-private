@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
     auto_swap_opt_out_from_extra, decide_auto_swap_from_state, decide_resident_return_from_state,
-    display_name, earliest_reset_at, locally_invalid_accounts, membership_expiry_from_extra,
+    display_name, earliest_recovery_at, locally_invalid_accounts, membership_expiry_from_extra,
     membership_period_days, membership_remaining_days, membership_start_from_extra,
     official_nickname_known, persist_auto_swap_opt_out, prettify_membership,
     read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
@@ -1234,8 +1234,8 @@ where
                 "no eligible candidate",
             ));
             AutoSwapSnapshotEffect {
-                message: Some(UiMessage::auto_swap_no_candidate(earliest_reset_at(
-                    snapshots,
+                message: Some(UiMessage::auto_swap_no_candidate(earliest_recovery_at(
+                    snapshots, now,
                 ))),
                 swapped: false,
             }

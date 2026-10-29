@@ -28,11 +28,11 @@ pub use account_registry::AccountRegistry;
 pub use audit::{AuditEvent, AuditLog};
 pub use auto_swap::{
     burn_trip_from_target, decide_auto_swap, decide_auto_swap_from_state, decide_resident_return,
-    decide_resident_return_from_state, read_burn_trip, read_last_auto_swap_at,
-    read_manual_hold_until, read_resident_confirm_counts, record_auto_swap_success,
-    set_manual_hold_until, write_burn_trip_and_last_auto_swap_at, write_last_auto_swap_at,
-    write_resident_confirm_counts, AutoSwapDecision, AutoSwapKind, AutoSwapReturn,
-    AutoSwapSkipReason, AutoSwapTarget, BurnTrip,
+    decide_resident_return_from_state, earliest_recovery_at, read_burn_trip,
+    read_last_auto_swap_at, read_manual_hold_until, read_resident_confirm_counts,
+    record_auto_swap_success, set_manual_hold_until, write_burn_trip_and_last_auto_swap_at,
+    write_last_auto_swap_at, write_resident_confirm_counts, AutoSwapDecision, AutoSwapKind,
+    AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget, BurnTrip,
 };
 pub use auto_swap_opt_out::{
     account_auto_swap_opt_out, auto_swap_opt_out_from_extra, persist_auto_swap_opt_out,
@@ -62,8 +62,8 @@ pub use provider::Provider;
 pub use quota_cache::{CachedEntry, QuotaCache, ValidEntry};
 pub use quota_query::query_quota_with_retry;
 pub use quota_snapshot::{
-    apply_cached_membership, earliest_reset_at, QuotaCollectOutcome, QuotaCollectReason,
-    QuotaCollectStats, QuotaSnapshot, QuotaState,
+    apply_cached_membership, QuotaCollectOutcome, QuotaCollectReason, QuotaCollectStats,
+    QuotaSnapshot, QuotaState,
 };
 pub use remove_account::remove_account;
 pub use removed::RemovedAccounts;
