@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use kimi_switch_core::error::{Error, Result};
-use kimi_switch_core::Account;
+use kimi_switch_core::{is_lock_contention, Account};
 use kimi_switch_engine::{
     extract_access_token, extract_refresh_token, forced_rotation_fits, FileBlobRuntime,
     RefreshOutcome,
@@ -496,7 +496,7 @@ async fn acquire_and_read_with_timeout(
                 loop {
                     match lock.try_lock_exclusive() {
                         Ok(()) => break,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(error) if is_lock_contention(&error) => {
                             if Instant::now() >= deadline {
                                 return Ok(None);
                             }
@@ -983,7 +983,8 @@ mod tests {
         assert!(!wanted(true, no_lock, None, 2000));
     }
 
-    #[cfg(not(windows))]
+    /// Python 官方刷新锁被官方客户端持有时等它放锁，再采用官方已轮换的凭证。Windows 上的锁竞争
+    /// 信号是 `ERROR_LOCK_VIOLATION`（os error 33）而不是 `WouldBlock`，同样要等，不能当故障报错。
     #[tokio::test]
     async fn waits_for_official_lock_then_reuses_rotated_credentials() {
         let temporary = tempfile::tempdir().unwrap();

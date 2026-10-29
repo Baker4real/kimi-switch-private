@@ -155,8 +155,9 @@ pub(crate) fn lock_within_wait_limit(file: &File) -> std::result::Result<(), Loc
 
 /// fs2 `try_lock_exclusive` 的竞争信号：Unix flock 返回 `EWOULDBLOCK`
 /// （std 映射为 `WouldBlock`），Windows `LockFileEx` 返回 `ERROR_LOCK_VIOLATION`
-/// （raw os error 33）。其余错误视为真实故障，不参与等待循环。
-fn is_lock_contention(err: &io::Error) -> bool {
+/// （raw os error 33）。其余错误视为真实故障，不参与等待循环。本 crate 的各把锁与
+/// Kimi adapter 等待 Python 官方刷新锁共用这一判据。
+pub fn is_lock_contention(err: &io::Error) -> bool {
     const ERROR_LOCK_VIOLATION: i32 = 33;
     err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(ERROR_LOCK_VIOLATION)
 }

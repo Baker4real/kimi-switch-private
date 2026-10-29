@@ -71,3 +71,4 @@ pub use remove_account::remove_account;
 pub use removed::RemovedAccounts;
 pub use startup_check::{startup_consistency_check, StartupCheckOutcome};
 pub use store::{CredentialStore, FileStore, KeyringStore};
+pub use switch_lock::is_lock_contention;
