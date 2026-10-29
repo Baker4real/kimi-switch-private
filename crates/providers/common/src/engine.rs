@@ -323,11 +323,11 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 // ---------------------------------------------------------------------------
 
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
-    /// 取账号 blob：active 账号优先读 live（并顺手修复 store 副本），parked 读 store，最后 legacy。
+    /// 取账号 blob：active 账号优先读 live（并顺手回灌 store 副本），parked 读 store，最后 legacy。
     ///
-    /// 「顺手修复 store 副本」是 ADR-0002 修订记录的第二条回灌路径：重授权 live 写失败
-    /// 窗口内对活跃账号一次读取（查额度/导出）即把旧 live 回灌库存、撤销新凭证——
-    /// 这是已接受的对外行为（窗口期一律以 live 为准），勿在此加防御。
+    /// 「顺手回灌」是 ADR-0002 修订记录的第二条回灌路径，按回灌新旧比对写库存
+    /// （[`Self::backfill_live_into_store_with`]，ADR-0019 决策 7）：重授权 live 写失败窗口内，
+    /// 可比较时较旧的 live 不再撤销库存里的新凭证。读取本身仍返回 live，不主动改写它。
     ///
     /// 错误处理顺序与原始 Beta 实现一致：store 读取失败时不立即冒泡，而是先捕获错误、
     /// 继续尝试 `recover_legacy`；只有 legacy 也拿不到时才把原始 store 错误抛出去。这样即使
@@ -350,12 +350,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         account: &Account,
     ) -> Result<String> {
         if let Some(raw) = Self::read_live_if_matches_with(runtime, home, account) {
-            let _ = store.set(
-                runtime.id(),
-                account.id.0.as_str(),
-                runtime.store_field(),
-                &raw,
-            );
+            // 回灌只是顺手保鲜：库写失败不影响读取。
+            let _ = Self::backfill_live_into_store_with(runtime, store, &account.id, &raw);
             return Ok(raw);
         }
         let store_error =
@@ -477,7 +473,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 覆盖 live 前把 live 凭证回灌进其 owner 账号 store。
     /// 只接收借用参数，供 `activate` 的 `spawn_blocking` 闭包与同步 reconcile 共用一份实现。
     ///
-    /// 守卫：live 缺 refresh 且 store 已有 refresh 时跳过（防静默写死账号）。
+    /// 按回灌新旧比对写入（[`Self::backfill_live_into_store_with`]，ADR-0019 决策 7）：
+    /// live 缺 refresh 且 store 已有 refresh 时跳过（防静默写死账号），live 严格较旧时也跳过。
     fn capture_live_into_store_with(
         runtime: &A,
         store: &dyn CredentialStore,
@@ -495,27 +492,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             .into_iter()
             .find(|a| Self::metadata_matches(&meta, a, dedup_extra_key));
         let Some(owner) = owner else { return Ok(()) };
-
-        if extract_refresh_token(&live_raw).is_none() {
-            if let Some(existing) =
-                store.get(runtime.id(), owner.id.0.as_str(), runtime.store_field())?
-            {
-                if extract_refresh_token(&existing).is_some() {
-                    tracing::warn!(
-                        account = %owner.id,
-                        "live capture missing refresh_token; skipped overwrite to keep existing store copy"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        store.set(
-            runtime.id(),
-            owner.id.0.as_str(),
-            runtime.store_field(),
-            &live_raw,
-        )?;
-        Ok(())
+        Self::backfill_live_into_store_with(runtime, store, &owner.id, &live_raw)
     }
 
     /// 只 live→store，不碰 active 标记。
@@ -542,8 +519,9 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 盖进刚替换的库存副本。写顺序固定「先库存后 live」：
     /// live 写失败时新凭证已安全落在库存，不会丢号。
     ///
-    /// 窗口期（store=新/live=旧）对外一律以 live 为准：其后的查询或切换都会把旧 live
-    /// 回灌库存、静默撤销新凭证（已接受行为，见 ADR-0002 修订与 issue #5）；补救是重试重新授权。
+    /// 窗口期（store=新/live=旧）：其后的查询或切换按回灌新旧比对回灌（ADR-0019 决策 7，
+    /// 修订 ADR-0002）。可比较时较旧的 live 不再撤销新凭证，切走再切回即生效；任一方解析不出
+    /// 过期时刻时仍以 live 为准、新凭证被撤销。补救是重试重新授权。
     ///
     /// 错误文本只含账号 id 与原因，不含任何凭证内容。
     pub fn replace_account_blob(&self, target: &AccountId, raw: String) -> Result<Account> {
@@ -563,11 +541,90 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         )?;
         if account.active {
             // 原子写（tmp + rename）：失败时旧 live 未被破坏，新凭证已在库存可重试。
-            // 窗口期对外行为见 ADR-0002 修订：live 仍为旧凭证，其后的查询/切换都以旧 live 为准，
-            // 错误文案必须把状态与补救讲清楚。
+            // 窗口期对外行为见函数 doc：live 仍为旧凭证，查询照用它；错误文案必须把状态与补救讲清楚。
             Self::write_blob(&self.live_path(), &raw).map_err(Error::reauth_live_write_failed)?;
         }
         Ok(account)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 回灌新旧比对（ADR-0019 决策 7）：live → 账号库的回灌不让较旧的凭证覆盖较新的
+// ---------------------------------------------------------------------------
+
+/// 一份 live 凭证能否回灌进账号库当前副本的裁决。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackfillVerdict {
+    /// 照写：库存没有这一项、两份 refresh token 相同、库存没有 refresh token 要保护，
+    /// 或比不出 live 严格较旧（含任一方解析不出过期时刻）。
+    Write,
+    /// live 缺 refresh token 而库存有：跳过，官方墓碑化的登录文件不污染账号库。
+    LiveMissingRefresh,
+    /// 两份 refresh token 不同且 live 的过期时刻严格早于库存：跳过，较旧的凭证不覆盖较新的。
+    LiveOlder,
+}
+
+impl<A: FileBlobRuntime> FileBlobProvider<A> {
+    /// live → 账号库的回灌。所有回灌点共用：capture-on-leave、读取当前账号凭证时的顺手回灌、
+    /// 主动续期发现官方已抢先轮换时的采纳回灌。在凭证存储自身的锁下读库存、按
+    /// [`Self::backfill_verdict`] 裁决、再写入（`set_if`）；跳过时记 warn。只防覆盖，从不改写 live。
+    fn backfill_live_into_store_with(
+        runtime: &A,
+        store: &dyn CredentialStore,
+        owner: &AccountId,
+        live_raw: &str,
+    ) -> Result<()> {
+        // 先经 `get` 读一次：legacy 钥匙串里还没迁移的库存副本借此落进凭证文件，下面的 `set_if`
+        // 才比对得到它（`set_if` 锁内只看凭证文件，ADR-0019 决策 2）。
+        store.get(runtime.id(), owner.0.as_str(), runtime.store_field())?;
+        let verdict = std::cell::Cell::new(BackfillVerdict::Write);
+        store.set_if(
+            runtime.id(),
+            owner.0.as_str(),
+            runtime.store_field(),
+            live_raw,
+            &|stored| {
+                verdict.set(Self::backfill_verdict(runtime, stored, live_raw));
+                verdict.get() == BackfillVerdict::Write
+            },
+        )?;
+        match verdict.get() {
+            BackfillVerdict::Write => {}
+            BackfillVerdict::LiveMissingRefresh => tracing::warn!(
+                account = %owner,
+                "live credentials missing refresh_token; skipped backfill to keep the stored copy"
+            ),
+            BackfillVerdict::LiveOlder => tracing::warn!(
+                account = %owner,
+                "live credentials older than the stored copy; skipped backfill to keep the newer one"
+            ),
+        }
+        Ok(())
+    }
+
+    /// 回灌新旧比对：两份 refresh token 相同照写；不同则比过期时刻
+    /// （[`FileBlobRuntime::credential_expiry`]：JWT `exp` 优先，缺失回退 `expires_at`），
+    /// live 严格较旧才不覆盖；live 更晚或相等、任一方解析不出都维持以 live 为准。
+    /// 「live 缺 refresh token 而库存有 → 跳过」的守卫先于比对。
+    fn backfill_verdict(runtime: &A, stored: Option<&str>, live: &str) -> BackfillVerdict {
+        let Some(stored) = stored else {
+            return BackfillVerdict::Write;
+        };
+        match (extract_refresh_token(live), extract_refresh_token(stored)) {
+            (None, Some(_)) => BackfillVerdict::LiveMissingRefresh,
+            (Some(live_refresh), Some(stored_refresh)) if live_refresh != stored_refresh => {
+                match (
+                    runtime.credential_expiry(live),
+                    runtime.credential_expiry(stored),
+                ) {
+                    (Some(live_exp), Some(stored_exp)) if live_exp < stored_exp => {
+                        BackfillVerdict::LiveOlder
+                    }
+                    _ => BackfillVerdict::Write,
+                }
+            }
+            _ => BackfillVerdict::Write,
+        }
     }
 }
 
@@ -715,11 +772,12 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 照样落进该账号的库存。轮换被官方拒绝（invalid_grant）时记录指纹并停止重试，
     /// 本地凭证不删除不墓碑化，本次查询按「凭证过期型 401」（issue #41）呈现。
     ///
-    /// 如实收录：live 原子写失败（本地 IO）**不是**可恢复窗口。live 保持旧内容，
-    /// 但下一次当前账号查询会经 [`Self::raw_blob_for_account`] 把旧 live 无条件回灌
-    /// 库槽位，销毁新轮换 refresh token 的唯一副本；此后轮换必被官方 invalid_grant
-    /// 拒绝，收敛到凭证过期型 401 + 指纹停试，需用户按引导重新授权
-    /// （ADR-0002 修订明文接受「窗口期一律以 live 为准」，ADR-0003 已接受边界）。
+    /// live 原子写失败（本地 IO）时：账号库已是新凭证，live 保持被消耗的旧凭证，本次查询报错。
+    /// 之后读取当前账号凭证（[`Self::raw_blob_for_account`]）与切走时的 capture-on-leave 都按
+    /// 回灌新旧比对回灌（ADR-0019 决策 7）：可比较时旧 live 不再覆盖账号库，切走再切回即恢复；
+    /// 任一方解析不出过期时刻时仍以 live 为准，旧 live 回灌库槽位、销毁新轮换 refresh token 的
+    /// 唯一副本，此后轮换必被官方 invalid_grant 拒绝，收敛到凭证过期型 401 + 指纹停试，
+    /// 需用户按引导重新授权（ADR-0003 已接受边界）。
     async fn renew_active_proactively(&self, account: &Account, raw: String) -> Result<String> {
         // 即用即读：轮换前现读 live 文件（官方即用即读，我们也即用即读），
         // 把与官方轮换的竞态窗口压到最小，不用查询开始时的旧副本。
@@ -729,13 +787,13 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         };
         if extract_access_token(&live).as_deref() != extract_access_token(&raw).as_deref() {
             // 官方已抢先轮换（与官方 100ms 重读采纳机制同款）：直接采纳最新 live，
-            // 顺手回灌账号库保持真本新鲜；本次查询不再消耗 refresh token。
+            // 按回灌新旧比对顺手回灌账号库（ADR-0019 决策 7）；本次查询不再消耗 refresh token。
             // 回灌只是顺手保鲜：库写失败不应让手握有效 live 的查询整体失败，
             // 与 `raw_blob_for_account` 的回灌容错（`let _ =`）一致。
-            let _ = self.store.set(
-                self.runtime.id(),
-                account.id.0.as_str(),
-                self.runtime.store_field(),
+            let _ = Self::backfill_live_into_store_with(
+                self.runtime.as_ref(),
+                self.store.as_ref(),
+                &account.id,
                 &live,
             );
             return Ok(live);
@@ -748,8 +806,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             RefreshOutcome::Rotated(new_blob) => {
                 // 轮换写回比对（ADR-0019）：`live` 是本次消耗掉的那份凭证。交换锁内先按比对写库存，
                 // 再仅当该账号仍是当前账号、当前登录文件仍持被消耗的 token 时原子写 live；续期在途时
-                // 被切走就不碰当前登录文件，不撤销切换。live 写失败时 live 保持旧内容不被破坏——
-                // 但此窗口不可恢复（如实收录，见函数 doc）。
+                // 被切走就不碰当前登录文件，不撤销切换。live 写失败时 live 保持旧内容不被破坏，
+                // 库存里的新凭证之后靠回灌新旧比对保住（见函数 doc）。
                 self.commit_rotation(account, &live, &new_blob).await?;
                 // 指纹清除规则不变：只清掉这次被消耗的 blob 的拒止指纹。
                 self.runtime.proactive_renewal_rotated(&self.home, &live)?;
@@ -1174,6 +1232,14 @@ mod tests {
             self.legacy_blob.clone()
         }
 
+        // 测试 blob 的过期时刻只认顶层整数 `expires_at`（JWT `exp` 优先的口径由 Kimi 适配器负责）。
+        fn credential_expiry(&self, blob: &str) -> Option<i64> {
+            serde_json::from_str::<serde_json::Value>(blob)
+                .ok()?
+                .get("expires_at")?
+                .as_i64()
+        }
+
         async fn proactive_renewal_wanted(&self, _blob: &str) -> bool {
             if let Some(blob) = &self.official_live_during_wanted {
                 // 模拟官方 100ms 采纳：判定期间 live 已被官方改写成新凭证。
@@ -1397,6 +1463,175 @@ mod tests {
         // 无匹配账号 → 不写 store。
         p.reconcile_active_from_live().unwrap();
         assert!(p.test_store_get("unmanaged").is_none());
+    }
+
+    // --- 回灌新旧比对（ADR-0019 决策 7）：经 capture-on-leave 通道断言 ---
+
+    /// 把 u1 的库存设成 `stored`、当前登录文件设成 `live`，回灌一次，返回 u1 的库存。
+    fn backfill_once(p: &FileBlobProvider<FakeRuntime>, stored: &str, live: &str) -> String {
+        p.import_raw(stored.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), live).unwrap();
+        p.reconcile_active_from_live().unwrap();
+        p.test_store_get("u1").unwrap()
+    }
+
+    /// 两份 refresh token 不同、live 的过期时刻严格较早：不覆盖库存里较新的凭证。
+    #[test]
+    fn backfill_skips_live_older_than_stored_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+        let stored = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2","expires_at":2000}"#;
+        let older = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1","expires_at":1000}"#;
+
+        assert_eq!(
+            backfill_once(&p, stored, older),
+            stored,
+            "较旧的 live 不得覆盖库存里较新的凭证"
+        );
+    }
+
+    /// live 过期得更晚或同刻：照常覆盖。
+    #[test]
+    fn backfill_overwrites_when_live_is_newer_or_equally_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+        let stored = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1","expires_at":1000}"#;
+        let newer = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2","expires_at":2000}"#;
+        let same_time =
+            r#"{"uid":"u1","refresh_token":"R3","access_token":"A3","expires_at":1000}"#;
+
+        assert_eq!(backfill_once(&p, stored, newer), newer, "live 较新时覆盖");
+        assert_eq!(
+            backfill_once(&p, stored, same_time),
+            same_time,
+            "同刻过期不算严格较旧，照常覆盖"
+        );
+    }
+
+    /// 任一方解析不出过期时刻：不可比较，维持以 live 为准。
+    #[test]
+    fn backfill_lets_live_win_when_either_side_has_no_expiry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+        let stored_with_expiry =
+            r#"{"uid":"u1","refresh_token":"R2","access_token":"A2","expires_at":2000}"#;
+        let live_without_expiry = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let stored_without_expiry = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+        let live_with_expiry =
+            r#"{"uid":"u1","refresh_token":"R1","access_token":"A1","expires_at":1000}"#;
+
+        assert_eq!(
+            backfill_once(&p, stored_with_expiry, live_without_expiry),
+            live_without_expiry,
+            "live 无过期时刻：维持现状，live 覆盖"
+        );
+        assert_eq!(
+            backfill_once(&p, stored_without_expiry, live_with_expiry),
+            live_with_expiry,
+            "库存无过期时刻：维持现状，live 覆盖"
+        );
+    }
+
+    /// 仿 `FileStore` 的 legacy 钥匙串回退：`get` 在凭证文件未命中时取 legacy 副本并迁移进文件，
+    /// `set_if` 只比对凭证文件（锁内不碰钥匙串）。生产装配就是带 legacy 回退的 `FileStore`。
+    struct UnmigratedLegacyStore {
+        inner: FileStore,
+        legacy: Mutex<std::collections::BTreeMap<(String, String, String), String>>,
+    }
+
+    impl kimi_switch_core::CredentialStore for UnmigratedLegacyStore {
+        fn set(&self, provider: &str, account: &str, field: &str, value: &str) -> Result<()> {
+            self.inner.set(provider, account, field, value)
+        }
+        fn get(&self, provider: &str, account: &str, field: &str) -> Result<Option<String>> {
+            if let Some(value) = self.inner.get(provider, account, field)? {
+                return Ok(Some(value));
+            }
+            let key = (provider.to_string(), account.to_string(), field.to_string());
+            let Some(value) = self.legacy.lock().unwrap().remove(&key) else {
+                return Ok(None);
+            };
+            self.inner.set(provider, account, field, &value)?;
+            Ok(Some(value))
+        }
+        fn delete(&self, provider: &str, account: &str, field: &str) -> Result<()> {
+            self.inner.delete(provider, account, field)
+        }
+        fn set_if(
+            &self,
+            provider: &str,
+            account: &str,
+            field: &str,
+            value: &str,
+            should_write: &dyn Fn(Option<&str>) -> bool,
+        ) -> Result<bool> {
+            self.inner
+                .set_if(provider, account, field, value, should_write)
+        }
+    }
+
+    /// 回灌比对的是账号库里的副本，含 legacy 钥匙串里还没迁移进凭证文件的那份：
+    /// live 缺 refresh token 而该副本有时，守卫照样跳过，不把它盖掉。
+    #[test]
+    fn backfill_guard_sees_stored_copy_not_yet_migrated_from_legacy_keyring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _switch_home = isolate_switch_home(tmp.path());
+        let legacy_copy = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+        let store = UnmigratedLegacyStore {
+            inner: FileStore::new(tmp.path().join("creds.json")),
+            legacy: Mutex::new(
+                [(
+                    ("fake".to_string(), "u1".to_string(), "blob".to_string()),
+                    legacy_copy.to_string(),
+                )]
+                .into(),
+            ),
+        };
+        let p = FileBlobProvider::new(
+            FakeRuntime::new(tmp.path().join("home")),
+            Arc::new(store),
+            Arc::new(AccountRegistry::new(tmp.path().join("registry.toml"))),
+        );
+        p.test_registry_upsert(fake_account("u1")).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), r#"{"uid":"u1","access_token":"A2"}"#).unwrap();
+
+        p.reconcile_active_from_live().unwrap();
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            legacy_copy,
+            "缺 refresh token 的 live 不得盖掉 legacy 里那份带 refresh token 的库存副本"
+        );
+    }
+
+    /// 库存里没有另一个 refresh token 要保护时照写，即使 live 过期得更早：
+    /// refresh token 相同（同一凭证的其他字段跟着同步），或库存根本没有 refresh token。
+    #[test]
+    fn backfill_writes_earlier_expiring_live_when_stored_refresh_token_is_same_or_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+        let stored =
+            r#"{"uid":"u1","refresh_token":"R1","access_token":"A-LATE","expires_at":2000}"#;
+        let same_refresh =
+            r#"{"uid":"u1","refresh_token":"R1","access_token":"A-EARLY","expires_at":1000}"#;
+        let stored_without_refresh = r#"{"uid":"u1","access_token":"A-LATE","expires_at":2000}"#;
+        let live = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1","expires_at":1000}"#;
+
+        assert_eq!(
+            backfill_once(&p, stored, same_refresh),
+            same_refresh,
+            "refresh token 相同：照写"
+        );
+        assert_eq!(
+            backfill_once(&p, stored_without_refresh, live),
+            live,
+            "库存没有 refresh token：没有一次性 token 要保护，照写"
+        );
     }
 
     // --- Finding 1 回归：账号匹配不应比迁移前的 Beta 实现窄 ---
@@ -1746,18 +1981,17 @@ mod tests {
         );
     }
 
-    /// 钉住已接受行为（ADR-0002 修订）：重授权 live 写失败留下 store=新/live=旧 窗口后，
-    /// 其后一次切换的 capture-on-leave 会把旧 live 回灌库存、静默撤销新凭证——这是明文
-    /// 接受的对外行为（对外一律以 live 为准），由本测试钉住防止未来无意改变；
-    /// 若要改变，先重开 ADR-0002 决策。
+    /// 回灌新旧比对（ADR-0019 决策 7，修订 ADR-0002）：重授权 live 写失败留下
+    /// store=新/live=旧 窗口后，其后一次切换的 capture-on-leave 不再用旧 live 撤销新凭证；
+    /// 再切回该账号时当前登录文件拿到的就是重新授权的结果，重新授权不白做。
     #[tokio::test]
-    async fn reauth_live_write_failure_window_then_activate_backfills_old_live_into_store() {
+    async fn reauth_live_write_failure_window_then_activate_keeps_new_credentials_in_store() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
         fs::create_dir_all(p.test_home()).unwrap();
 
-        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
-        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1","expires_at":1000}"#;
+        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2","expires_at":2000}"#;
         let u2_blob = r#"{"uid":"u2","refresh_token":"RX","access_token":"AX"}"#;
 
         p.import_raw(old_u1.into(), None, Some(true)).unwrap();
@@ -1784,29 +2018,35 @@ mod tests {
 
         assert_eq!(
             p.test_store_get("u1").unwrap(),
-            old_u1,
-            "钉住已接受行为（ADR-0002 修订）：窗口内切换会把旧 live 回灌库存、撤销新凭证"
+            new_u1,
+            "窗口期内切走时，capture-on-leave 不得用旧 live 撤销库存里的新凭证"
         );
         assert_eq!(
             fs::read_to_string(p.test_live_path()).unwrap(),
             u2_blob,
             "切换后 live 应为 u2 的 blob"
         );
+
+        p.activate(&AccountId("u1".into())).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            new_u1,
+            "切回 u1 时当前登录文件应拿到重新授权的新凭证"
+        );
     }
 
-    /// 钉住已接受行为（ADR-0002 修订）：查询路径与切换路径一样会把旧 live 回灌库存。
-    /// 重授权 live 写失败留下 store=新/live=旧 窗口后，对活跃账号一次额度查询
-    /// 即把旧 live 回写 store、静默撤销新凭证——这是明文
-    /// 接受的对外行为（窗口期一律以 live 为准），由本测试钉住防止未来无意改变；
-    /// 若要改变，先重开 ADR-0002 决策。
+    /// 回灌新旧比对（ADR-0019 决策 7，修订 ADR-0002）：重授权 live 写失败留下
+    /// store=新/live=旧 窗口后，对当前账号一次额度查询不再用旧 live 撤销新凭证。
+    /// 两份凭证都带过期时刻、live 严格较旧，读取时的顺手回灌放弃覆盖；查询仍用当前登录文件，
+    /// live 也不被主动改写。
     #[tokio::test]
-    async fn reauth_live_write_failure_window_then_query_quota_backfills_old_live_into_store() {
+    async fn reauth_live_write_failure_window_then_query_quota_keeps_new_credentials_in_store() {
         let tmp = tempfile::tempdir().unwrap();
         let p = provider(tmp.path());
         fs::create_dir_all(p.test_home()).unwrap();
 
-        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
-        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2"}"#;
+        let old_u1 = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1","expires_at":1000}"#;
+        let new_u1 = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2","expires_at":2000}"#;
 
         p.import_raw(old_u1.into(), None, Some(true)).unwrap();
         fs::write(p.test_live_path(), old_u1).unwrap();
@@ -1825,10 +2065,15 @@ mod tests {
             "窗口成立：store 已是新凭证而 live 仍是旧凭证"
         );
 
-        // 解除注入后对活跃账号查一次额度（FakeRuntime 无网络）。
+        // 解除注入后对当前账号查一次额度（FakeRuntime 无网络）。
         fs::remove_dir_all(&tmp_target).unwrap();
         p.query_quota(&AccountId("u1".into())).await.unwrap();
 
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            new_u1,
+            "窗口期内的查询不得用旧 live 撤销库存里的新凭证"
+        );
         assert_eq!(
             p.test_runtime()
                 .last_access_token
@@ -1836,12 +2081,12 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("A1"),
-            "钉住已接受行为（ADR-0002 修订）：窗口内查询以 live 为准，用旧凭证"
+            "读取仍以当前登录文件为准"
         );
         assert_eq!(
-            p.test_store_get("u1").unwrap(),
+            fs::read_to_string(p.test_live_path()).unwrap(),
             old_u1,
-            "钉住已接受行为（ADR-0002 修订）：查询路径与切换路径一样会把旧 live 回灌库存、撤销新凭证"
+            "只防覆盖，不主动改写当前登录文件"
         );
     }
 
@@ -2237,12 +2482,10 @@ mod tests {
     /// ADR-0002 写序钉住「先库后 live」：live 原子写失败时，账号库必须已是新凭证、
     /// live 保持旧凭证不被破坏（注入手法同重授权 live 写失败测试）。
     ///
-    /// 注意此窗口**不可恢复**（如实收录，消除「可恢复」误导）：live 写失败后，下一次
-    /// 当前账号查询会经 `raw_blob_for_account` 把旧 live 无条件回灌库槽位，新轮换
-    /// refresh token 的唯一副本即被销毁；此后轮换必被官方 invalid_grant 拒绝 →
-    /// 记指纹停试 → 收敛到凭证过期型 401，需用户按引导重新授权。该语义是 ADR-0002
-    /// 修订「窗口期一律以 live 为准」的明文接受行为；本测试只钉失败瞬间的落库/落盘
-    /// 状态，不暗示任何可恢复性。
+    /// 本测试只钉失败瞬间的落库/落盘状态。之后能否保住账号库里的新凭证取决于回灌新旧比对
+    /// （ADR-0019 决策 7）：可比较时旧 live 不再覆盖它；任一方解析不出过期时刻时仍以 live
+    /// 为准，新轮换 refresh token 的唯一副本被销毁 → 轮换必被官方 invalid_grant 拒绝 →
+    /// 记指纹停试 → 收敛到凭证过期型 401，需用户按引导重新授权。
     #[tokio::test]
     async fn proactive_renewal_live_write_failure_leaves_store_new_and_live_old() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2382,6 +2625,49 @@ mod tests {
             p.test_store_get("u1").unwrap(),
             official,
             "采纳后回灌账号库"
+        );
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), official);
+    }
+
+    /// 采纳回灌同样按回灌新旧比对（ADR-0019 决策 7）：官方抢先轮换、本次采纳当前登录文件时，
+    /// 账号库里的凭证比它还新，就不被覆盖；本次查询照用当前登录文件。
+    #[tokio::test]
+    async fn proactive_renewal_adoption_keeps_newer_stored_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            FakeRuntime::with_proactive(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let official =
+            r#"{"uid":"u1","refresh_token":"R9","access_token":"OFFICIAL","expires_at":2000}"#;
+        runtime.official_live_during_wanted = Some(official.into());
+        let p = provider_with(tmp.path(), runtime);
+        let stored =
+            r#"{"uid":"u1","refresh_token":"R-STORED","access_token":"STORED","expires_at":3000}"#;
+        let old_live =
+            r#"{"uid":"u1","refresh_token":"R1","access_token":"OLD","expires_at":1000}"#;
+        let account = p.import_raw(stored.into(), None, Some(true)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), old_live).unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            0,
+            "官方已轮换则不重复消耗 refresh token"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("OFFICIAL"),
+            "查询照用官方刚写进当前登录文件的凭证"
+        );
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            stored,
+            "采纳回灌不得用较旧的 live 覆盖账号库里较新的凭证"
         );
         assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), official);
     }

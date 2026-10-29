@@ -46,6 +46,9 @@ impl FileBlobRuntime for KimiRuntime {
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>> {
         kimi_usage::fetch_quota_with_active_recovery(access_token, account, &self.registry).await
     }
+    fn credential_expiry(&self, blob: &str) -> Option<i64> {
+        kimi_files::credential_expiry(blob)
+    }
 
     // 当前账号主动续期（issue #44）：判定与 DeadToken 纪律在 oauth，机制在引擎。
     async fn proactive_renewal_wanted(&self, blob: &str) -> bool {

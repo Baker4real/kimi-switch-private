@@ -64,6 +64,14 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
         None
     }
 
+    /// 凭证的过期时刻（Unix 秒）：优先取 access token 的 JWT `exp`，缺失时回退凭证里的
+    /// `expires_at`；解析不出为 `None`。回灌新旧比对（ADR-0019）用它判断两份凭证谁更新，
+    /// 任一方为 `None` 即不可比较、维持以 live 为准。默认 `None`。
+    fn credential_expiry(&self, blob: &str) -> Option<i64> {
+        let _ = blob;
+        None
+    }
+
     // -----------------------------------------------------------------------
     // 当前账号主动续期（issue #44，ADR-0003 第 2 条）。
     // 四个钩子的默认实现都是「不主动续期」：不提供该能力的 runtime 与
