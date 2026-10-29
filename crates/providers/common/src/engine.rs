@@ -20,7 +20,7 @@ use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::membership_expiry::{
     EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME, EXTRA_NEXT_BILLING_TIME,
 };
-use kimi_switch_core::swap::{swap_with_snapshot_protected, SwapTarget};
+use kimi_switch_core::swap::{swap_with_snapshot_protected, with_swap_lock, SwapTarget};
 use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, Provider, Quota};
 
 use crate::json::{extract_access_token, extract_refresh_token};
@@ -41,6 +41,39 @@ fn take_fail_next_live_sync() -> bool {
 #[cfg(test)]
 pub(crate) fn fail_next_live_sync() {
     FAIL_NEXT_LIVE_SYNC.with(|cell| cell.set(true));
+}
+
+// 测试 seam（ADR-0019）：activate 即将进入交换锁时，运行为该 provider home 登记的一次性
+// 探针，供交错用例在「已调用 activate、尚未拿到交换锁」这一刻插入另一段持锁写入。activate
+// 的阻塞部分跑在 spawn_blocking 线程上，线程本地注入不可达，所以按 home 登记在进程级表里
+// （每个用例的 home 在各自 tempdir 下，并行用例互不串）。
+#[cfg(test)]
+type ActivateLockProbe = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static ACTIVATE_LOCK_PROBES: std::sync::Mutex<Vec<(PathBuf, ActivateLockProbe)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn before_next_activate_lock(home: &Path, probe: impl FnOnce() + Send + 'static) {
+    ACTIVATE_LOCK_PROBES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((home.to_path_buf(), Box::new(probe)));
+}
+
+#[cfg(test)]
+fn run_activate_lock_probe(home: &Path) {
+    let probe = {
+        let mut probes = ACTIVATE_LOCK_PROBES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let index = probes.iter().position(|(registered, _)| registered == home);
+        index.map(|i| probes.remove(i).1)
+    };
+    if let Some(probe) = probe {
+        probe();
+    }
 }
 
 /// 文件型 OAuth 账号切换引擎：接一个 [`FileBlobRuntime`] adapter 即可获得完整 [`Provider`] 实现。
@@ -300,29 +333,42 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 继续尝试 `recover_legacy`；只有 legacy 也拿不到时才把原始 store 错误抛出去。这样即使
     /// keyring 后端本身故障，仍有机会从 legacy 布局恢复凭证。
     fn raw_blob_for_account(&self, account: &Account) -> Result<String> {
-        if let Some(raw) = self.read_live_if_matches(account) {
-            let _ = self.store.set(
-                self.runtime.id(),
+        Self::raw_blob_for_account_with(
+            self.runtime.as_ref(),
+            self.store.as_ref(),
+            &self.home,
+            account,
+        )
+    }
+
+    /// [`Self::raw_blob_for_account`] 的借用参数版本，供 activate 在交换锁内（`spawn_blocking`
+    /// 闭包里）读取目标凭证。
+    fn raw_blob_for_account_with(
+        runtime: &A,
+        store: &dyn CredentialStore,
+        home: &Path,
+        account: &Account,
+    ) -> Result<String> {
+        if let Some(raw) = Self::read_live_if_matches_with(runtime, home, account) {
+            let _ = store.set(
+                runtime.id(),
                 account.id.0.as_str(),
-                self.runtime.store_field(),
+                runtime.store_field(),
                 &raw,
             );
             return Ok(raw);
         }
-        let store_error = match self.store.get(
-            self.runtime.id(),
-            account.id.0.as_str(),
-            self.runtime.store_field(),
-        ) {
-            Ok(Some(raw)) => return Ok(raw),
-            Ok(None) => None,
-            Err(e) => Some(e),
-        };
-        if let Some(raw) = self.runtime.recover_legacy(&self.home, account) {
-            let _ = self.store.set(
-                self.runtime.id(),
+        let store_error =
+            match store.get(runtime.id(), account.id.0.as_str(), runtime.store_field()) {
+                Ok(Some(raw)) => return Ok(raw),
+                Ok(None) => None,
+                Err(e) => Some(e),
+            };
+        if let Some(raw) = runtime.recover_legacy(home, account) {
+            let _ = store.set(
+                runtime.id(),
                 account.id.0.as_str(),
-                self.runtime.store_field(),
+                runtime.store_field(),
                 &raw,
             );
             return Ok(raw);
@@ -332,16 +378,20 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         }
         Err(Error::Credential(format!(
             "no stored credentials for {}:{}; run `kimi-switch login {}` or re-import",
-            self.runtime.id(),
+            runtime.id(),
             account.id,
-            self.runtime.id()
+            runtime.id()
         )))
     }
 
     fn read_live_if_matches(&self, account: &Account) -> Option<String> {
-        let raw = fs::read_to_string(self.live_path()).ok()?;
-        let meta = self.runtime.parse_metadata(&raw);
-        Self::metadata_matches(&meta, account, self.runtime.dedup_extra_key()).then_some(raw)
+        Self::read_live_if_matches_with(self.runtime.as_ref(), &self.home, account)
+    }
+
+    fn read_live_if_matches_with(runtime: &A, home: &Path, account: &Account) -> Option<String> {
+        let raw = fs::read_to_string(runtime.live_cred_path(home)).ok()?;
+        let meta = runtime.parse_metadata(&raw);
+        Self::metadata_matches(&meta, account, runtime.dedup_extra_key()).then_some(raw)
     }
 
     /// 写后回读身份校验（issue #154，spec #152 实现决策 6）：activate 把目标 blob
@@ -528,13 +578,12 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 #[async_trait]
 impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
     async fn activate(&self, id: &AccountId) -> Result<()> {
-        // 阶段 1：异步预处理（仅查 registry + store，无网络调用），与 Beta 现有实现一致。
+        // 阶段 1：只查 registry（无网络调用）。目标凭证在阶段 2 的交换锁内读取。
         let account = self.require_account(id)?;
-        let target_raw = self.raw_blob_for_account(&account)?;
 
-        // 阶段 2：把需要阻塞 IO 的部分（含 capture-on-leave）整体搬进 spawn_blocking。
-        // 不用 `block_in_place`：调用方可能运行在 current-thread runtime（如测试），
-        // `block_in_place` 在那种 runtime 下会直接 panic；`spawn_blocking` 没有这个限制。
+        // 阶段 2：阻塞 IO 整体搬进 spawn_blocking。不用 `block_in_place`：调用方可能运行在
+        // current-thread runtime（如测试），`block_in_place` 在那种 runtime 下会直接 panic；
+        // `spawn_blocking` 没有这个限制。
         let home = self.home.clone();
         let live_path = self.live_path();
         let provider_id = self.runtime.id();
@@ -542,66 +591,77 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
         let store = self.store.clone();
         let registry = self.registry.clone();
         let id_owned = id.clone();
-        // 写后回读身份校验（issue #154）用：切换目标账号（registry 侧权威定义）。
-        let verify_account = account.clone();
         // registry.toml 纳入切换备份/回滚集（issue #153 续跑，reviewer P1-2）：
         // commit 阶段 set_active 的写入（含其 fsync 失败）与 live 同生命周期回滚。
         let registry_file = registry.path().to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            // capture-on-leave：覆盖 live 前，先把当前 live 凭证回灌进它所属账号的 store。
-            // 否则切走的账号 store 副本会停在旧 refresh token，下次切回写回旧 token → "already used"。
-            if let Err(e) = FileBlobProvider::<A>::capture_live_into_store_with(
-                runtime.as_ref(),
-                store.as_ref(),
-                registry.as_ref(),
-                &home,
-            ) {
-                tracing::warn!(err = %e, "capture-on-leave failed; continuing swap");
-            }
+            let lock_dir = FileBlobProvider::<A>::swap_lock_dir(&registry, &home);
+            #[cfg(test)]
+            run_activate_lock_probe(&home);
+            // 读取进锁（ADR-0019）：目标凭证读取、capture-on-leave、切换前身份记录，与写入、
+            // 写后回读校验、registry 提交同在一段交换锁临界区。锁按线程可重入，下面的切换骨架
+            // 与 registry 写入照常进锁。锁内纯本地 IO、零网络；轮换的网络请求在锁外，
+            // 切换不等待任何在途轮换。
+            with_swap_lock(&lock_dir, || {
+                let target_raw = FileBlobProvider::<A>::raw_blob_for_account_with(
+                    runtime.as_ref(),
+                    store.as_ref(),
+                    &home,
+                    &account,
+                )?;
 
-            // 切换前 live 身份快照（issue #154 reviewer P2）：此刻 writer 尚未运行，
-            // live 仍是切换前内容；mismatch 回滚前用它识别「官方客户端并发写回
-            // 旧账号」特征。读失败/解析不出 → None（无法确证，不做抢救判定）。
-            let pre_swap_identity = fs::read_to_string(runtime.live_cred_path(&home))
-                .ok()
-                .and_then(|raw| {
-                    let meta = runtime.parse_metadata(&raw);
-                    Self::official_identity(&meta).map(str::to_string)
-                });
+                // capture-on-leave：覆盖 live 前，先把当前 live 凭证回灌进它所属账号的 store。
+                // 否则切走的账号 store 副本会停在旧 refresh token，下次切回写回旧 token →
+                // "already used"。失败只 warn、不阻断切换（ADR-0015 决策 11）。
+                if let Err(e) = FileBlobProvider::<A>::capture_live_into_store_with(
+                    runtime.as_ref(),
+                    store.as_ref(),
+                    registry.as_ref(),
+                    &home,
+                ) {
+                    tracing::warn!(err = %e, "capture-on-leave failed; continuing swap");
+                }
 
-            let blob = target_raw;
-            let targets = vec![SwapTarget {
-                snapshot_name: "credentials",
-                live_path,
-                writer: Box::new(move |p: &Path| FileBlobProvider::<A>::write_blob(p, &blob)),
-            }];
-            let lock_dir = registry
-                .path()
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| home.clone());
-            swap_with_snapshot_protected(
-                provider_id,
-                &home,
-                &lock_dir,
-                targets,
-                vec![registry_file],
-                || {
-                    // 写后回读身份校验（issue #154，spec #152 实现决策 6）：live 已落盘、
-                    // registry 尚未提交。此刻校验失败走既有 commit 失败回滚——live 恢复
-                    // 切换前内容、registry 从未变更，对外即「要么切对、要么回到原状」。
-                    FileBlobProvider::<A>::verify_live_identity_after_swap(
-                        runtime.as_ref(),
-                        store.as_ref(),
-                        registry.as_ref(),
-                        &home,
-                        &verify_account,
-                        pre_swap_identity.as_deref(),
-                    )?;
-                    registry.set_active(provider_id, &id_owned)
-                },
-            )
+                // 切换前 live 身份快照（issue #154 reviewer P2）：此刻 writer 尚未运行，
+                // live 仍是切换前内容；mismatch 回滚前用它识别「官方客户端并发写回
+                // 旧账号」特征。读失败/解析不出 → None（无法确证，不做抢救判定）。
+                let pre_swap_identity = fs::read_to_string(runtime.live_cred_path(&home))
+                    .ok()
+                    .and_then(|raw| {
+                        let meta = runtime.parse_metadata(&raw);
+                        Self::official_identity(&meta).map(str::to_string)
+                    });
+
+                let targets = vec![SwapTarget {
+                    snapshot_name: "credentials",
+                    live_path,
+                    writer: Box::new(move |p: &Path| {
+                        FileBlobProvider::<A>::write_blob(p, &target_raw)
+                    }),
+                }];
+                swap_with_snapshot_protected(
+                    provider_id,
+                    &home,
+                    &lock_dir,
+                    targets,
+                    vec![registry_file],
+                    || {
+                        // 写后回读身份校验（issue #154，spec #152 实现决策 6）：live 已落盘、
+                        // registry 尚未提交。此刻校验失败走既有 commit 失败回滚——live 恢复
+                        // 切换前内容、registry 从未变更，对外即「要么切对、要么回到原状」。
+                        FileBlobProvider::<A>::verify_live_identity_after_swap(
+                            runtime.as_ref(),
+                            store.as_ref(),
+                            registry.as_ref(),
+                            &home,
+                            &account,
+                            pre_swap_identity.as_deref(),
+                        )?;
+                        registry.set_active(provider_id, &id_owned)
+                    },
+                )
+            })
         })
         .await
         .map_err(|e| Error::provider(format!("spawn_blocking join failed: {e}")))?
@@ -707,7 +767,9 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 }
 
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
-    /// parked 账号刷新一次并写回 store。返回 `Some(新 blob)` 表示已轮换。
+    /// parked 账号刷新一次，结果经轮换写回比对提交（[`Self::commit_rotation`]，ADR-0019）：
+    /// 刷新请求在锁外，提交在交换锁内，轮换期间被切成当前账号时同步写当前登录文件。
+    /// 返回 `Some(新 blob)` 表示已轮换；本次查询照用新凭证，不论库存是否因比对不符放弃写入。
     ///
     /// DeadToken（issue #80）：复用当前账号主动续期的指纹纪律——发前若指纹在案则跳过
     /// refresh；被拒时记录指纹并停止后续重试。查询仍用现有 access token 继续（不把
@@ -724,12 +786,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         }
         match self.runtime.refresh(raw).await? {
             RefreshOutcome::Rotated(new_blob) => {
-                self.store.set(
-                    self.runtime.id(),
-                    account.id.0.as_str(),
-                    self.runtime.store_field(),
-                    &new_blob,
-                )?;
+                self.commit_rotation(account, raw, &new_blob).await?;
                 Ok(Some(new_blob))
             }
             RefreshOutcome::DeadToken => {
@@ -740,6 +797,163 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             }
             RefreshOutcome::Unsupported => Ok(None),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 轮换写回比对（ADR-0019）：网络请求在锁外完成，提交在交换锁内进行
+// ---------------------------------------------------------------------------
+
+impl<A: FileBlobRuntime> FileBlobProvider<A> {
+    /// 交换锁目录：注册表同目录，与注册表写操作、切换同一临界区。
+    fn swap_lock_dir(registry: &AccountRegistry, home: &Path) -> PathBuf {
+        registry
+            .path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.to_path_buf())
+    }
+
+    /// 轮换写回比对的异步入口：交换锁最多等 3 秒，阻塞部分放进 `spawn_blocking`。
+    /// 规则见 [`Self::commit_rotation_with`]。
+    async fn commit_rotation(
+        &self,
+        account: &Account,
+        consumed: &str,
+        rotated: &str,
+    ) -> Result<()> {
+        let runtime = self.runtime.clone();
+        let store = self.store.clone();
+        let registry = self.registry.clone();
+        let home = self.home.clone();
+        let account = account.clone();
+        let consumed = consumed.to_string();
+        let rotated = rotated.to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::commit_rotation_with(
+                runtime.as_ref(),
+                store.as_ref(),
+                registry.as_ref(),
+                &home,
+                &account,
+                &consumed,
+                &rotated,
+            )
+        })
+        .await
+        .map_err(|e| Error::provider(format!("spawn_blocking join failed: {e}")))?
+    }
+
+    /// 轮换写回比对：`consumed` 是本次轮换消耗掉的那份凭证，`rotated` 是轮换结果。
+    ///
+    /// 在交换锁内依次提交（写序先库存后 live，ADR-0002；锁内不做网络请求）：
+    /// 1. 库存凭证仍持被消耗的 refresh token 才替换，否则放弃并记 warn
+    ///    （[`Self::store_rotation_if_unchanged`]）。
+    /// 2. 该账号此刻是 registry 当前账号、当前登录文件身份是它、且仍持被消耗的 refresh token
+    ///    时，把新凭证原子写进当前登录文件；当前登录文件已经换人或已被别处更新时绝不覆盖。
+    ///
+    /// 交换锁等不到（3 秒上限）时放弃写当前登录文件，库存仍在凭证存储自身的锁下按比对
+    /// 写入并记 warn：新凭证绝不丢弃。比对只看 refresh token，不比整串。
+    ///
+    /// 借用参数、同步执行，供各写回点（停泊账号查询前轮换等）在 `spawn_blocking` 里共用。
+    fn commit_rotation_with(
+        runtime: &A,
+        store: &dyn CredentialStore,
+        registry: &AccountRegistry,
+        home: &Path,
+        account: &Account,
+        consumed: &str,
+        rotated: &str,
+    ) -> Result<()> {
+        let consumed_refresh = extract_refresh_token(consumed);
+        let committed = with_swap_lock(&Self::swap_lock_dir(registry, home), || {
+            Self::store_rotation_if_unchanged(
+                runtime,
+                store,
+                account,
+                consumed_refresh.as_deref(),
+                rotated,
+            )?;
+            if Self::live_still_holds_consumed(
+                runtime,
+                registry,
+                home,
+                account,
+                consumed_refresh.as_deref(),
+            )? {
+                Self::write_blob(&runtime.live_cred_path(home), rotated)?;
+            }
+            Ok(())
+        });
+        match committed {
+            // 超时只发生在进锁之前，锁内两步都还没执行。
+            Err(Error::SwitchLockTimeout) => {
+                tracing::warn!(
+                    account = %account.id,
+                    "swap lock busy; rotation written back to stored credentials only, live credentials untouched"
+                );
+                Self::store_rotation_if_unchanged(
+                    runtime,
+                    store,
+                    account,
+                    consumed_refresh.as_deref(),
+                    rotated,
+                )
+            }
+            other => other,
+        }
+    }
+
+    /// 库存侧比对写：在凭证存储自身的锁下读当前库存，refresh token 仍等于被消耗的那个才写入
+    /// 轮换结果；库存已被别处更新（重新授权、另一进程的轮换、回灌）就放弃并记 warn。
+    fn store_rotation_if_unchanged(
+        runtime: &A,
+        store: &dyn CredentialStore,
+        account: &Account,
+        consumed_refresh: Option<&str>,
+        rotated: &str,
+    ) -> Result<()> {
+        let written = store.set_if(
+            runtime.id(),
+            account.id.0.as_str(),
+            runtime.store_field(),
+            rotated,
+            &|current| {
+                current.is_some_and(|raw| extract_refresh_token(raw).as_deref() == consumed_refresh)
+            },
+        )?;
+        if !written {
+            tracing::warn!(
+                account = %account.id,
+                "rotation writeback skipped: stored credentials no longer hold the consumed refresh token"
+            );
+        }
+        Ok(())
+    }
+
+    /// 交换锁内重读：该账号是否仍是 registry 当前账号、当前登录文件身份是否是它、
+    /// 当前登录文件是否仍持 `consumed_refresh`。任一项不符（含 live 读不出）即 false。
+    fn live_still_holds_consumed(
+        runtime: &A,
+        registry: &AccountRegistry,
+        home: &Path,
+        account: &Account,
+        consumed_refresh: Option<&str>,
+    ) -> Result<bool> {
+        let Some(current) = registry.find(runtime.id(), &account.id)? else {
+            return Ok(false);
+        };
+        if !current.active {
+            return Ok(false);
+        }
+        let Ok(live) = fs::read_to_string(runtime.live_cred_path(home)) else {
+            return Ok(false);
+        };
+        let meta = runtime.parse_metadata(&live);
+        Ok(
+            Self::metadata_matches(&meta, &current, runtime.dedup_extra_key())
+                && extract_refresh_token(&live).as_deref() == consumed_refresh,
+        )
     }
 }
 
@@ -814,6 +1028,30 @@ mod tests {
         official_overwrite_when_live_is: Option<(String, String)>,
         /// 这些 uid 的 refresh 一律 DeadToken，便于同一 runtime 里混测「当前号轮换 / 停泊死号」。
         dead_uids: HashSet<String>,
+        /// 可暂停轮换闸门（ADR-0019）：设置后 refresh 在请求已发出时停住，等测试放行。
+        rotation_gate: Option<Arc<RotationGate>>,
+        /// `Rotate` 行为返回的轮换结果；缺省按旧规则生成 `{"uid":…,"access_token":"ROTATED"}`。
+        rotated_blob: Option<String>,
+    }
+
+    /// 可暂停轮换闸门：轮换请求发出后停住（此刻服务端已消耗本次 refresh token），
+    /// 由测试放行。竞态用例靠它构造「轮换在途 × 切换」交错，不靠 sleep 赌时序。
+    #[derive(Default)]
+    struct RotationGate {
+        sent: tokio::sync::Notify,
+        released: tokio::sync::Notify,
+    }
+
+    impl RotationGate {
+        /// 等到轮换请求已发出、停在闸门上。
+        async fn wait_sent(&self) {
+            self.sent.notified().await;
+        }
+
+        /// 放行停在闸门上的轮换。
+        fn release(&self) {
+            self.released.notify_one();
+        }
     }
 
     impl FakeRuntime {
@@ -833,6 +1071,17 @@ mod tests {
                 official_live_during_wanted: None,
                 official_overwrite_when_live_is: None,
                 dead_uids: HashSet::new(),
+                rotation_gate: None,
+                rotated_blob: None,
+            }
+        }
+
+        /// 轮换成功并返回 `rotated`，但请求发出后先停在 `gate` 上等测试放行。
+        fn with_rotation_gate(home: PathBuf, gate: Arc<RotationGate>, rotated: &str) -> Self {
+            Self {
+                rotation_gate: Some(gate),
+                rotated_blob: Some(rotated.to_string()),
+                ..Self::with_behavior(home, RefreshBehavior::Rotate)
             }
         }
 
@@ -898,6 +1147,10 @@ mod tests {
         }
         async fn refresh(&self, blob: &str) -> Result<RefreshOutcome> {
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.rotation_gate {
+                gate.sent.notify_one();
+                gate.released.notified().await;
+            }
             let uid = serde_json::from_str::<serde_json::Value>(blob)
                 .ok()
                 .and_then(|v| v.get("uid")?.as_str().map(str::to_string));
@@ -908,11 +1161,11 @@ mod tests {
                 RefreshBehavior::Unsupported => RefreshOutcome::Unsupported,
                 RefreshBehavior::Dead => RefreshOutcome::DeadToken,
                 RefreshBehavior::Rotate => {
-                    let v: serde_json::Value = serde_json::from_str(blob).unwrap_or_default();
-                    let uid = v.get("uid").and_then(|x| x.as_str()).unwrap_or_default();
-                    RefreshOutcome::Rotated(format!(
-                        r#"{{"uid":"{uid}","access_token":"ROTATED"}}"#
-                    ))
+                    RefreshOutcome::Rotated(self.rotated_blob.clone().unwrap_or_else(|| {
+                        let v: serde_json::Value = serde_json::from_str(blob).unwrap_or_default();
+                        let uid = v.get("uid").and_then(|x| x.as_str()).unwrap_or_default();
+                        format!(r#"{{"uid":"{uid}","access_token":"ROTATED"}}"#)
+                    }))
                 }
             })
         }
@@ -2635,5 +2888,285 @@ mod tests {
             names[0].starts_with("fake-"),
             "快照目录按 provider 命名: {names:?}"
         );
+    }
+
+    // --- ADR-0019：轮换写回比对与 activate 读取进锁 ---
+
+    const U1_BLOB: &str = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1"}"#;
+    const U2_BLOB: &str = r#"{"uid":"u2","refresh_token":"R2","access_token":"A2"}"#;
+    const U2_ROTATED: &str = r#"{"uid":"u2","refresh_token":"R2-NEW","access_token":"A2-NEW"}"#;
+    const U3_BLOB: &str = r#"{"uid":"u3","refresh_token":"R3","access_token":"A3"}"#;
+
+    /// u1 为当前账号（live = u1），u2、u3 停泊；u2 的轮换会停在闸门上并返回 `U2_ROTATED`。
+    fn gated_provider(tmp: &Path, gate: &Arc<RotationGate>) -> TestProvider {
+        let runtime = FakeRuntime::with_rotation_gate(tmp.join("home"), gate.clone(), U2_ROTATED);
+        let p = provider_with(tmp, runtime);
+        fs::create_dir_all(p.test_home()).unwrap();
+        p.import_raw(U1_BLOB.into(), None, Some(true)).unwrap();
+        p.import_raw(U2_BLOB.into(), None, Some(false)).unwrap();
+        p.import_raw(U3_BLOB.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+        p
+    }
+
+    fn active_ids(p: &FileBlobProvider<FakeRuntime>) -> Vec<String> {
+        p.test_list_accounts()
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.active)
+            .map(|a| a.id.0)
+            .collect()
+    }
+
+    /// 复现（spec #185 问题 1）：后台额度查询为停泊账号 u2 轮换，请求已发出时用户切到 u2。
+    /// 放行后当前登录文件与库存凭证都必须持新 refresh token；随后读取当前账号凭证
+    /// （当前账号额度查询会顺手回灌库存）不得把库存降级回已被消耗的旧 token。
+    #[tokio::test]
+    async fn parked_rotation_in_flight_then_switch_to_it_lands_new_token_in_live_and_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let p = gated_provider(tmp.path(), &gate);
+        let u2 = AccountId("u2".into());
+
+        let query = p.query_quota(&u2);
+        let switch = async {
+            gate.wait_sent().await;
+            p.activate(&u2).await.unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, switch);
+        quota.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_ROTATED,
+            "切到 u2 后，轮换结果必须同步进当前登录文件，否则官方客户端拿已作废的 R2 续期被拒"
+        );
+        assert_eq!(p.test_store_get("u2").unwrap(), U2_ROTATED);
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+
+        p.query_quota(&u2).await.unwrap();
+        assert_eq!(
+            p.test_store_get("u2").unwrap(),
+            U2_ROTATED,
+            "随后读取当前账号凭证不得把库存降级回被消耗的 R2"
+        );
+    }
+
+    /// 停泊轮换在途时切到别的账号 u3：放行后 u2 的库存持新 token，当前登录文件仍是 u3。
+    #[tokio::test]
+    async fn parked_rotation_in_flight_then_switch_elsewhere_keeps_live_and_stores_new_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let p = gated_provider(tmp.path(), &gate);
+        let u2 = AccountId("u2".into());
+
+        let query = p.query_quota(&u2);
+        let switch = async {
+            gate.wait_sent().await;
+            p.activate(&AccountId("u3".into())).await.unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, switch);
+        quota.unwrap();
+
+        assert_eq!(p.test_store_get("u2").unwrap(), U2_ROTATED);
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U3_BLOB,
+            "当前登录文件已经换人时，轮换结果绝不覆盖它"
+        );
+        assert_eq!(active_ids(&p), vec!["u3".to_string()]);
+    }
+
+    /// 轮换期间库存凭证被别处更新（这里是用户重新授权了 u2）：库存已不再持被消耗的 R2，
+    /// 写回放弃覆盖，重新授权的结果保留。
+    #[tokio::test]
+    async fn parked_rotation_writeback_yields_when_store_was_updated_meanwhile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let p = gated_provider(tmp.path(), &gate);
+        let u2 = AccountId("u2".into());
+        let reauthorized = r#"{"uid":"u2","refresh_token":"R2-REAUTH","access_token":"A2-REAUTH"}"#;
+
+        let query = p.query_quota(&u2);
+        let reauth = async {
+            gate.wait_sent().await;
+            p.replace_account_blob(&u2, reauthorized.into()).unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, reauth);
+        quota.unwrap();
+
+        assert_eq!(
+            p.test_store_get("u2").unwrap(),
+            reauthorized,
+            "库存已被别处更新：轮换写回必须放弃覆盖"
+        );
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U1_BLOB);
+    }
+
+    /// 交换锁等不到（3 秒上限）：轮换期间 u2 已被切成当前账号，提交时交换锁一直被另一处占着。
+    /// 不写当前登录文件；库存仍按比对写入新凭证，查询照常完成——新凭证不丢。
+    #[tokio::test]
+    async fn parked_rotation_commit_without_swap_lock_still_stores_new_token() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let p = gated_provider(tmp.path(), &gate);
+        let u2 = AccountId("u2".into());
+        // 交换锁在注册表同目录。
+        let lock_dir = tmp.path().to_path_buf();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let query = p.query_quota(&u2);
+        let switch_then_hold_lock = async {
+            gate.wait_sent().await;
+            p.activate(&u2).await.unwrap();
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                with_swap_lock(&lock_dir, || {
+                    held_tx.send(()).ok();
+                    release_rx.recv_timeout(Duration::from_secs(30)).ok();
+                    Ok(())
+                })
+            });
+            held_rx.await.expect("持锁线程应先进入交换锁");
+            gate.release();
+            holder
+        };
+        let (quota, holder) = tokio::join!(query, switch_then_hold_lock);
+        release_tx.send(()).ok();
+        holder.join().unwrap().unwrap();
+
+        quota.expect("交换锁等不到只影响当前登录文件，查询照常用新凭证完成");
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_BLOB,
+            "交换锁等不到时不得写当前登录文件"
+        );
+        assert_eq!(
+            p.test_store_get("u2").unwrap(),
+            U2_ROTATED,
+            "交换锁等不到时库存仍按比对写入，新凭证不丢"
+        );
+    }
+
+    /// u1 为当前账号（live = u1），u2、u3 停泊；runtime 不轮换。
+    fn three_account_provider(tmp: &Path) -> TestProvider {
+        let p = provider(tmp);
+        fs::create_dir_all(p.test_home()).unwrap();
+        p.import_raw(U1_BLOB.into(), None, Some(true)).unwrap();
+        p.import_raw(U2_BLOB.into(), None, Some(false)).unwrap();
+        p.import_raw(U3_BLOB.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+        p
+    }
+
+    /// activate 的目标凭证读取在交换锁内：在「已调用 activate(u2)、尚未拿到交换锁」这一刻，
+    /// 一次轮换提交（持交换锁写库存）把 u2 的库存换成了新凭证。activate 必须写入这份新凭证，
+    /// 而不是调用之初读到的旧库存——否则当前登录文件拿到的是已被消耗的 R2。
+    #[tokio::test]
+    async fn activate_reads_target_credentials_inside_swap_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+        let lock_dir = tmp.path().to_path_buf();
+        let creds = tmp.path().join("creds.json");
+        before_next_activate_lock(&p.test_home(), move || {
+            with_swap_lock(&lock_dir, || {
+                FileStore::new(creds).set("fake", "u2", "blob", U2_ROTATED)
+            })
+            .unwrap();
+        });
+
+        p.activate(&AccountId("u2".into())).await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_ROTATED,
+            "activate 必须写入进锁之后读到的目标凭证"
+        );
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+    }
+
+    /// 两个切换交错：在「已调用 activate(u3)、尚未拿到交换锁」这一刻，另一个切换把 u2 切成了
+    /// 当前账号，官方客户端随即为 u2 轮换出新 token 写进当前登录文件。activate(u3) 的
+    /// capture-on-leave 必须回灌这份 u2 的当前凭证，而不是调用之初看到的 u1。
+    #[tokio::test]
+    async fn interleaved_switches_capture_on_leave_keeps_intermediate_account_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+        let u2_official =
+            r#"{"uid":"u2","refresh_token":"R2-OFFICIAL","access_token":"A2-OFFICIAL"}"#;
+        let lock_dir = tmp.path().to_path_buf();
+        let live = p.test_live_path();
+        let registry_file = tmp.path().join("registry.toml");
+        before_next_activate_lock(&p.test_home(), move || {
+            with_swap_lock(&lock_dir, || {
+                fs::write(&live, u2_official)?;
+                AccountRegistry::new(registry_file).set_active("fake", &AccountId("u2".into()))
+            })
+            .unwrap();
+        });
+
+        p.activate(&AccountId("u3".into())).await.unwrap();
+
+        assert_eq!(
+            p.test_store_get("u2").unwrap(),
+            u2_official,
+            "capture-on-leave 漏掉了中间账号 u2 的当前凭证"
+        );
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U3_BLOB);
+        assert_eq!(active_ids(&p), vec!["u3".to_string()]);
+    }
+
+    /// 包一层 `CredentialStore`，`set` 恒定失败（`set_if` 走默认实现，同样落到 `set`），
+    /// 模拟回灌写不进账号库；`get`/`delete` 照常转发到内层 `FileStore`。
+    struct FailingSetStore {
+        inner: FileStore,
+    }
+
+    impl kimi_switch_core::CredentialStore for FailingSetStore {
+        fn set(&self, _provider: &str, _account: &str, _field: &str, _value: &str) -> Result<()> {
+            Err(Error::Credential("simulated store write failure".into()))
+        }
+        fn get(&self, provider: &str, account: &str, field: &str) -> Result<Option<String>> {
+            self.inner.get(provider, account, field)
+        }
+        fn delete(&self, provider: &str, account: &str, field: &str) -> Result<()> {
+            self.inner.delete(provider, account, field)
+        }
+    }
+
+    /// capture-on-leave 进锁之后失败仍只 warn、不阻断切换（ADR-0015 决策 11）。
+    #[tokio::test]
+    async fn activate_still_switches_when_capture_on_leave_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _switch_home = isolate_switch_home(tmp.path());
+        let seed = FileStore::new(tmp.path().join("creds.json"));
+        seed.set("fake", "u1", "blob", U1_BLOB).unwrap();
+        seed.set("fake", "u2", "blob", U2_BLOB).unwrap();
+        let p = FileBlobProvider::new(
+            FakeRuntime::new(tmp.path().join("home")),
+            Arc::new(FailingSetStore { inner: seed }),
+            Arc::new(AccountRegistry::new(tmp.path().join("registry.toml"))),
+        );
+        let mut u1 = fake_account("u1");
+        u1.active = true;
+        p.test_registry_upsert(u1).unwrap();
+        p.test_registry_upsert(fake_account("u2")).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        // live 里的 u1 已被官方轮换过，capture-on-leave 要回灌它，但账号库写不进去。
+        let u1_live = r#"{"uid":"u1","refresh_token":"R1-OFFICIAL","access_token":"A1-OFFICIAL"}"#;
+        fs::write(p.test_live_path(), u1_live).unwrap();
+
+        p.activate(&AccountId("u2".into()))
+            .await
+            .expect("capture-on-leave 失败只 warn，不阻断切换");
+
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
     }
 }
