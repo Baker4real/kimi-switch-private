@@ -2179,7 +2179,6 @@ dependencies = [
  "clap",
  "dialoguer",
  "directories",
- "fs2",
  "kimi-switch-core",
  "kimi-switch-kimi",
  "serde",

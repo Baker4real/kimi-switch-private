@@ -11,7 +11,6 @@ documents:
     - passive_trace
     - overlay_exhausted_snapshot
     - decide_auto_swap_passive_from_state
-    - PassiveSwapLock
     - install_hook_into
     - locally_invalid_accounts
 ---
@@ -86,6 +85,11 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
    这把锁时，[提交, 写冷却] 间隙里迟到的触发会把 403 证据错按在新当前账号上再切一跳。
    **#193 起「重读当前账号」由 ADR-0020「期望当前账号」取代：切换带着决定时的当前账号作
    前置条件，在交换锁内比对，重读与拿锁之间插进来的手动切换不再漏过；被动锁内重读冷却保留。**
+   **#194 起本锁的范围与名称修订：移入 core（`AutoSwapLock`），扩为 GUI 快照编排、CLI status
+   自动切换与被动触发共用的「自动切换串行化锁」，文件名 `passive-swap.lock` 不变。锁顺序
+   明确为本锁 → 交换锁（持本锁调用 activate，activate 内再拿交换锁）；冷却与手动保持期在锁内
+   读，被动触发撞上轮询切换的 [提交, 写冷却] 间隙也只切一次；手动切换不拿本锁。见 ADR-0020
+   「自动切换串行化锁」。**
 
 8. **hook 安装只经 CLI `install-hook` 子命令，幂等、可卸载（#162，spec 决策 16）。** 向
    Kimi Code 工作目录（`KIMI_CODE_HOME` > `~/.kimi-code`）的 `config.toml` 写入 `[[hooks]]`
@@ -262,7 +266,9 @@ overloaded、403 的非配额文案、没有状态信号的耗尽文案。原决
      之后重读，发现并发切换已抢先），以及判定本身的跳过原因（`cooldown`、
      `no_eligible_candidate` 等，与 CLI `--json` 的 skip reason 同名）。**#193 起
      `superseded` 来自交换锁内的期望当前账号比对（决定之后已有手动或别的切换抢先）或被动锁内
-     重读到冷却，见 ADR-0020「期望当前账号」。**
+     重读到冷却，见 ADR-0020「期望当前账号」。** **#194 起 `busy` 指 3 秒内没拿到自动切换
+     串行化锁：另一次自动切换（被动触发、GUI 快照编排或 CLI status）正在进行，这次让给它，
+     耗尽账本也不记，见 ADR-0020「自动切换串行化锁」。**
    - `result`：`swap_failed` 与 `error` 记 `error`，其余记 `ok`。
 
    例：`hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429

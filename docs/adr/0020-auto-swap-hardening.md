@@ -2,8 +2,8 @@
 type: adr
 title: 自动切换侧加固：判定口径与并发收敛
 status: accepted
-tags: [auto-swap, past-reset, earliest-recovery, passive-swap, quota-cache, exhaustion-ledger, expected-current-account]
-intent: Record the auto-swap side of spec 185 (implementation decisions D-F), one section per ticket; the credential side (A-C) lives in ADR-0019. Past reset (issue 191, decision E) - when deciding, a quota window whose reset_at is at or before now counts as already reset (used 0, limit unchanged, next reset unknown) for the current and parked accounts alike, across the exhaustion trigger, candidate eligibility, candidate margin, resident return, burn candidates and burn return; pace and the burn trigger already skipped passed resets, the burn-return flip still needs a later reset_at, and prefer_soonest_reset no longer ranks a passed reset_at first (amends ADR-0011 decision 2). The passive overlay applies the same view to its cached base under one shared now, so the authoritative exhausted window survives (amends ADR-0017 decision 5). The passive path reads the quota cache through get_keeping_past_resets so accounts whose windows have all passed keep a snapshot. The earliest-recovery hint returns only future times through earliest_recovery_at, shared by the GUI toast and the CLI line and JSON. Nothing writes the quota cache or changes displayed numbers; no new network request, config key or state field. Exhaustion ledger (issue 192, decision D) - with the master switch on, the passive path records the current account's exhaustion (account, window, observed_at, recovers_at) into the exhaustion_ledger field of auto_swap.json through record_exhaustion, inside the passive lock before the decision and whatever it decides; recovers_at is the cached reset_at of that window when later than observed_at, else observed_at plus 5 hours, 7 days or 31 days (unrecognized windows count as 5 hours). A record is in effect while recovers_at is in the future and the account has no usable snapshot fetched after observed_at; in-effect accounts join the locally invalid ones as excluded parked candidates on every automatic path, so past reset cannot re-admit a just-exhausted account (spec decision E), the current account gets no extra trigger, and manual swap ignores the ledger. earliest_recovery_at takes the state file path and also returns in-effect recovery times; every state write prunes records whose recovery has passed; the quota cache stays untouched (amends ADR-0017 decision 5). Expected current account (issue 193, decision F) - automatic swaps call Provider::activate_if_current with the account current at decision time; inside the swap lock, before reading credentials or writing live, the engine re-reads the registry current mark and returns ActivateOutcome::Superseded on mismatch (no live, registry or snapshot write, no rollback, not an error). GUI snapshot orchestration, CLI status auto-swap (exit 2, reason superseded) and the passive path (trace superseded, exit 0) treat it as no swap: no audit, cooldown, round-trip memory, toast or resident-confirm reset. It replaces the post-decision current-account re-read (amends ADR-0017 decision 7); the GUI pending-auth re-read and the passive in-lock cooldown re-read stay; manual swap keeps the unconditioned activate.
+tags: [auto-swap, past-reset, earliest-recovery, passive-swap, quota-cache, exhaustion-ledger, expected-current-account, auto-swap-lock]
+intent: Record the auto-swap side of spec 185 (implementation decisions D-F), one section per ticket; the credential side (A-C) lives in ADR-0019. Past reset (issue 191, decision E) - when deciding, a quota window whose reset_at is at or before now counts as already reset (used 0, limit unchanged, next reset unknown) for the current and parked accounts alike, across the exhaustion trigger, candidate eligibility, candidate margin, resident return, burn candidates and burn return; pace and the burn trigger already skipped passed resets, the burn-return flip still needs a later reset_at, and prefer_soonest_reset no longer ranks a passed reset_at first (amends ADR-0011 decision 2). The passive overlay applies the same view to its cached base under one shared now, so the authoritative exhausted window survives (amends ADR-0017 decision 5). The passive path reads the quota cache through get_keeping_past_resets so accounts whose windows have all passed keep a snapshot. The earliest-recovery hint returns only future times through earliest_recovery_at, shared by the GUI toast and the CLI line and JSON. Nothing writes the quota cache or changes displayed numbers; no new network request, config key or state field. Exhaustion ledger (issue 192, decision D) - with the master switch on, the passive path records the current account's exhaustion (account, window, observed_at, recovers_at) into the exhaustion_ledger field of auto_swap.json through record_exhaustion, inside the passive lock before the decision and whatever it decides; recovers_at is the cached reset_at of that window when later than observed_at, else observed_at plus 5 hours, 7 days or 31 days (unrecognized windows count as 5 hours). A record is in effect while recovers_at is in the future and the account has no usable snapshot fetched after observed_at; in-effect accounts join the locally invalid ones as excluded parked candidates on every automatic path, so past reset cannot re-admit a just-exhausted account (spec decision E), the current account gets no extra trigger, and manual swap ignores the ledger. earliest_recovery_at takes the state file path and also returns in-effect recovery times; every state write prunes records whose recovery has passed; the quota cache stays untouched (amends ADR-0017 decision 5). Expected current account (issue 193, decision F) - automatic swaps call Provider::activate_if_current with the account current at decision time; inside the swap lock, before reading credentials or writing live, the engine re-reads the registry current mark and returns ActivateOutcome::Superseded on mismatch (no live, registry or snapshot write, no rollback, not an error). GUI snapshot orchestration, CLI status auto-swap (exit 2, reason superseded) and the passive path (trace superseded, exit 0) treat it as no swap: no audit, cooldown, round-trip memory, toast or resident-confirm reset. It replaces the post-decision current-account re-read (amends ADR-0017 decision 7); the GUI pending-auth re-read and the passive in-lock cooldown re-read stay; manual swap keeps the unconditioned activate. Auto-swap serialization lock (issue 194, decision F) - the passive lock moves into core as AutoSwapLock and now serializes every automatic trigger (GUI snapshot orchestration, CLI status auto-swap, passive), keeping the lock file name passive-swap.lock under the state dir so mixed GUI and hook CLI versions still queue together; lock order is this lock then the swap lock, the wait limit is 3 seconds, and the GUI waits through spawn_blocking. Each trigger re-reads the auto-swap state (cooldown and manual hold included), decides, activates with the expected current account and writes cooldown inside the lock, so a trigger arriving in another's commit-to-cooldown gap no longer swaps a second time. A busy lock skips the GUI round silently, makes CLI status stay with exit 2 and reason busy, and leaves passive trace busy with exit 0 and no ledger record; the exhaustion ledger write stays inside the lock, the passive post-decision cooldown re-read stays for older processes, and manual swap never takes this lock (amends ADR-0017 decision 7 scope and name).
 documents:
   symbols:
     - reset_passed_windows
@@ -15,6 +15,10 @@ documents:
     - decide_resident_return
     - activate_if_current
     - ActivateOutcome
+    - AutoSwapLock
+    - auto_swap_lock_file
+    - apply_status_auto_swap
+    - apply_snapshot_auto_swap
 ---
 # 自动切换侧加固：判定口径与并发收敛
 
@@ -291,3 +295,94 @@ GUI 很久没开时，额度缓存停在上次真实查询的结果。缓存里 
   在被动 activate 之前插入一次真实手动切换：手动选的账号保住，没有切换审计和冷却，留痕
   `decision=stay reason=superseded`，观察型内核不向上报错）。
 - 手动切换不经前置条件，既有切换用例保持绿。
+
+## 自动切换串行化锁（#194，spec #185 决策 F）
+
+#162 给被动触发加了一把排他文件锁 `<state_dir>/passive-swap.lock`（ADR-0017 决策 7），
+只让被动触发彼此排队。GUI 快照编排与 CLI `status` 自动切换不拿它，冷却也在锁外读，
+[提交, 写冷却] 间隙对它们仍然敞开：CLI `status` 刚把已耗尽的 alice 切到 bob、冷却还没写，
+alice 会话的配额失败 hook 恰在此刻到达。被动触发拿到被动锁，重读账号库时当前账号已是
+bob，冷却又读不到，于是把耗尽证据按在 bob 头上，再切一跳到 carol。期望当前账号（#193）
+挡不住这一跳：被动触发是在 bob 提交之后才判定的，判定时的当前账号就是 bob，交换锁内比对
+一致。CLI 端到端复现用例先红（停在 carol，两条切换审计）。
+
+### 决策
+
+1. **一把锁覆盖全部自动触发。** core 新增 `AutoSwapLock`（`crates/core/src/auto_swap_lock.rs`），
+   取代 CLI 私有的 `PassiveSwapLock`。GUI 快照编排（`apply_snapshot_auto_swap`）、CLI `status`
+   自动切换（`apply_status_auto_swap`）与被动触发都在锁内走完「重读自动切换状态 → 判定 →
+   带期望当前账号的切换 → 写冷却、往返记忆与回驻确认计数」。后到的触发在锁内看到前一个
+   持锁者刚写下的冷却，自然落空。总开关关闭时不拿锁；GUI 有进行中的设备码授权时也不拿。
+
+2. **文件名不变。** 锁文件仍是 `<state_dir>/passive-swap.lock`
+   （`AppPaths::auto_swap_lock_file`）。GUI 与 hook 所调的 release CLI 不一定同时更新，文件
+   同名，新旧版本的被动触发才继续在同一个文件上排队；改名还要迁移。规范名改为「自动切换
+   串行化锁」，文件名是历史遗留。
+
+3. **锁顺序与等待。** 固定为本锁 → 交换锁：自动触发先拿本锁，再在 activate 里拿交换锁；
+   手动切换只拿交换锁，不会反过来等本锁，构不成死锁环。等待上限对齐交换锁的 3 秒。打不开
+   或锁不上的 IO 故障同样当作拿不到，记一条 warn：宁可这一轮不切，也不在锁外判定。临界区里
+   没有网络请求：额度查询在拿锁之前完成，锁内只读写本地文件。
+
+4. **冷却与手动保持期在锁内读。** `apply_status_auto_swap` 与 `apply_snapshot_auto_swap`
+   不再接收调用方事先读好的这两个值，改收一个拿锁闭包，进锁后自己从状态文件读；往返记忆、
+   回驻确认计数与耗尽账本本就由 `decide_*_from_state` 在判定时读。调用方没法再在锁外读状态。
+
+5. **拿不到锁就是另一次自动切换正在进行，各调用方按自己的「不切」口径放弃。**
+   - GUI 快照编排：本轮静默跳过，不判定、不弹 toast、不写审计与状态，下一轮快照照常重试。
+     等锁放进 `spawn_blocking`，不占异步运行时线程，界面不因等锁卡住。
+   - CLI `status`：按不切换处理，与 `superseded` 同口径：退出码 2，`--json` 输出 `stay` 事件，
+     原因 `busy`；没有说明行和审计，不写状态。
+   - 被动触发：留痕 `decision=stay reason=busy`，入口退出码照旧恒为 0。
+
+6. **耗尽账本仍在锁内写。** `record_exhaustion` 照旧在拿到锁之后、判定之前写（「耗尽账本」
+   决策 2），只是锁换成了本锁。被动触发 busy 时不记账本。
+
+7. **被动路径决定之后的冷却重读保留。** 同版本的 GUI 与 CLI `status` 已在同一把锁里排队，
+   这道重读拦不到它们；它留给不拿本锁的旧版本 GUI 或 CLI `status`，代价是一次本地读。
+
+8. **手动切换不拿本锁。** `swap` 等手动路径只拿交换锁，自动触发持锁期间照常立刻完成，仍然
+   零网络、不依赖额度查询。手动切换与自动切换之间的竞态由期望当前账号在交换锁内处理。
+
+9. **残留：迟到的被动触发。** hook 事件不带账号身份。另一次自动切换已经写完冷却、放了锁，
+   被动触发才到，就会把耗尽记在新的当前账号头上：冷却挡住了切换，耗尽账本却照「无论切不切」
+   给它记了一条。它此刻是当前账号，不受影响；在下一次真实查询拿到它的可用快照、或到恢复时刻
+   之前，它被切走后不作停泊候选。本锁只保证同时到达的触发不在 [提交, 写冷却] 间隙里判定，
+   收不掉这种情形。
+
+本节**修订 ADR-0017 决策 7** 的范围与名称：被动串行化锁扩为全部自动触发共用的自动切换
+串行化锁，文件名不变。本 ADR 前文「耗尽账本」决策 2 与「期望当前账号」中的「被动串行化锁」
+「被动锁」，从本节起读作自动切换串行化锁。
+
+### 被拒方案
+
+- **只在锁内包住 activate，冷却与保持期仍由调用方事先读好传进来**：后到者拿着进锁之前读的
+  旧冷却判定，看不见前一个持锁者刚写下的冷却，竞态原样保留。
+- **拿锁留在调用方外层，`apply_*` 签名不变**：每个调用方都得记得在锁内读冷却与保持期，
+  busy 的处理也落在测不到的薄壳里。拿锁作为参数收进编排，锁内重读与 busy 口径在既有注入
+  接缝上就能测。
+- **另开新锁文件（如 `auto-swap.lock`）**：版本不一致的 GUI 与 hook 所调 CLI 不再互相排队，
+  旧文件也要清理。
+- **不等待，拿不到立即放弃**：前一个持锁者只是判定不切（冷却中、没有合格候选）时，后到的
+  被动触发本可以照常判定，立即放弃就白白丢掉一次权威证据。临界区只有本地读写和一次切换，
+  通常远不到 3 秒。
+- **手动切换也拿本锁**：手动切换要立刻生效，让它最多等自动切换 3 秒只多一段延迟。手动与自动
+  之间的竞态已由期望当前账号在交换锁内处理。
+
+### 验收
+
+- core（`crates/core/src/auto_swap_lock.rs` 测试）：`lock_file_keeps_the_passive_lock_path`
+  （路径仍是 `<state_dir>/passive-swap.lock`，与状态文件同目录）、
+  `acquire_async_waits_off_the_runtime_thread`（等锁不占运行时线程）。
+- CLI（`crates/cli/src/main.rs` 测试）：端到端 `status_and_passive_concurrent_triggers_swap_exactly_once`
+  （修复前为红；tempdir 入口、真实 activate：status 把耗尽的 alice 切到 bob，被动触发在
+  [提交, 写冷却] 间隙到达，等满 3 秒后以 busy 放弃；恰好一次切换、一条切换审计，留痕
+  `decision=stay reason=busy`，耗尽账本无记录，观察型内核不向上报错）；
+  `status_auto_swap_lock_busy_is_stay_without_side_effects`（退出码 2、`--json` 原因 `busy`、
+  无审计、不写状态）；`status_auto_swap_rereads_cooldown_after_taking_lock`（等锁期间写下的
+  冷却在锁内看得见）；`manual_swap_ignores_auto_swap_lock`（持锁期间手动切换照常完成）。
+- GUI 注入（`crates/gui/src/lib.rs` 测试）：`snapshot_auto_swap_lock_busy_skips_round_then_retries`
+  （busy 轮无 toast、无审计、不写状态，下一轮照常切换）、
+  `snapshot_auto_swap_rereads_cooldown_after_taking_lock`。
+- 既有用例保持绿：`passive_concurrent_triggers_converge_without_oscillation`（5 触发恰 1 切）
+  与各留痕、额度缓存字节不变用例。
