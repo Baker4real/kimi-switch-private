@@ -16,10 +16,10 @@ use kimi_switch_core::{
     official_nickname_known, persist_auto_swap_opt_out, prettify_membership,
     read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
     set_manual_hold_until, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
-    ActivateOutcome, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn,
-    AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota,
-    QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState,
-    QuotaWindow, RemovedAccounts, StartupCheckOutcome, WEB_STORE_FIELD,
+    ActivateOutcome, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapLock,
+    AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore,
+    Provider, Quota, QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot,
+    QuotaState, QuotaWindow, RemovedAccounts, StartupCheckOutcome, WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
@@ -236,7 +236,8 @@ impl Backend {
             .unwrap_or_default()
     }
 
-    /// collect 完成后串行判定；`pending_auth` 或开关关则不读冷却、不 activate。
+    /// collect 完成后串行判定；`pending_auth` 或开关关则不拿锁、不读冷却、不 activate。
+    /// 自动切换串行化锁经 `spawn_blocking` 等待，不占住异步运行时线程。
     async fn maybe_run_snapshot_auto_swap(
         &self,
         accounts: &[Account],
@@ -252,9 +253,7 @@ impl Backend {
         let Ok(paths) = AppPaths::resolve() else {
             return AutoSwapSnapshotEffect::none();
         };
-        let state_path = paths.auto_swap_state_file();
-        let last = read_last_auto_swap_at(&state_path);
-        let hold = read_manual_hold_until(&state_path);
+        let lock_path = paths.auto_swap_lock_file();
         let kimi = self.kimi.clone();
         apply_snapshot_auto_swap(
             &settings,
@@ -262,13 +261,12 @@ impl Backend {
             accounts,
             snapshots,
             Utc::now(),
-            last,
-            hold,
+            move || AutoSwapLock::acquire_async(lock_path),
             move |to, expected_current| async move {
                 kimi.activate_if_current(&to, &expected_current).await
             },
             &self.audit,
-            &state_path,
+            &paths.auto_swap_state_file(),
         )
         .await
     }
@@ -1181,31 +1179,41 @@ impl AutoSwapSnapshotEffect {
     }
 }
 
-/// collect 完成后的自动切换编排。`pending_auth` 或开关关闭立即返回；activate 失败不写冷却。
+/// collect 完成后的自动切换编排，整段在自动切换串行化锁内（ADR-0020）：拿锁 → 重读状态 →
+/// 判定 → 带期望当前账号的切换 → 写冷却。`pending_auth` 或开关关闭立即返回，不拿锁。`serialize`
+/// 拿锁，3 秒等不到（另一自动触发正在切换）时本轮静默跳过：不判定、不 toast、不审计、不写状态，
+/// 下一轮快照照常重试。冷却与手动保持期在拿到锁之后才读，往返记忆、回驻确认计数与耗尽账本由
+/// 判定自己从状态文件读，前一个持锁者刚写下的状态因此都看得见。activate 失败不写冷却。
 /// 决定之后、真正 activate 之前再读 pending：设备码授权已开始则放弃（不 toast、不审计、不写冷却）。
 /// `activate(目标, 期望当前账号)` 是带前置条件的切换（期望当前账号，ADR-0020），期望当前账号取
 /// 决定时的当前账号；返回「已被取代」（用户已手动抢先切换）同样放弃，不 toast、不审计、不写冷却。
 /// 耗尽判定 Stay 时再评估回驻（issue #95 / ADR-0008）；回驻无目标静默，activate 失败同样不写冷却。
-pub(crate) async fn apply_snapshot_auto_swap<F, Fut, P>(
+pub(crate) async fn apply_snapshot_auto_swap<L, LFut, G, F, Fut, P>(
     auto_swap: &kimi_switch_core::settings::AutoSwap,
     pending_auth: P,
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
     now: DateTime<Utc>,
-    last_auto_swap_at: Option<DateTime<Utc>>,
-    manual_hold_until: Option<DateTime<Utc>>,
+    serialize: L,
     activate: F,
     audit: &AuditLog,
     state_path: &Path,
 ) -> AutoSwapSnapshotEffect
 where
     P: Fn() -> bool,
+    L: FnOnce() -> LFut,
+    LFut: std::future::Future<Output = Option<G>>,
     F: FnOnce(AccountId, AccountId) -> Fut,
     Fut: std::future::Future<Output = kimi_switch_core::Result<ActivateOutcome>>,
 {
     if pending_auth() || !auto_swap.enabled {
         return AutoSwapSnapshotEffect::none();
     }
+    let Some(_serialized) = serialize().await else {
+        return AutoSwapSnapshotEffect::none();
+    };
+    let last_auto_swap_at = read_last_auto_swap_at(state_path);
+    let manual_hold_until = read_manual_hold_until(state_path);
     match decide_auto_swap_from_state(
         state_path,
         accounts,
@@ -1661,8 +1669,7 @@ mod pending_lifecycle_tests {
                 auto_swap_ready("bob", 10, 100, now),
             ],
             now,
-            None,
-            None,
+            || std::future::ready(Some(())),
             |_to, _expected| async { panic!("有效期内不得自动切换") },
             &audit,
             &state,
@@ -1683,8 +1690,7 @@ mod pending_lifecycle_tests {
                 auto_swap_ready("bob", 10, 100, now),
             ],
             now,
-            None,
-            None,
+            || std::future::ready(Some(())),
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {

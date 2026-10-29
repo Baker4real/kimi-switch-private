@@ -2096,6 +2096,11 @@ mod tests {
         serde_json::from_str(raw.trim()).unwrap()
     }
 
+    /// 自动切换串行化锁的替身：立即拿到锁。
+    fn unlocked() -> std::future::Ready<Option<()>> {
+        std::future::ready(Some(()))
+    }
+
     /// 开关关闭：不 activate、不写审计、不碰冷却文件。
     #[tokio::test]
     async fn snapshot_auto_swap_disabled_has_no_side_effects() {
@@ -2113,8 +2118,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { panic!("disabled 不得 activate") },
             &audit,
             &state,
@@ -2141,8 +2145,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { panic!("pending_auth 不得 activate") },
             &audit,
             &state,
@@ -2175,8 +2178,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2242,8 +2244,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2298,8 +2299,7 @@ mod tests {
                 auto_swap_ready_at("bob", 80, 100, Some(near)),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2368,8 +2368,7 @@ mod tests {
                 auto_swap_ready_at("bob", 10, 100, Some(flipped)),
             ],
             auto_swap_now(),
-            kimi_switch_core::read_last_auto_swap_at(&state),
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2440,8 +2439,7 @@ mod tests {
                 auto_swap_ready("carol", 1, 100),
             ],
             auto_swap_now(),
-            kimi_switch_core::read_last_auto_swap_at(&state),
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2493,8 +2491,7 @@ mod tests {
                 auto_swap_ready("carol", 20, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2535,8 +2532,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2576,8 +2572,7 @@ mod tests {
             &[auto_swap_acc("alice", true), bob.clone()],
             &[alice_snap.clone(), bob_snap.clone()],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { panic!("确认期未满不得 activate") },
             &audit,
             &state,
@@ -2601,8 +2596,7 @@ mod tests {
             &[auto_swap_acc("alice", true), bob],
             &[alice_snap, bob_snap],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
@@ -2635,7 +2629,7 @@ mod tests {
     }
 
     /// 手动保持期（issue #95 / ADR-0008）：手动切换后的 8 小时内不回驻——
-    /// 无 toast、无审计、不碰状态文件（耗尽路径不受影响，另行覆盖）。
+    /// 无 toast、无审计、状态文件只留手动保持期（耗尽路径不受影响，另行覆盖）。
     #[tokio::test]
     async fn snapshot_resident_return_blocked_by_manual_hold() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2647,14 +2641,18 @@ mod tests {
         alice_snap.membership = Some("LEVEL_ADVANCED".into());
         let mut bob_snap = auto_swap_ready("bob", 20, 100);
         bob_snap.membership = Some("LEVEL_INTERMEDIATE".into());
+        kimi_switch_core::set_manual_hold_until(
+            &state,
+            auto_swap_now() + chrono::Duration::hours(1),
+        );
+        let state_before = std::fs::read(&state).unwrap();
         let effect = apply_snapshot_auto_swap(
             &settings,
             || false,
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[alice_snap, bob_snap],
             auto_swap_now(),
-            None,
-            Some(auto_swap_now() + chrono::Duration::hours(1)),
+            unlocked,
             |_to, _expected| async { panic!("保持期内不得回驻") },
             &audit,
             &state,
@@ -2662,7 +2660,11 @@ mod tests {
         .await;
         assert!(effect.message.is_none());
         assert!(!effect.swapped);
-        assert!(!state.exists());
+        assert_eq!(
+            std::fs::read(&state).unwrap(),
+            state_before,
+            "保持期内不碰状态文件"
+        );
         assert!(!audit.path().exists());
     }
 
@@ -2681,8 +2683,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { Err(kimi_switch_core::Error::provider("disk full")) },
             &audit,
             &state,
@@ -2720,8 +2721,7 @@ mod tests {
                 auto_swap_ready("bob", 99, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
@@ -2777,8 +2777,7 @@ mod tests {
                 auto_swap_ready_at("bob", 99, 100, Some(early)),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
@@ -2820,8 +2819,7 @@ mod tests {
                 auto_swap_ready_at("bob", 100, 100, Some(passed)),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
@@ -2850,8 +2848,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |_to, _expected| async { panic!("过期决策不得 activate") },
             &audit,
             &state,
@@ -2882,8 +2879,7 @@ mod tests {
                 auto_swap_ready("bob", 10, 100),
             ],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             move |to: AccountId, expected: AccountId| {
                 *requested_cb.lock().unwrap() = Some((to.0, expected.0));
                 async { Ok(ActivateOutcome::Superseded) }
@@ -2923,8 +2919,7 @@ mod tests {
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[alice_snap, bob_snap],
             auto_swap_now(),
-            None,
-            None,
+            unlocked,
             |to, expected| async move {
                 assert_eq!((to.0.as_str(), expected.0.as_str()), ("bob", "alice"));
                 Ok(ActivateOutcome::Superseded)
@@ -2947,6 +2942,90 @@ mod tests {
             Some(1),
             "已被取代不走成功收尾，确认计数保持判定时写下的值"
         );
+    }
+
+    /// 自动切换串行化锁（issue #194 / ADR-0020）：另一自动触发（hook 唤起的被动切换或 CLI
+    /// status）正持锁，3 秒等不到 → 本轮静默跳过：不判定、不 activate、不 toast、不审计、不写
+    /// 状态，也不报错；下一轮快照照常重试，拿到锁即正常切换。
+    #[tokio::test]
+    async fn snapshot_auto_swap_lock_busy_skips_round_then_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let accounts = [auto_swap_acc("alice", true), auto_swap_acc("bob", false)];
+        let snapshots = [
+            auto_swap_ready("alice", 99, 100),
+            auto_swap_ready("bob", 10, 100),
+        ];
+
+        let busy = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            &accounts,
+            &snapshots,
+            auto_swap_now(),
+            || std::future::ready(None::<()>),
+            |_to, _expected| async { panic!("拿不到锁不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(busy.message.is_none(), "拿不到锁不弹 toast");
+        assert!(!busy.swapped);
+        assert!(!state.exists(), "拿不到锁不写状态");
+        assert!(!audit.path().exists(), "拿不到锁不留审计");
+
+        let next = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            &accounts,
+            &snapshots,
+            auto_swap_now(),
+            unlocked,
+            |to, _expected| async move {
+                assert_eq!(to.0, "bob");
+                Ok(ActivateOutcome::Activated)
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(next.swapped, "下一轮拿到锁照常切换");
+        assert_eq!(last_audit(audit.path()).account.as_deref(), Some("bob"));
+    }
+
+    /// 锁内重读状态（ADR-0020）：一轮额度查询要好几秒，等锁期间 hook 唤起的被动切换刚切完并
+    /// 写下冷却。拿到锁之后的判定读到这份冷却，本轮不切换、不 toast、不审计。
+    #[tokio::test]
+    async fn snapshot_auto_swap_rereads_cooldown_after_taking_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            || {
+                // 前一个持锁者释放锁之前写下的冷却。
+                kimi_switch_core::write_last_auto_swap_at(
+                    &state,
+                    auto_swap_now() - chrono::Duration::seconds(1),
+                );
+                std::future::ready(Some(()))
+            },
+            |_to, _expected| async { panic!("冷却中不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.message.is_none(), "冷却中不弹 toast");
+        assert!(!effect.swapped);
+        assert!(!audit.path().exists(), "冷却中不留切换审计");
     }
 
     /// 成功 auto-swap toast 优先于同一次 snapshot 里的「刚刚更新过」。

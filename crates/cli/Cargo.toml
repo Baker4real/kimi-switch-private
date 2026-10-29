@@ -32,8 +32,6 @@ toml_edit.workspace = true
 chrono.workspace = true
 # Kimi Code 工作目录解析（只读镜像 provider 侧 kimi_home，install-hook 用）。
 directories.workspace = true
-# 被动触发串行化锁（on-quota-failure 并发收敛，issue #162；与交换锁同款机制）。
-fs2.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
