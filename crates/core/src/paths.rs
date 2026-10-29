@@ -99,6 +99,13 @@ impl AppPaths {
         self.state_dir.join("auto_swap.json")
     }
 
+    /// 自动切换串行化锁：`<state_dir>/passive-swap.lock`（[`crate::auto_swap_lock`]）。
+    ///
+    /// 全部自动触发共用；文件名沿用 #162 被动串行化锁的旧名，免迁移。
+    pub fn auto_swap_lock_file(&self) -> PathBuf {
+        self.state_dir.join(crate::auto_swap_lock::LOCK_FILE_NAME)
+    }
+
     /// 用户显式删除过的账号墓碑：`<config_dir>/removed.json`。
     /// 默认入口自动导入会跳过这些 id，直到 `kimi-switch login` 再导入。
     pub fn removed_file(&self) -> PathBuf {

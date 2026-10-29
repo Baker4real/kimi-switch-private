@@ -3,6 +3,7 @@
 pub mod account_registry;
 pub mod audit;
 pub mod auto_swap;
+pub mod auto_swap_lock;
 pub mod auto_swap_opt_out;
 pub mod credential_health;
 pub mod defaults;
@@ -34,6 +35,7 @@ pub use auto_swap::{
     write_last_auto_swap_at, write_resident_confirm_counts, AutoSwapDecision, AutoSwapKind,
     AutoSwapReturn, AutoSwapSkipReason, AutoSwapTarget, BurnTrip,
 };
+pub use auto_swap_lock::AutoSwapLock;
 pub use auto_swap_opt_out::{
     account_auto_swap_opt_out, auto_swap_opt_out_from_extra, persist_auto_swap_opt_out,
     write_auto_swap_opt_out_extra, EXTRA_AUTO_SWAP_OPT_OUT,
