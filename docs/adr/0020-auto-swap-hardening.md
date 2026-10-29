@@ -2,8 +2,8 @@
 type: adr
 title: 自动切换侧加固：判定口径与并发收敛
 status: accepted
-tags: [auto-swap, past-reset, earliest-recovery, passive-swap, quota-cache]
-intent: Record the auto-swap side of spec 185 (implementation decisions D-F), one section per ticket; the credential side (A-C) lives in ADR-0019. Past reset (issue 191, decision E) - when deciding, a quota window whose reset_at is at or before now counts as already reset (used 0, limit unchanged, next reset unknown) for the current and parked accounts alike, across the exhaustion trigger, candidate eligibility, candidate margin, resident return, burn candidates and burn return; pace and the burn trigger already skipped passed resets, the burn-return flip still needs a later reset_at, and prefer_soonest_reset no longer ranks a passed reset_at first (amends ADR-0011 decision 2). The passive overlay applies the same view to its cached base under one shared now, so the authoritative exhausted window survives (amends ADR-0017 decision 5). The passive path reads the quota cache through get_keeping_past_resets so accounts whose windows have all passed keep a snapshot. The earliest-recovery hint returns only future times through earliest_recovery_at, shared by the GUI toast and the CLI line and JSON. Nothing writes the quota cache or changes displayed numbers; no new network request, config key or state field.
+tags: [auto-swap, past-reset, earliest-recovery, passive-swap, quota-cache, expected-current-account]
+intent: Record the auto-swap side of spec 185 (implementation decisions D-F), one section per ticket; the credential side (A-C) lives in ADR-0019. Past reset (issue 191, decision E) - when deciding, a quota window whose reset_at is at or before now counts as already reset (used 0, limit unchanged, next reset unknown) for the current and parked accounts alike, across the exhaustion trigger, candidate eligibility, candidate margin, resident return, burn candidates and burn return; pace and the burn trigger already skipped passed resets, the burn-return flip still needs a later reset_at, and prefer_soonest_reset no longer ranks a passed reset_at first (amends ADR-0011 decision 2). The passive overlay applies the same view to its cached base under one shared now, so the authoritative exhausted window survives (amends ADR-0017 decision 5). The passive path reads the quota cache through get_keeping_past_resets so accounts whose windows have all passed keep a snapshot. The earliest-recovery hint returns only future times through earliest_recovery_at, shared by the GUI toast and the CLI line and JSON. Nothing writes the quota cache or changes displayed numbers; no new network request, config key or state field. Expected current account (issue 193, decision F) - automatic swaps call Provider::activate_if_current with the account current at decision time; inside the swap lock, before reading credentials or writing live, the engine re-reads the registry current mark and returns ActivateOutcome::Superseded on mismatch (no live, registry or snapshot write, no rollback, not an error). GUI snapshot orchestration, CLI status auto-swap (exit 2, reason superseded) and the passive path (trace superseded, exit 0) treat it as no swap: no audit, cooldown, round-trip memory, toast or resident-confirm reset. It replaces the post-decision current-account re-read (amends ADR-0017 decision 7); the GUI pending-auth re-read and the passive in-lock cooldown re-read stay; manual swap keeps the unconditioned activate.
 documents:
   symbols:
     - reset_passed_windows
@@ -12,6 +12,8 @@ documents:
     - get_keeping_past_resets
     - decide_auto_swap
     - decide_resident_return
+    - activate_if_current
+    - ActivateOutcome
 ---
 # 自动切换侧加固：判定口径与并发收敛
 
@@ -122,3 +124,88 @@ GUI 很久没开时，额度缓存停在上次真实查询的结果。缓存里 
   内核不向上报错（入口恒退出码 0）。
 - 提示同口径：CLI `status_auto_swap_no_candidate_skips_passed_reset`（说明行与
   `earliestReset`）、GUI `snapshot_auto_swap_no_candidate_skips_passed_reset`（toast）。
+
+## 期望当前账号（#193，spec #185 决策 F）
+
+自动切换从做出决定到真正写当前登录文件，中间隔着一段时间：GUI 快照编排要等一轮额度查询
+收齐才判定，CLI `status` 先查完额度再判定，被动触发判定之后还要去拿交换锁。这段时间里用户
+手动切到别的账号，自动切换随后仍按原决定切走，用户刚做的选择被覆盖。
+
+修复前各路径的防线都有缝：
+
+- GUI 快照编排：判定后、activate 前在交换锁外重读当前账号，重读与拿锁之间仍可插进手动切换。
+- CLI `status` 自动切换：判定后不重读，直接 activate。
+- 被动触发：在被动锁内重读当前账号与冷却（ADR-0017 决策 7），但手动切换不拿被动锁，重读与
+  拿交换锁之间同样插得进来。
+
+复现用例先红：引擎用例在比对放到锁外时照样切换；CLI 被动端到端用例里，旧代码把用户刚手动
+切到的账号又切走。
+
+### 决策
+
+1. **带前置条件的切换入口。** `Provider` 新增 `activate_if_current(id, expected_current)`，
+   返回 `ActivateOutcome`：`Activated`（已切换）或 `Superseded`（已被取代）。调用方传入判定
+   时的当前账号，即切换目标的 `from`。这是必需方法，没有默认实现：默认实现碰不到交换锁，只能
+   在锁外先查再切，满足不了下面的锁内契约。
+
+2. **比对在交换锁内最先做，只看 registry 当前标记。** 进锁后、读目标凭证与 capture-on-leave
+   之前重读 registry：期望账号不在了，或已不是当前账号，就返回 `Superseded`。此时不读写
+   凭证、不建切换前快照、不写当前登录文件、不写 registry、不进回滚，也不算错误，只记一条
+   info 日志。registry 的写入与切换同在这把交换锁下，手动切换的 registry 提交也在锁内完成，
+   所以比对之后到本次提交之间不会再有别的切换插进来。比对一致时与 `activate` 完全相同。
+
+3. **调用方把「已被取代」当作没有切换。** 不写切换审计、冷却和往返记忆，不弹 toast；回驻
+   确认计数停在判定时的值，只有切换成功才清零。
+   - GUI 快照编排（`apply_snapshot_auto_swap`）：本轮没有任何效果。
+   - CLI `status` 自动切换（`apply_status_auto_swap`）：按不切换处理，退出码 2，`--json` 输出
+     `stay` 事件，原因 `superseded`。
+   - 被动触发：留痕 `decision=stay reason=superseded`，入口退出码照旧恒为 0。
+
+4. **取代「决定之后重读当前账号」。** 锁内比对覆盖了原来锁外重读能拦住的全部情形，还补上了
+   重读与拿锁之间的缝。
+   - GUI 去掉当前账号重读，保留待授权重读：设备码授权进行中时放弃，与当前账号是谁无关。
+   - 被动路径去掉被动锁内的当前账号重读，保留锁内冷却重读：并发的轮询切换刚写下冷却时直接
+     放弃，不必再去拿交换锁，留痕同为 `superseded`。
+   - CLI `status` 原本没有重读，直接带上前置条件。
+
+   **修订 ADR-0017 决策 7** 中「重读当前账号」的部分；被动串行化锁与锁内冷却重读不变。
+
+5. **手动切换不变。** `swap` 等手动路径照旧调用不带前置条件的 `activate`：手动切换就是用户
+   此刻的选择，不该被别的切换取代；仍然零网络、不依赖额度查询。
+
+### 被拒方案
+
+- **比对留在锁外（调用方决定后重读一次）**：就是修复前 GUI 的做法，重读与拿锁之间的缝还在；
+  引擎复现用例在这种做法下为红。
+- **比对放进提交闭包（写当前登录文件之后、提交 registry 之前）**：比对失败要走回滚，当前
+  登录文件已被改写一次、切换前快照也已建好，做不到「已被取代时什么都不动」。放在进锁后最先
+  做，失败时没有任何副作用。
+- **比对当前登录文件里的账号身份**：要防的是别的切换抢先，而每次切换都在这把锁下提交
+  registry 当前标记，这个标记就是「当前账号是谁」的记录。当前登录文件会被官方客户端续期
+  改写，身份也可能解析不出，拿它比对会混进与这个竞态无关的误判。当前登录文件被外部改写的
+  情形，已由 capture-on-leave 与写后回读校验处理。
+- **给 trait 方法加默认实现**：默认实现只能在锁外先查再 `activate`，等于把上面被拒的锁外
+  比对藏进接口。各测试替身逐个显式实现，契约更清楚。
+- **把「已被取代」当错误返回**：调用方会按切换失败记审计、弹失败提示、CLI 返回 1。它只说明
+  用户已经做了选择，应与「不切换」一样安静。
+
+### 验收
+
+- 引擎（`crates/providers/common/src/engine.rs` 测试）：
+  `activate_if_current_switches_when_expected_account_is_still_current`（一致时正常切换，
+  零网络）、`activate_if_current_is_superseded_by_manual_switch_before_swap_lock`（经
+  `before_next_activate_lock` 在进锁前插入一次手动切换；当前登录文件与 registry 字节不变，
+  快照目录不存在或为空）。
+- GUI 注入（`crates/gui/src/lib.rs` 测试）：
+  `snapshot_auto_swap_superseded_skips_toast_audit_and_cooldown`、
+  `snapshot_resident_return_superseded_skips_toast_audit_and_cooldown`（不弹 toast、不写审计
+  与冷却，回驻确认计数不被清零）；`snapshot_auto_swap_stale_pending_skips_activate`（待授权
+  重读保留）。
+- CLI（`crates/cli/src/main.rs` 测试）：
+  `status_auto_swap_superseded_is_stay_without_audit_or_cooldown`、
+  `status_resident_return_superseded_is_stay_without_audit_or_cooldown`（退出码 2、`--json`
+  原因 `superseded`、不写审计与冷却）；被动端到端
+  `passive_superseded_by_manual_switch_keeps_manual_choice`（tempdir 入口、真实 activate，
+  在被动 activate 之前插入一次真实手动切换：手动选的账号保住，没有切换审计和冷却，留痕
+  `decision=stay reason=superseded`，观察型内核不向上报错）。
+- 手动切换不经前置条件，既有切换用例保持绿。

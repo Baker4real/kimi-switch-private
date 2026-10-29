@@ -80,6 +80,8 @@ CONTEXT.md「自动切换」词条长期把「按 403 被动换号」列为回�
    3 秒，等不到视为另一触发处理中、观察型放弃）：锁把「读状态 → 判定 → activate → 写
    冷却」整段排成队列，后到者在锁内重读状态，看到冷却或新当前账号健康即自然落空——没有
    这把锁时，[提交, 写冷却] 间隙里迟到的触发会把 403 证据错按在新当前账号上再切一跳。
+   **#193 起「重读当前账号」由 ADR-0020「期望当前账号」取代：切换带着决定时的当前账号作
+   前置条件，在交换锁内比对，重读与拿锁之间插进来的手动切换不再漏过；被动锁内重读冷却保留。**
 
 8. **hook 安装只经 CLI `install-hook` 子命令，幂等、可卸载（#162，spec 决策 16）。** 向
    Kimi Code 工作目录（`KIMI_CODE_HOME` > `~/.kimi-code`）的 `config.toml` 写入 `[[hooks]]`
@@ -254,7 +256,9 @@ overloaded、403 的非配额文案、没有状态信号的耗尽文案。原决
      读账号库失败，原文只进 stderr 日志）。不切的原因：`not_exhausted`（未命中）、
      `disabled`、`busy`（3 秒内没拿到被动锁）、`no_active_account`、`superseded`（决定
      之后重读，发现并发切换已抢先），以及判定本身的跳过原因（`cooldown`、
-     `no_eligible_candidate` 等，与 CLI `--json` 的 skip reason 同名）。
+     `no_eligible_candidate` 等，与 CLI `--json` 的 skip reason 同名）。**#193 起
+     `superseded` 来自交换锁内的期望当前账号比对（决定之后已有手动或别的切换抢先）或被动锁内
+     重读到冷却，见 ADR-0020「期望当前账号」。**
    - `result`：`swap_failed` 与 `error` 记 `error`，其余记 `ok`。
 
    例：`hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429
