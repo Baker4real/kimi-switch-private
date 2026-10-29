@@ -752,6 +752,76 @@ fn passive_with_overlay_never_fails_on_missing_current_snapshot() {
     ));
 }
 
+/// 过点重置不抵消被动 overlay（issue #191 / ADR-0020）：缓存里当前账号命中窗口的
+/// `reset_at` 已过，耗尽原文仍是「此刻已耗尽」的权威证据；文案辨认不出窗口时，已过点
+/// 窗口的陈旧比例也不参与「已用最高」的挑选。
+#[test]
+fn passive_overlay_window_is_exempt_from_past_reset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("auto_swap.json");
+    let passed = now() - chrono::Duration::hours(1);
+    let later = now() + chrono::Duration::days(3);
+    let accounts = vec![acc("alice", true, None), acc("bob", false, None)];
+    let bob = ready("bob", vec![quota("bob", QuotaWindow::FiveHour, 10, 100)]);
+    let with_reset = |mut quota: Quota, reset_at: DateTime<Utc>| {
+        quota.reset_at = Some(reset_at);
+        quota
+    };
+
+    // 文案辨认出 5 小时窗，缓存里该窗 reset_at 已过：覆写的耗尽窗口不被过点重置抵消。
+    let cached = ready(
+        "alice",
+        vec![with_reset(
+            quota("alice", QuotaWindow::FiveHour, 40, 100),
+            passed,
+        )],
+    );
+    let overlay = overlay_exhausted_snapshot(
+        &AccountId("alice".into()),
+        Some(&cached),
+        Some(QuotaWindow::FiveHour),
+        now(),
+    );
+    match decide_auto_swap_passive_from_state(
+        &state,
+        &accounts,
+        &[overlay, bob.clone()],
+        &on(),
+        now(),
+        None,
+    ) {
+        AutoSwapDecision::Swap(target) => {
+            assert_eq!(target.to.0, "bob");
+            assert_eq!(target.trigger_window, QuotaWindow::FiveHour);
+        }
+        other => panic!("耗尽原文是权威证据，不得被已过的 reset_at 抵消：{other:?}"),
+    }
+
+    // 文案辨认不出窗口：已过点的 5 小时窗那份陈旧的 100% 不算「已用最高」，覆写落在 7 天窗。
+    let cached = ready(
+        "alice",
+        vec![
+            with_reset(quota("alice", QuotaWindow::FiveHour, 100, 100), passed),
+            with_reset(quota("alice", QuotaWindow::SevenDay, 60, 100), later),
+        ],
+    );
+    let overlay =
+        overlay_exhausted_snapshot(&AccountId("alice".into()), Some(&cached), None, now());
+    match decide_auto_swap_passive_from_state(
+        &state,
+        &accounts,
+        &[overlay, bob],
+        &on(),
+        now(),
+        None,
+    ) {
+        AutoSwapDecision::Swap(target) => {
+            assert_eq!(target.trigger_window, QuotaWindow::SevenDay)
+        }
+        other => panic!("应以 7 天窗为耗尽证据切走：{other:?}"),
+    }
+}
+
 /// 总开关关闭：被动路径与轮询同闸，零副作用。
 #[test]
 fn passive_respects_master_switch() {
