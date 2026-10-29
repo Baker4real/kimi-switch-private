@@ -417,6 +417,17 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         Self::metadata_matches(&meta, account, runtime.dedup_extra_key()).then_some(raw)
     }
 
+    /// 当前登录文件确证属于别的账号：读得出、解析得出官方身份，且不指向 `account`。
+    /// 读不出或解析不出身份不算（无法确证 ≠ 不符，与写后回读校验同向）。
+    fn live_belongs_to_another_account(runtime: &A, home: &Path, account: &Account) -> bool {
+        let Ok(raw) = fs::read_to_string(runtime.live_cred_path(home)) else {
+            return false;
+        };
+        let meta = runtime.parse_metadata(&raw);
+        Self::official_identity(&meta).is_some()
+            && !Self::metadata_matches(&meta, account, runtime.dedup_extra_key())
+    }
+
     /// 写后回读身份校验（issue #154，spec #152 实现决策 6）：activate 把目标 blob
     /// 写进 live 并落盘后，立即重读 live、解析官方身份、与目标账号比对。不一致 →
     /// 返回错误，由 `swap_with_snapshot` 的既有 commit 失败路径回滚——此刻 registry
@@ -737,14 +748,29 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                 // 同在这把锁下，判定到提交之间不会再有别的切换插进来。当前账号已不是期望账号
                 // （决定之后有手动切换抢先）就放弃：不读写凭证、不建快照、不碰 registry。
                 if let Some(expected) = &expected_current {
-                    if !registry
+                    let Some(current) = registry
                         .find(provider_id, expected)?
-                        .is_some_and(|current| current.active)
-                    {
+                        .filter(|current| current.active)
+                    else {
                         tracing::info!(
                             account = %id_owned,
                             expected_current = %expected,
                             "activate superseded: current account changed before swap lock"
+                        );
+                        return Ok(ActivateOutcome::Superseded);
+                    };
+                    // 当前登录文件确证属于别的账号（如在 Kimi Code 里直接登录了未导入的账号）时
+                    // 同样放弃：那个账号不在账号库，capture-on-leave 回灌不了，覆盖后它的凭证只剩
+                    // 切换快照。读不出或解析不出身份不算不符，照常切换。
+                    if FileBlobProvider::<A>::live_belongs_to_another_account(
+                        runtime.as_ref(),
+                        &home,
+                        &current,
+                    ) {
+                        tracing::info!(
+                            account = %id_owned,
+                            expected_current = %expected,
+                            "activate superseded: live credentials no longer belong to the expected current account"
                         );
                         return Ok(ActivateOutcome::Superseded);
                     }
@@ -4386,5 +4412,52 @@ mod tests {
             "已被取代时不进切换骨架，不留快照: {}",
             snapshots.display()
         );
+    }
+
+    /// 当前登录文件确证属于别的账号（spec #185 对抗评审 3）：registry 仍记 u1 为当前账号，用户
+    /// 却在 Kimi Code 里直接登录了未导入的账号 x9。带前置条件的切换进锁后看到当前登录文件的
+    /// 身份不是期望账号，返回「已被取代」：x9 不在账号库，capture-on-leave 回灌不了它，覆盖后
+    /// 它的凭证只剩切换快照。手动切换不带前置条件，照常切换。
+    #[tokio::test]
+    async fn activate_if_current_is_superseded_when_live_belongs_to_another_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+        let outside_login = r#"{"uid":"x9","refresh_token":"RX","access_token":"AX"}"#;
+        fs::write(p.test_live_path(), outside_login).unwrap();
+
+        let outcome = p
+            .activate_if_current(&AccountId("u2".into()), &AccountId("u1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ActivateOutcome::Superseded);
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            outside_login,
+            "自动切换不得覆盖账号库之外的登录"
+        );
+        assert_eq!(active_ids(&p), vec!["u1".to_string()]);
+
+        p.activate(&AccountId("u2".into()))
+            .await
+            .expect("手动切换不看前置条件");
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
+    }
+
+    /// 当前登录文件不存在：没有可被覆盖的登录，带前置条件的切换照常进行。
+    #[tokio::test]
+    async fn activate_if_current_proceeds_when_live_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+        fs::remove_file(p.test_live_path()).unwrap();
+
+        let outcome = p
+            .activate_if_current(&AccountId("u2".into()), &AccountId("u1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ActivateOutcome::Activated);
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
     }
 }
