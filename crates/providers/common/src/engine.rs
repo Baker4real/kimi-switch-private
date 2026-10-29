@@ -1005,7 +1005,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 未临期直接用现有 access token 查询；遇 401（服务端提前作废了 access token）强制轮换
     /// 一次、重试一次。
     ///
-    /// 两种轮换都走 [`Self::refresh_parked_if_needed`]，经轮换写回比对提交、守 DeadToken 指纹
+    /// 两种轮换都走 [`Self::rotate_parked_once`]，经轮换写回比对提交、守 DeadToken 指纹
     /// 纪律。强制轮换排在一次查询之后，发出前先核对本次查询的剩余时间（见
     /// [`forced_rotation_fits`]），不够就不发、返回首个 401，留给下次查询。强制轮换被拒或
     /// 不可用时同样返回首个 401，重试仍是 401 时原样返回：都按既有停泊 401 口径呈现（裸 401），
@@ -1014,7 +1014,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         // 凭证里没有 access token 就无从查询：与过期时刻解析不出同样处理，先轮换再查询。
         let expiry = extract_access_token(raw).and_then(|_| self.runtime.credential_expiry(raw));
         if parked_rotation_due(expiry, Utc::now().timestamp()) {
-            let fresh = self.refresh_parked_if_needed(account, raw).await?;
+            let fresh = self.rotate_parked_once(account, raw).await?;
             return self
                 .fetch_quota_with_blob(account, fresh.as_deref().unwrap_or(raw))
                 .await;
@@ -1035,7 +1035,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                     account = %account.id,
                     "parked quota query got 401 before access token expiry; forcing one rotation"
                 );
-                match self.refresh_parked_if_needed(account, raw).await? {
+                match self.rotate_parked_once(account, raw).await? {
                     Some(fresh) => self.fetch_quota_with_blob(account, &fresh).await,
                     None => Err(unauthorized),
                 }
@@ -1054,19 +1054,16 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         self.runtime.fetch_quota(&access, account).await
     }
 
-    /// parked 账号刷新一次，结果经轮换写回比对提交（[`Self::commit_rotation`]，ADR-0019）：
-    /// 刷新请求在锁外，提交在交换锁内，轮换期间被切成当前账号时同步写当前登录文件。
-    /// 由 [`Self::query_parked_quota`] 在临期时、或未临期遇 401 时调用。
+    /// 停泊账号轮换一次，结果经轮换写回比对提交（[`Self::commit_rotation`]，ADR-0019）：
+    /// 轮换请求在锁外，提交在交换锁内，轮换期间被切成当前账号时同步写当前登录文件。
+    /// 轮不轮换不在这里判：由 [`Self::query_parked_quota`] 在临期时（[`parked_rotation_due`]）、
+    /// 或未临期遇 401 时调用。
     /// 返回 `Some(新 blob)` 表示已轮换；本次查询照用新凭证，不论库存是否因比对不符放弃写入。
     ///
     /// DeadToken（issue #80）：复用当前账号主动续期的指纹纪律——发前若指纹在案则跳过
     /// refresh；被拒时记录指纹并停止后续重试。查询仍用现有 access token 继续（不把
     /// 停泊路径改成凭证过期硬失败）。
-    async fn refresh_parked_if_needed(
-        &self,
-        account: &Account,
-        raw: &str,
-    ) -> Result<Option<String>> {
+    async fn rotate_parked_once(&self, account: &Account, raw: &str) -> Result<Option<String>> {
         // DeadToken 纪律：指纹在案 → 停止重试，继续用现有 access token 查询。
         if self.runtime.proactive_renewal_blocked(&self.home, raw) {
             tracing::warn!(account = %account.id, "refresh token dead; skip retry");
