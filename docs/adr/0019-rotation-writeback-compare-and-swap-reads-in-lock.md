@@ -3,7 +3,7 @@ type: adr
 title: 凭证侧：轮换写回比对与切换读取进锁
 status: accepted
 tags: [token-rotation, swap, swap-lock, credential-store, race]
-intent: Record the credential-side decisions of spec 185, starting with ticket 186. Every token rotation the tool performs sends its network request outside any lock and commits inside the swap lock against the refresh token it consumed - the stored credential is replaced only while it still holds that token, the live credential is written only while the account is current, the live file is still that account's and still holds that token, store before live, and on a 3 s swap-lock timeout the store is still compare-written while live is left alone, so a new credential is never dropped. The credential store gains an atomic read-compare-write (set_if, atomic in FileStore under its own lock). activate's target read, capture-on-leave and pre-swap identity move into the same swap-lock critical section as the write, post-swap verify and registry commit, so a switch never writes a pre-rotation credential and never misses an intermediate account's live credential; manual swap stays network-free and never waits for an in-flight rotation. Later credential-side tickets of spec 185 (proactive renewal, 401 coordinated recovery, backfill new-vs-old compare, parked on-demand rotation) extend this record.
+intent: Record the credential-side decisions of spec 185, starting with ticket 186. Every token rotation the tool performs sends its network request outside any lock and commits inside the swap lock against the refresh token it consumed - the stored credential is replaced only while it still holds that token, the live credential is written only while the account is current, the live file is still that account's and still holds that token, store before live, and on a 3 s swap-lock timeout the store is still compare-written while live is left alone, so a new credential is never dropped. The credential store gains an atomic read-compare-write (set_if, atomic in FileStore under its own lock). activate's target read, capture-on-leave and pre-swap identity move into the same swap-lock critical section as the write, post-swap verify and registry commit, so a switch never writes a pre-rotation credential and never misses an intermediate account's live credential; manual swap stays network-free and never waits for an in-flight rotation. Later credential-side tickets of spec 185 (proactive renewal, 401 coordinated recovery, backfill new-vs-old compare, parked on-demand rotation) extend this record. Parked on-demand rotation (ticket 190) - a parked account rotates before a quota query only when its access token has less than max(300 s, expires_in x 0.5) left (JWT exp, else expires_at; unparsable expiry still rotates first), and a 401 before that forces one rotation plus one retry; both rotations commit through the writeback compare.
 documents:
   symbols:
     - commit_rotation_with
@@ -11,6 +11,8 @@ documents:
     - live_still_holds_consumed
     - set_if
     - with_swap_lock
+    - parked_rotation_due
+    - access_token_expiry
 ---
 # 凭证侧：轮换写回比对与切换读取进锁
 
@@ -30,6 +32,10 @@ refresh token；下一次读取当前账号凭证又以 live 为准回灌库存�
 同源的另一处：activate 的目标凭证读取、capture-on-leave 与切换前身份记录都在交换锁之外。两个
 切换交错时，后一个切换的 capture-on-leave 在前一个切换提交之前就已跑完；前一个切换的账号在 live
 里被官方客户端轮换出的新凭证，随后被后一个切换覆盖，没有回灌进库存。
+
+spec #185 问题 2（#190）：停泊账号每次额度查询前都轮换（ADR-0003「查询前必轮换」），GUI 开着时
+每个停泊账号约 40 次/小时。每次轮换都消耗一次性 refresh token，多一次就多一次「响应丢失即掉号」
+的机会，也放大了上面的竞态窗口。官方客户端自己只在剩余不足 max(5 分钟, 半寿命) 时才刷新。
 
 ## 决策
 
@@ -83,6 +89,33 @@ activate 的目标凭证读取、capture-on-leave、切换前身份记录（供�
 官方刷新锁（如有）→ 交换锁 → 凭证存储锁。切换路径从不拿官方刷新锁，凭证存储从不拿交换锁，
 不会死锁。交换锁内不做网络请求。
 
+### 6. 停泊按需轮换（#190）
+
+停泊账号额度查询前，只在 access token 临期时先轮换再查询：剩余不足 max(300 秒, `expires_in` × 0.5)，
+与官方 OAuth 管理器同一阈值（spec #185 外部证据），已过期同样算临期。
+
+- 过期时刻优先取 access token 的 JWT `exp`，缺失时回退凭证的 `expires_at`；`expires_in` 缺失时
+  阈值取 300 秒。
+- 凭证里没有 access token、或过期时刻解析不出：维持旧行为，先轮换再查询。
+- 未临期而额度查询返回 HTTP 401（服务端提前作废了 access token）：强制轮换一次，再重试额度查询
+  一次。
+  - 强制轮换被拒按既有 DeadToken 指纹纪律处理：记录指纹，本次不重试查询，返回首个 401；指纹在案
+    之后再遇 401 也不再轮换。
+  - 重试仍是 401：原样返回。
+  - 两种都按既有停泊 401 口径呈现（裸 401，即额度查询失败），不归为凭证待续期。
+- 临期轮换与强制轮换都经决策 1 的轮换写回比对提交。
+- 当前账号的路径不变，主动续期门（开关 × 锁探测 × 临期 60 秒，ADR-0003）不动。
+- 阈值只写在本 ADR 与 CONTEXT.md，不进配置（AGENTS 规则 3）。
+
+分工：runtime 经 `FileBlobRuntime::access_token_expiry` 报告过期信息（Kimi 读 JWT `exp`、
+`expires_at` 与 `expires_in`），阈值判定在引擎（`parked_rotation_due`）。不提供这个钩子的 runtime
+返回 `None`，与旧版一样每次查询前都轮换。
+
+估算：15 分钟 access token（`expires_in` = 900）的阈值是 max(300, 450) = 450 秒。按 90 秒的停泊
+查询节奏，轮换后第 6 次查询（第 540 秒，剩 360 秒）才临期，每个停泊账号的轮换从约 40 次/小时降到
+约 7 次/小时（3600 ÷ 540 ≈ 6.7）。额度查询节奏、适应性轮询档位、`/me` 后台补缓存与会员档位补章
+都不变。
+
 ## 剩余风险
 
 - 轮换结果同步进当前登录文件之前，官方客户端若已用旧 token 续期被拒并写入墓碑，该会话需要
@@ -90,6 +123,11 @@ activate 的目标凭证读取、capture-on-leave、切换前身份记录（供�
 - 交换锁等不到、且轮换期间该账号已被切成当前账号时，当前登录文件留着被消耗的 token。回灌新旧
   比对落地之前，之后一次读取当前账号凭证仍会按 ADR-0002 修订以 live 为准回灌库存，覆盖新凭证。
 - 当前账号主动续期与 401 协调恢复的写回点尚未改走本规则（spec #185 后续凭证侧票）。
+- 停泊账号未临期期间，refresh token 若被别处消耗（如跨设备共用同一账号，spec #185 Out of
+  Scope），要到下一次临期轮换才被拒并记录指纹；在此之前它仍可能成为自动切换的停泊候选。
+- 强制轮换排在一次 401 查询之后，与它共用单次查询的超时预算（`quota.fetch_timeout_ms`，默认 20
+  秒）。401 查询若异常地慢，超时可能落在轮换响应返回之前，与其他轮换一样有「响应丢失即掉号」的
+  风险。
 
 ## 验收
 
@@ -117,6 +155,22 @@ activate 的目标凭证读取、capture-on-leave、切换前身份记录（供�
 既有用例保持绿：写后回读校验、一次性 token 抢救、快照回滚、fsync 注入失败、启动一致性自检、
 切换零网络断言。
 
+停泊按需轮换（#190），`crates/providers/common/src/engine.rs`（FakeRuntime 新增额度查询计数与
+「这些 access token 查询返回 401」）：
+
+- `parked_query_before_expiry_does_not_rotate`：修复前为红，轮换计数为 1。
+- `parked_query_near_or_past_expiry_rotates_first`
+- `parked_rotation_threshold_is_max_of_300s_and_half_lifetime`：阈值边界，恰好等于阈值不算临期。
+- `parked_401_before_expiry_forces_one_rotation_and_retries_once`：修复前为红，401 原样返回。
+- `parked_forced_rotation_rejected_records_fingerprint_and_stops_retrying`
+- `parked_retry_still_401_keeps_parked_401_presentation`
+- `parked_forced_rotation_in_flight_then_switch_to_it_lands_new_token_in_live_and_store`：强制轮换
+  同样走轮换写回比对。
+
+`crates/providers/kimi/src/kimi_files.rs`：`access_token_expiry_prefers_jwt_exp_then_falls_back_to_expires_at`。
+没有过期信息仍先轮换由既有 `query_quota_refreshes_parked_account_and_persists_rotation` 覆盖；停泊
+DeadToken 指纹用例与上面的竞态用例保持绿。
+
 ## Considered Options
 
 - **轮换整段持交换锁（含网络请求）**：刷新请求超时上限 10 秒，远超交换锁 3 秒等待上限，切换会在
@@ -133,3 +187,10 @@ activate 的目标凭证读取、capture-on-leave、切换前身份记录（供�
   refresh token 已足够判定，不引入新的持久状态。
 - **只把目标凭证读取进锁，capture-on-leave 留在锁外**：两个切换交错时仍会漏回灌中间账号的当前
   凭证。
+- **停泊轮换阈值做成配置项**：扩大配置面（AGENTS 规则 3）；跟随官方 OAuth 管理器的阈值即可。
+- **停泊轮换沿用主动续期的临期 60 秒**：与官方口径不一致；余量太小，本机与服务端时钟有偏差时，
+  更多查询要先撞 401、再靠强制轮换兜底。
+- **未临期遇 401 不强制轮换**：服务端提前作废 access token 时，该账号要一直查询失败到临期
+  （15 分钟 token 最长约 7 分半），期间还进 90 秒鉴权退避（ADR-0009）。
+- **强制轮换后多次重试**：每次轮换都消耗一次性 refresh token；新 access token 仍 401 说明问题不在
+  access token，再轮换只会多消耗。
