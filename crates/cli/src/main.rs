@@ -50,7 +50,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    decide_auto_swap_from_state, decide_resident_return_from_state, earliest_reset_at,
+    decide_auto_swap_from_state, decide_resident_return_from_state, earliest_recovery_at,
     locally_invalid_accounts, membership_expiry_from_extra, prettify_membership,
     read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
     set_manual_hold_until, settings, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
@@ -496,9 +496,9 @@ impl StatusJsonEvent {
         }
     }
 
-    fn no_candidate(snapshots: &[QuotaSnapshot]) -> Self {
+    fn no_candidate(earliest_recovery: Option<DateTime<Utc>>) -> Self {
         Self {
-            earliest_reset: earliest_reset_at(snapshots)
+            earliest_reset: earliest_recovery
                 .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             ..Self::base("no_candidate")
         }
@@ -554,12 +554,13 @@ impl AutoSwapStatusEffect {
         }
     }
 
-    fn no_candidate(snapshots: &[QuotaSnapshot]) -> Self {
+    /// `earliest_recovery` 由调用方经 [`earliest_recovery_at`] 算一次，说明行与 JSON 同口径。
+    fn no_candidate(earliest_recovery: Option<DateTime<Utc>>) -> Self {
         Self {
-            line: Some(auto_swap_no_candidate_line(snapshots)),
+            line: Some(auto_swap_no_candidate_line(earliest_recovery)),
             swapped: false,
             exit: StatusExitKind::NoCandidate,
-            json: StatusJsonEvent::no_candidate(snapshots),
+            json: StatusJsonEvent::no_candidate(earliest_recovery),
         }
     }
 
@@ -653,7 +654,7 @@ where
                 current.map(|account| account.id.0.as_str()),
                 "no eligible candidate",
             ));
-            AutoSwapStatusEffect::no_candidate(snapshots)
+            AutoSwapStatusEffect::no_candidate(earliest_recovery_at(snapshots, now))
         }
         // 未达耗尽阈值 / 冷却 / 宽限期等 Stay：耗尽路径不动作，转交回驻判定。
         AutoSwapDecision::Stay { reason } => {
@@ -771,8 +772,8 @@ fn auto_swap_success_line(target: &AutoSwapTarget) -> String {
     }
 }
 
-fn auto_swap_no_candidate_line(snapshots: &[QuotaSnapshot]) -> String {
-    match earliest_reset_at(snapshots) {
+fn auto_swap_no_candidate_line(earliest_recovery: Option<DateTime<Utc>>) -> String {
+    match earliest_recovery {
         Some(at) => format!(
             "auto_swap: no eligible candidate (earliest reset {})",
             at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -1269,12 +1270,14 @@ async fn passive_swap(
 
     // 5. 耗尽原文 = 当前账号耗尽的权威证据：合成/覆盖当前账号快照后进既有判定。
     //    耗尽语义（冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆、候选本地
-    //    凭证快检）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。
+    //    凭证快检）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。overlay 与
+    //    判定共用同一 `now`：过点重置按同一时刻划线，抵消不了覆写的耗尽窗口（ADR-0020）。
+    let now = Utc::now();
     let overlay = overlay_exhausted_snapshot(
         &current.id,
         snapshots.iter().find(|item| item.account_id == current.id),
         window,
-        Utc::now(),
+        now,
     );
     match snapshots
         .iter_mut()
@@ -1289,7 +1292,7 @@ async fn passive_swap(
         &accounts,
         &snapshots,
         auto_swap,
-        Utc::now(),
+        now,
         read_last_auto_swap_at(&state_path),
     );
 
@@ -1485,8 +1488,10 @@ impl PassiveSwapLock {
 
 /// 只读额度缓存构造快照（被动路径零网络）。档位取窗口一字段（与 core
 /// `membership_of` 同口径）。无缓存账号返回 `None`（无快照 → 候选资格线不通过）。
+/// `reset_at` 已过的窗口原样保留，交给判定按过点重置处理（ADR-0020）：GUI 久未开时，
+/// 窗口全部过点的账号不会因缓存层丢窗口而整条失去快照。
 fn cached_quota_snapshot(cache: &QuotaCache, id: &AccountId) -> Option<QuotaSnapshot> {
-    let entry = cache.get("kimi", &id.0)?;
+    let entry = cache.get_keeping_past_resets("kimi", &id.0)?;
     let membership = entry.quotas.iter().find_map(|q| q.membership.clone());
     Some(QuotaSnapshot {
         account_id: id.clone(),
@@ -2499,14 +2504,8 @@ mod tests {
         let early = chrono::DateTime::parse_from_rfc3339("2026-09-03T16:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let late = chrono::DateTime::parse_from_rfc3339("2026-09-04T08:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
         assert_eq!(
-            super::auto_swap_no_candidate_line(&[
-                ready_reset("alice", 99, 100, Some(late)),
-                ready_reset("bob", 99, 100, Some(early)),
-            ]),
+            super::auto_swap_no_candidate_line(Some(early)),
             "auto_swap: no eligible candidate (earliest reset 2026-09-03T16:00:00Z)"
         );
     }
@@ -2514,7 +2513,7 @@ mod tests {
     #[test]
     fn auto_swap_no_candidate_line_unchanged_without_reset() {
         assert_eq!(
-            super::auto_swap_no_candidate_line(&[ready("alice", 99, 100), ready("bob", 99, 100)]),
+            super::auto_swap_no_candidate_line(None),
             "auto_swap: no eligible candidate"
         );
     }
@@ -2733,6 +2732,43 @@ mod tests {
         )
         .await;
         assert_eq!(effect.exit_code(), 3);
+        let event = parse_status_event(&effect);
+        assert_eq!(event["type"], "no_candidate");
+        assert_eq!(event["earliestReset"], "2026-09-03T16:00:00Z");
+    }
+
+    /// 「最早恢复」只给仍在未来的时刻（issue #191 / ADR-0020）：说明行与 `--json` 的
+    /// earliestReset 同口径，摘出的 bob 缓存里已过点的 reset_at 都不给出。
+    #[tokio::test]
+    async fn status_auto_swap_no_candidate_skips_passed_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let passed = now() - chrono::Duration::hours(1);
+        let future = chrono::DateTime::parse_from_rfc3339("2026-09-03T16:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut bob = acc("bob", false);
+        kimi_switch_core::write_auto_swap_opt_out_extra(&mut bob.extra, true);
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", true), bob],
+            &[
+                ready_reset("alice", 99, 100, Some(future)),
+                ready_reset("bob", 100, 100, Some(passed)),
+            ],
+            now(),
+            None,
+            None,
+            |_id| async { panic!("无候选不得 activate") },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            effect.line.as_deref(),
+            Some("auto_swap: no eligible candidate (earliest reset 2026-09-03T16:00:00Z)")
+        );
         let event = parse_status_event(&effect);
         assert_eq!(event["type"], "no_candidate");
         assert_eq!(event["earliestReset"], "2026-09-03T16:00:00Z");
@@ -3091,12 +3127,21 @@ mod tests {
 
     /// 种额度缓存（被动路径的唯一快照来源，零网络）。
     fn seed_quota_cache(entries: &[(&str, u64, u64)]) {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|(id, used, limit)| (*id, *used, *limit, None))
+            .collect();
+        seed_quota_cache_with_reset(&entries);
+    }
+
+    /// 同 [`seed_quota_cache`]，每个账号的 5 小时窗另带 `reset_at`。
+    fn seed_quota_cache_with_reset(entries: &[(&str, u64, u64, Option<DateTime<Utc>>)]) {
         use kimi_switch_core::paths::AppPaths;
         use kimi_switch_core::{Quota, QuotaCache};
 
         let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
         let mut cache = QuotaCache::load(&cache_path);
-        for (id, used, limit) in entries {
+        for (id, used, limit, reset_at) in entries {
             cache.set(
                 "kimi",
                 id,
@@ -3106,7 +3151,7 @@ mod tests {
                     window: QuotaWindow::FiveHour,
                     used: *used,
                     limit: *limit,
-                    reset_at: None,
+                    reset_at: *reset_at,
                     status: kimi_switch_core::QuotaStatus::Ok,
                     note: None,
                     membership: None,
@@ -3377,6 +3422,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 过点重置（issue #191 / ADR-0020）：GUI 没开、额度缓存陈旧，bob 的缓存仍显示耗尽
+    /// 但 `reset_at` 已过 → 被动触发照样经真实 activate 切到 bob；额度缓存字节不变，内核
+    /// 不向上报错（入口恒退出码 0）。
+    #[tokio::test]
+    async fn passive_swaps_to_account_whose_cached_exhaustion_already_reset() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        let passed = Utc::now() - chrono::Duration::hours(1);
+        seed_quota_cache_with_reset(&[("alice", 80, 100, None), ("bob", 100, 100, Some(passed))]);
+        let cache_path = AppPaths::resolve().unwrap().quota_cache_file();
+        let before = std::fs::read(&cache_path).unwrap();
+
+        super::run_on_quota_failure_with(&ctx, &event_429_5h(), &passive_settings())
+            .await
+            .expect("观察型内核不得向上报错");
+
+        assert_passive_swapped_to_bob(&env, &ctx);
+        assert_eq!(
+            std::fs::read(&cache_path).unwrap(),
+            before,
+            "被动路径不得回写额度缓存"
+        );
     }
 
     /// 冷却收敛：第一次切换完成后，后续触发（新当前账号健康 + 冷却未过）自然落空，
