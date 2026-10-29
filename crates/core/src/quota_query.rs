@@ -12,6 +12,23 @@ use crate::settings::{self, Quota as QuotaSettings};
 /// 额度重试日志里的 provider 标识。trait 不再暴露 `id()`，由实现内部常量自报（Kimi）。
 const PROVIDER_ID: &str = "kimi";
 
+tokio::task_local! {
+    /// 本次 attempt 的超时时刻：到点外层超时就会取消 `Provider::query_quota`。
+    static ATTEMPT_DEADLINE: tokio::time::Instant;
+}
+
+/// 本次额度查询 attempt 距外层超时还剩多久；不在 [`query_quota_with_retry`] 的 attempt 里
+/// （没有外层超时会取消本次查询）时返回 `None`。
+///
+/// 供 Provider 在发出「被取消即丢失」的请求前判断剩余时间够不够：停泊账号遇 401 的强制轮换
+/// 盖不住轮换请求的超时上限时不发（ADR-0019）。在 `Provider::query_quota` 外面另加超时的
+/// 调用方必须同样公布超时时刻，否则 Provider 会当作没有外层超时。
+pub fn attempt_time_left() -> Option<Duration> {
+    ATTEMPT_DEADLINE
+        .try_with(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .ok()
+}
+
 /// 按当前配置查询 quota，失败或单次超时后做保守重试。
 pub async fn query_quota_with_retry(provider: &dyn Provider, id: &AccountId) -> Result<Vec<Quota>> {
     let cfg = settings::current().quota.clone();
@@ -28,10 +45,16 @@ async fn query_quota_with_retry_config(
     let timeout = Duration::from_millis(cfg.fetch_timeout_ms);
 
     for attempt in 1..=max_attempts {
-        let result = match tokio::time::timeout(timeout, provider.query_quota(id)).await {
-            Ok(inner) => inner,
-            Err(_) => Err(Error::quota_timeout()),
+        let query = provider.query_quota(id);
+        // 超时时刻经 task-local 公布给 Provider（见 [`attempt_time_left`]）；
+        // 时刻溢出（超时配置大到离谱）等同不设超时，与 `tokio::time::timeout` 一致。
+        let outcome = match tokio::time::Instant::now().checked_add(timeout) {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, ATTEMPT_DEADLINE.scope(deadline, query)).await
+            }
+            None => Ok(query.await),
         };
+        let result = outcome.unwrap_or_else(|_| Err(Error::quota_timeout()));
 
         match result {
             Ok(quotas) => return Ok(quotas),
@@ -255,6 +278,54 @@ mod tests {
         assert_eq!(err.http_status(), None);
         assert!(err.is_retryable());
         assert!(!err.is_authentication_failure());
+    }
+
+    /// 在 `query_quota` 里读剩余时间，记下每次 attempt 看到的值。
+    struct TimeLeftProbe {
+        seen: std::sync::Mutex<Vec<Option<Duration>>>,
+    }
+
+    #[async_trait]
+    impl Provider for TimeLeftProbe {
+        async fn activate(&self, _id: &AccountId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
+        }
+
+        async fn query_quota(&self, _id: &AccountId) -> Result<Vec<Quota>> {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            self.seen.lock().unwrap().push(attempt_time_left());
+            Ok(Vec::new())
+        }
+    }
+
+    /// attempt 里能读到距外层超时的剩余时间（随耗时减少），attempt 外读不到。
+    #[tokio::test(start_paused = true)]
+    async fn attempt_time_left_is_published_only_inside_an_attempt() {
+        let provider = TimeLeftProbe {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let cfg = QuotaSettings {
+            fetch_timeout_ms: 1_000,
+            ..QuotaSettings::default()
+        };
+
+        query_quota_with_retry_config(&provider, &AccountId("alice".into()), &cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *provider.seen.lock().unwrap(),
+            vec![Some(Duration::from_millis(700))]
+        );
+        assert_eq!(attempt_time_left(), None);
     }
 
     #[test]
