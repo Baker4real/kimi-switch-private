@@ -164,7 +164,9 @@ token 的唯一有效副本。这样的窗口有两个来源：重新授权写�
 边界）。复现用例修复前为红：重新授权窗口期内的查询与切换都把库存撤回旧凭证。
 
 现在三处回灌共用一条规则，先比对再写：capture-on-leave（含写后回读校验的抢救，ADR-0015 决策 7）、
-读取当前账号凭证时的顺手回灌、主动续期发现官方已抢先轮换时的采纳回灌。
+读取当前账号凭证时的顺手回灌、主动续期发现官方已抢先轮换时的采纳回灌。从当前登录文件导入
+（GUI 导入、`login kimi`，`import_active`）同样走这条规则：跳过写入时保留库存、记 warn，registry
+照常更新；设备码授权等新授权结果（`import_raw`）照旧直接覆盖。
 
 1. live 缺 refresh token 而库存有：跳过。这是 capture-on-leave 的既有守卫（官方墓碑化的登录文件
    不污染账号库），现在三处回灌都适用。
@@ -285,6 +287,8 @@ runtime 返回 `None`，与旧版一样每次查询前都轮换。
   两个用例改写，凭证带上了过期时刻；切换用例最后切回该账号，当前登录文件拿到重新授权的结果。
 - `proactive_renewal_adoption_keeps_newer_stored_credentials`（#189）：修复前为红，采纳回灌用较旧的
   live 覆盖了库存。
+- `import_active_keeps_newer_stored_credentials`：修复前为红，从当前登录文件导入无条件覆盖库存，
+  较旧的 live 盖掉了较新的凭证。
 - 回灌比对各分支（#189，经 capture-on-leave 通道）：`backfill_skips_live_older_than_stored_credentials`、
   `backfill_overwrites_when_live_is_newer_or_equally_new`、
   `backfill_lets_live_win_when_either_side_has_no_expiry`、

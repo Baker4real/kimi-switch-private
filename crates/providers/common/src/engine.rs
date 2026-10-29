@@ -185,6 +185,15 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 // 存账号 / 导入
 // ---------------------------------------------------------------------------
 
+/// 导入时 blob 写进库存的口径。
+#[derive(Clone, Copy)]
+enum StoreWrite {
+    /// 新授权结果（设备码授权入库）：直接覆盖。
+    Replace,
+    /// 当前登录文件里的凭证：按回灌新旧比对写（ADR-0019 决策 8），库存里较新的副本不被覆盖。
+    Backfill,
+}
+
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 从 blob 落库：blob 进 store，元数据进 registry.toml。`active_override=None` 时保留原 active。
     /// 官方身份由 [`Self::official_identity`] 从 `parse_metadata` 得出。
@@ -193,18 +202,21 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         raw: String,
         label_hint: Option<String>,
         active_override: Option<bool>,
+        write: StoreWrite,
     ) -> Result<Account> {
         let meta = self.runtime.parse_metadata(&raw);
-        self.store_account_with_metadata(raw, meta, label_hint, active_override)
+        self.store_account_with_metadata(raw, meta, label_hint, active_override, write)
     }
 
     /// 同 [`Self::store_account`]，但接收调用方提供的、已解析好的 metadata，不再从 `raw` 重新派生。
+    /// 库存按 `write` 的口径写；回灌比对跳过写入时库存保留原副本，registry 照常更新。
     fn store_account_with_metadata(
         &self,
         raw: String,
         meta: BlobMetadata,
         label_hint: Option<String>,
         active_override: Option<bool>,
+        write: StoreWrite,
     ) -> Result<Account> {
         let id_string = Self::official_identity(&meta)
             .map(str::to_string)
@@ -219,12 +231,20 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
             .or_else(|| meta.label.clone())
             .unwrap_or_else(|| id.0.clone());
 
-        self.store.set(
-            self.runtime.id(),
-            id.0.as_str(),
-            self.runtime.store_field(),
-            &raw,
-        )?;
+        match write {
+            StoreWrite::Replace => self.store.set(
+                self.runtime.id(),
+                id.0.as_str(),
+                self.runtime.store_field(),
+                &raw,
+            )?,
+            StoreWrite::Backfill => Self::backfill_live_into_store_with(
+                self.runtime.as_ref(),
+                self.store.as_ref(),
+                &id,
+                &raw,
+            )?,
+        }
 
         let mut extra = meta.extra.clone();
         if let Some(dk) = meta.dedup_key.clone() {
@@ -290,10 +310,14 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     }
 
     /// 从当前 live 文件导入（可切换）。
+    ///
+    /// 库存按回灌新旧比对写（ADR-0019 决策 8）：该账号库存里已有较新的凭证（轮换提交只写了
+    /// 库存，或重新授权后 live 写失败），而当前登录文件还是被消耗的那份时，保留库存并记 warn；
+    /// registry 照常更新、标成当前账号。
     pub fn import_active(&self, label_hint: Option<String>) -> Result<Account> {
         let raw = fs::read_to_string(self.live_path())
             .map_err(|e| Error::provider(format!("read live credentials failed: {e}")))?;
-        self.store_account(raw, label_hint, Some(true))
+        self.store_account(raw, label_hint, Some(true), StoreWrite::Backfill)
     }
 
     /// 当前 live 凭证对应的 registry id。启动一致性自检（issue #155）用它辨认
@@ -310,14 +334,14 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         Ok(AccountId(id_string.to_string()))
     }
 
-    /// 从原始 blob 导入（设备码授权入库）。
+    /// 从原始 blob 导入（设备码授权入库）。新授权结果直接覆盖库存。
     pub fn import_raw(
         &self,
         raw: String,
         label_hint: Option<String>,
         active: Option<bool>,
     ) -> Result<Account> {
-        self.store_account(raw, label_hint, active)
+        self.store_account(raw, label_hint, active, StoreWrite::Replace)
     }
 }
 
@@ -599,7 +623,7 @@ enum BackfillVerdict {
 
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// live → 账号库的回灌。所有回灌点共用：capture-on-leave、读取当前账号凭证时的顺手回灌、
-    /// 主动续期发现官方已抢先轮换时的采纳回灌。在凭证存储自身的锁下读库存、按
+    /// 主动续期发现官方已抢先轮换时的采纳回灌、从当前登录文件导入。在凭证存储自身的锁下读库存、按
     /// [`Self::backfill_verdict`] 裁决、再写入（`set_if`）；跳过时记 warn。只防覆盖，从不改写 live。
     fn backfill_live_into_store_with(
         runtime: &A,
@@ -2001,6 +2025,30 @@ mod tests {
             p.test_store_get("u1").unwrap().contains("A2"),
             "Code blob 仍要换成这次导入的新凭证"
         );
+    }
+
+    /// 从当前登录文件导入（GUI 导入 / `login kimi`）按回灌新旧比对写库存（ADR-0019 决策 8）：
+    /// 账号库里已有较新的凭证（轮换提交只写了库存，或重新授权后 live 写失败），当前登录文件还是
+    /// 被消耗的那份时，不覆盖库存；registry 照常更新，该账号标成当前账号。
+    #[test]
+    fn import_active_keeps_newer_stored_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = provider(tmp.path());
+        fs::create_dir_all(p.test_home()).unwrap();
+        let stored = r#"{"uid":"u1","refresh_token":"R2","access_token":"A2","expires_at":2000}"#;
+        let older = r#"{"uid":"u1","refresh_token":"R1","access_token":"A1","expires_at":1000}"#;
+        p.import_raw(stored.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), older).unwrap();
+
+        let account = p.import_active(None).unwrap();
+
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            stored,
+            "较旧的 live 不得覆盖库存里较新的凭证"
+        );
+        assert!(account.active);
+        assert_eq!(active_ids(&p), vec!["u1".to_string()]);
     }
 
     // --- 读 blob：store 错误处理顺序（不抢先冒泡，先试 legacy）---
