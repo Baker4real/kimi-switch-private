@@ -1013,16 +1013,13 @@ fn exhaustion_recovers_at(
         .unwrap_or_else(|| observed_at + exhaustion_window_length(window))
 }
 
-/// 恢复时刻估计用的窗口时长：5 小时窗 5 小时、7 天窗 7 天、月度窗 31 天。分类器只辨认
-/// 这三种窗口（见 [`window_from_usage_limit_texts`]），其余窗口与辨认不出一样按 5 小时窗。
+/// 恢复时刻估计用的窗口时长：已知时长的窗口（[`known_window_duration`]：5 小时窗、7 天窗）
+/// 取其时长；月度窗长短不一，取上限 31 天。分类器只辨认这三种窗口（见
+/// [`window_from_usage_limit_texts`]），其余窗口与辨认不出一样按 5 小时窗。
 fn exhaustion_window_length(window: QuotaWindow) -> chrono::Duration {
     match window {
-        QuotaWindow::SevenDay => chrono::Duration::days(7),
         QuotaWindow::Month => chrono::Duration::days(31),
-        QuotaWindow::FiveHour
-        | QuotaWindow::FirstPartyModels
-        | QuotaWindow::Api
-        | QuotaWindow::Custom => chrono::Duration::hours(5),
+        other => known_window_duration(other).unwrap_or_else(|| chrono::Duration::hours(5)),
     }
 }
 

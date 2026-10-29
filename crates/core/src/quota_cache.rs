@@ -96,21 +96,7 @@ impl QuotaCache {
     /// 获取仍有效的缓存快照，已过期的窗口被过滤。
     /// 若所有窗口都过期或无缓存，返回 None。
     pub fn get(&self, provider: &str, account_id: &str) -> Option<ValidEntry> {
-        let entry = self.entries.get(&cache_key(provider, account_id))?;
-        let now = Utc::now();
-        let valid_quotas: Vec<Quota> = entry
-            .quotas
-            .iter()
-            .filter(|q| !quota_expired(q, entry.cached_at, now))
-            .cloned()
-            .collect();
-        if valid_quotas.is_empty() {
-            return None;
-        }
-        Some(ValidEntry {
-            quotas: valid_quotas,
-            cached_at: entry.cached_at,
-        })
+        self.valid_entry(provider, account_id, false)
     }
 
     /// 同 [`get`](Self::get)，但保留 `reset_at` 已过的窗口（原样返回缓存值）；无 `reset_at`
@@ -118,12 +104,27 @@ impl QuotaCache {
     /// 「过点重置」把这些窗口当作已重置（ADR-0020），缓存层若先丢掉它们，窗口全部过点的
     /// 账号会整条失去快照、被误判为不可用。展示路径仍用 [`get`](Self::get)。
     pub fn get_keeping_past_resets(&self, provider: &str, account_id: &str) -> Option<ValidEntry> {
+        self.valid_entry(provider, account_id, true)
+    }
+
+    /// [`get`](Self::get) 与 [`get_keeping_past_resets`](Self::get_keeping_past_resets) 的
+    /// 共用实现：过期窗口被过滤，`keep_past_resets` 为真时带 `reset_at` 的窗口一律保留。
+    /// 一个窗口都不剩时返回 None。
+    fn valid_entry(
+        &self,
+        provider: &str,
+        account_id: &str,
+        keep_past_resets: bool,
+    ) -> Option<ValidEntry> {
         let entry = self.entries.get(&cache_key(provider, account_id))?;
         let now = Utc::now();
         let quotas: Vec<Quota> = entry
             .quotas
             .iter()
-            .filter(|q| q.reset_at.is_some() || !quota_expired(q, entry.cached_at, now))
+            .filter(|q| {
+                (keep_past_resets && q.reset_at.is_some())
+                    || !quota_expired(q, entry.cached_at, now)
+            })
             .cloned()
             .collect();
         if quotas.is_empty() {
