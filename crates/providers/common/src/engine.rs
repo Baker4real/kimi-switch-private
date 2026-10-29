@@ -359,24 +359,15 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 错误处理顺序与原始 Beta 实现一致：store 读取失败时不立即冒泡，而是先捕获错误、
     /// 继续尝试 `recover_legacy`；只有 legacy 也拿不到时才把原始 store 错误抛出去。这样即使
     /// keyring 后端本身故障，仍有机会从 legacy 布局恢复凭证。
-    fn raw_blob_for_account(&self, account: &Account) -> Result<String> {
-        Self::raw_blob_for_account_with(
-            self.runtime.as_ref(),
-            self.store.as_ref(),
-            &self.home,
-            account,
-        )
-    }
-
-    /// [`Self::raw_blob_for_account`] 的借用参数版本，供 activate 在交换锁内（`spawn_blocking`
-    /// 闭包里）读取目标凭证。
-    fn raw_blob_for_account_with(
+    ///
+    /// 借用参数：activate 在交换锁内（`spawn_blocking` 闭包里）读取目标凭证时同样用它。
+    fn raw_blob_for_account(
         runtime: &A,
         store: &dyn CredentialStore,
         home: &Path,
         account: &Account,
     ) -> Result<String> {
-        if let Some(raw) = Self::read_live_if_matches_with(runtime, home, account) {
+        if let Some(raw) = Self::read_live_if_matches(runtime, home, account) {
             // 回灌只是顺手保鲜：库写失败不影响读取。
             let _ = Self::backfill_live_into_store_with(runtime, store, &account.id, &raw);
             return Ok(raw);
@@ -407,11 +398,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         )))
     }
 
-    fn read_live_if_matches(&self, account: &Account) -> Option<String> {
-        Self::read_live_if_matches_with(self.runtime.as_ref(), &self.home, account)
-    }
-
-    fn read_live_if_matches_with(runtime: &A, home: &Path, account: &Account) -> Option<String> {
+    /// 当前登录文件属于 `account` 时返回其内容；读不出或身份不符返回 `None`。
+    fn read_live_if_matches(runtime: &A, home: &Path, account: &Account) -> Option<String> {
         let raw = fs::read_to_string(runtime.live_cred_path(home)).ok()?;
         let meta = runtime.parse_metadata(&raw);
         Self::metadata_matches(&meta, account, runtime.dedup_extra_key()).then_some(raw)
@@ -788,7 +776,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                     }
                 }
 
-                let target_raw = FileBlobProvider::<A>::raw_blob_for_account_with(
+                let target_raw = FileBlobProvider::<A>::raw_blob_for_account(
                     runtime.as_ref(),
                     store.as_ref(),
                     &home,
@@ -870,7 +858,12 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
 
     async fn query_quota(&self, id: &AccountId) -> Result<Vec<Quota>> {
         let account = self.require_account(id)?;
-        let mut raw = self.raw_blob_for_account(&account)?;
+        let mut raw = Self::raw_blob_for_account(
+            self.runtime.as_ref(),
+            self.store.as_ref(),
+            &self.home,
+            &account,
+        )?;
 
         if account.active {
             // 当前账号主动续期（issue #44）：仅当 runtime 判定该轮换
@@ -920,7 +913,8 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     async fn renew_active_proactively(&self, account: &Account, raw: String) -> Result<String> {
         // 即用即读：轮换前现读 live 文件（官方即用即读，我们也即用即读），
         // 把与官方轮换的竞态窗口压到最小，不用查询开始时的旧副本。
-        let Some(live) = self.read_live_if_matches(account) else {
+        let Some(live) = Self::read_live_if_matches(self.runtime.as_ref(), &self.home, account)
+        else {
             // live 读不出或已改属其他账号：不碰 live 与账号库，沿用原凭证查询。
             return Ok(raw);
         };
