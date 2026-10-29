@@ -471,6 +471,14 @@ mod tests {
             Ok(())
         }
 
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> Result<crate::provider::ActivateOutcome> {
+            Ok(crate::provider::ActivateOutcome::Activated)
+        }
+
         async fn query_quota(&self, id: &AccountId) -> Result<Vec<Quota>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             {
