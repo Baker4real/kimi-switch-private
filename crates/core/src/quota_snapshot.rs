@@ -380,28 +380,6 @@ pub fn apply_cached_membership(
     }
 }
 
-/// 可用快照窗口里最早的 `reset_at`。
-///
-/// Ready 一律计入；Cached 仅非 stale 计入；Failed 与 stale Cached 不算可用。
-/// 窗口缺 `reset_at` 则跳过；全部缺或没有可用窗口时返回 `None`。
-pub fn earliest_reset_at(snapshots: &[QuotaSnapshot]) -> Option<DateTime<Utc>> {
-    snapshots
-        .iter()
-        .filter_map(usable_quota_windows)
-        .flatten()
-        .filter_map(|quota| quota.reset_at)
-        .min()
-}
-
-/// Ready 一律可用；Cached 仅在非 stale 回落时可用；Failed（含凭证待续期）不可用。
-fn usable_quota_windows(snapshot: &QuotaSnapshot) -> Option<&[Quota]> {
-    match &snapshot.state {
-        QuotaState::Failed(_) => None,
-        QuotaState::Cached(_) if snapshot.stale => None,
-        QuotaState::Ready(quotas) | QuotaState::Cached(quotas) => Some(quotas.as_slice()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,7 +390,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
 
-    use crate::error::{Error, QuotaFailure, QuotaFailureKind, Result};
+    use crate::error::{Error, QuotaFailureKind, Result};
     use crate::model::{QuotaStatus, QuotaWindow};
 
     struct ScriptedProvider {
@@ -2029,76 +2007,5 @@ mod tests {
             "快照自带档位优先，不被 extra 覆盖"
         );
         assert_eq!(snapshots[2].membership, None, "无缓存保持未知");
-    }
-
-    /// 可用窗口取 `reset_at` 最小值；Failed / stale Cached 不计入。
-    #[test]
-    fn earliest_reset_at_min_of_usable_windows() {
-        let early = utc("2026-09-03T16:00:00Z");
-        let late = utc("2026-09-03T20:00:00Z");
-        let later = utc("2026-09-04T08:00:00Z");
-        let mut two_windows = quota_at("carol", Some(later));
-        two_windows.window = QuotaWindow::SevenDay;
-        assert_eq!(
-            earliest_reset_at(&[
-                ready_at("alice", Some(late)),
-                ready_at("bob", Some(early)),
-                snap(
-                    "carol",
-                    false,
-                    QuotaState::Ready(vec![quota_at("carol", Some(later)), two_windows]),
-                ),
-            ]),
-            Some(early)
-        );
-    }
-
-    #[test]
-    fn earliest_reset_at_includes_fresh_cached_not_failed_or_stale() {
-        let cached_early = utc("2026-09-03T15:00:00Z");
-        let stale_earlier = utc("2026-09-03T10:00:00Z");
-        let ready_late = utc("2026-09-03T18:00:00Z");
-        assert_eq!(
-            earliest_reset_at(&[
-                snap(
-                    "cached",
-                    false,
-                    QuotaState::Cached(vec![quota_at("cached", Some(cached_early))]),
-                ),
-                snap(
-                    "stale",
-                    true,
-                    QuotaState::Cached(vec![quota_at("stale", Some(stale_earlier))]),
-                ),
-                snap(
-                    "failed",
-                    false,
-                    QuotaState::Failed(QuotaFailure::other("quota fetch failed")),
-                ),
-                ready_at("ready", Some(ready_late)),
-            ]),
-            Some(cached_early)
-        );
-    }
-
-    #[test]
-    fn earliest_reset_at_none_when_usable_windows_lack_reset() {
-        assert_eq!(earliest_reset_at(&[]), None);
-        assert_eq!(
-            earliest_reset_at(&[
-                ready_at("alice", None),
-                snap(
-                    "stale",
-                    true,
-                    QuotaState::Cached(vec![quota_at("stale", Some(utc("2026-09-03T10:00:00Z")))]),
-                ),
-                snap(
-                    "failed",
-                    false,
-                    QuotaState::Failed(QuotaFailure::other("quota fetch failed")),
-                ),
-            ]),
-            None
-        );
     }
 }
