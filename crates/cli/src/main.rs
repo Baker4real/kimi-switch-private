@@ -1305,9 +1305,20 @@ async fn passive_swap(
     //    凭证快检、耗尽账本）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。账本、
     //    overlay 与判定共用同一 `now`：过点重置按同一时刻划线，抵消不了覆写的耗尽窗口
     //    （ADR-0020）。
+    //
+    //    例外：上次自动切换距此刻不到安顿宽限时证据归属不明，不记账本（ADR-0020 自动切换
+    //    串行化锁决策 9）。hook 事件不带账号身份，这时到达的耗尽多半是刚被切走的账号的会话
+    //    在切换前发出的请求，记在新的当前账号头上会让它被切走后不作停泊候选。overlay 与判定
+    //    照常，冷却仍让判定落空。只看上次自动切换：刚被手动选中的账号撞上耗尽照记，安顿宽限
+    //    对被动路径的豁免不变（spec #152 决策 14）。
     let now = Utc::now();
+    let last_auto_swap_at = read_last_auto_swap_at(&state_path);
     let cached_current = snapshots.iter().find(|item| item.account_id == current.id);
-    record_exhaustion(&state_path, &current.id, cached_current, window, now);
+    let just_auto_swapped = last_auto_swap_at
+        .is_some_and(|at| now < at + chrono::Duration::milliseconds(auto_swap.settle_grace_ms));
+    if !just_auto_swapped {
+        record_exhaustion(&state_path, &current.id, cached_current, window, now);
+    }
     let overlay = overlay_exhausted_snapshot(&current.id, cached_current, window, now);
     match snapshots
         .iter_mut()
@@ -1323,7 +1334,7 @@ async fn passive_swap(
         &snapshots,
         auto_swap,
         now,
-        read_last_auto_swap_at(&state_path),
+        last_auto_swap_at,
     );
 
     match decision {
@@ -3627,6 +3638,60 @@ mod tests {
         assert_eq!(
             live_blob(&env),
             r#"{"label":"alice","access_token":"tok-alice"}"#
+        );
+    }
+
+    /// 迟到的被动触发（ADR-0020 自动切换串行化锁决策 9）：alice 撞上额度耗尽、被动切到 bob；
+    /// alice 会话在切换前发出的请求随即也失败，hook 在安顿宽限内到达，此刻当前账号已是 bob。
+    /// 这次耗尽归属不明，不记进耗尽账本，冷却照常挡住切换。之后用户手动切回 alice、冷却过后
+    /// alice 再次撞上耗尽：bob 没有被错记成刚耗尽，仍是合格的停泊候选，被动切到 bob。
+    #[tokio::test]
+    async fn passive_late_trigger_within_settle_grace_does_not_ledger_new_current_account() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+        let paths = AppPaths::resolve().unwrap();
+        let settings = passive_settings();
+        let raw = event_429_5h();
+        let bob_live = r#"{"label":"bob","access_token":"tok-bob"}"#;
+
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+        assert_eq!(live_blob(&env), bob_live, "alice 耗尽先切到 bob");
+
+        // 安顿宽限内迟到的同一会话失败：当前账号已是 bob，冷却挡住切换。
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+        assert_eq!(live_blob(&env), bob_live, "冷却中不切换");
+
+        // 用户手动切回 alice；冷却过后 alice 再次撞上额度耗尽。
+        super::swap(&ctx, Some("alice"))
+            .await
+            .expect("手动切换照常成功");
+        kimi_switch_core::write_last_auto_swap_at(
+            &paths.auto_swap_state_file(),
+            Utc::now()
+                - chrono::Duration::milliseconds(settings.cooldown_ms)
+                - chrono::Duration::minutes(1),
+        );
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+
+        assert_eq!(
+            live_blob(&env),
+            bob_live,
+            "bob 没有被错记成刚耗尽，仍是合格候选"
+        );
+        let traces = audits("on_quota_failure");
+        assert_eq!(traces.len(), 3, "{traces:?}");
+        assert_eq!(
+            traces[2].detail.as_deref(),
+            Some("hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=swap from=alice to=bob")
         );
     }
 
