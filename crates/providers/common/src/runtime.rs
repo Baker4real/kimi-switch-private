@@ -21,10 +21,11 @@ pub struct BlobMetadata {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// access token 的过期信息，供停泊按需轮换判定临期（ADR-0019）。
+/// 凭证的过期信息（ADR-0019）：回灌新旧比对据过期时刻判断两份凭证谁更新，停泊按需轮换据它
+/// 与寿命判定临期。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AccessTokenExpiry {
-    /// 过期时刻（Unix 秒）。
+pub struct CredentialExpiry {
+    /// 过期时刻（Unix 秒）：access token 的 JWT `exp` 优先，缺失时回退凭证的 `expires_at`。
     pub expires_at: i64,
     /// 凭证声明的 access token 寿命（秒，即 `expires_in`）；缺失为 `None`。
     pub expires_in: Option<i64>,
@@ -75,10 +76,12 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
         None
     }
 
-    /// 停泊按需轮换（ADR-0019）用的 access token 过期信息。blob 没有 access token、或过期
-    /// 时刻解析不出时返回 `None`，引擎据此维持「先轮换再查询」。阈值判定在引擎。
-    /// 默认 `None`：不提供该能力的 runtime 与旧版一样每次查询前都轮换停泊账号。
-    fn access_token_expiry(&self, blob: &str) -> Option<AccessTokenExpiry> {
+    /// 凭证的过期信息（ADR-0019）：过期时刻优先取 access token 的 JWT `exp`，缺失时回退凭证里的
+    /// `expires_at`，`expires_in` 一并读出；过期时刻解析不出为 `None`。阈值与比对都在引擎：
+    /// 回灌新旧比对任一方为 `None` 即不可比较、维持以 live 为准；停泊按需轮换为 `None` 时
+    /// 先轮换再查询。默认 `None`：不提供该能力的 runtime 回灌照旧以 live 为准，停泊账号与旧版
+    /// 一样每次查询前都轮换。
+    fn credential_expiry(&self, blob: &str) -> Option<CredentialExpiry> {
         let _ = blob;
         None
     }

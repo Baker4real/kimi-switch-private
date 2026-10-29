@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::{Account, AccountRegistry, CredentialStore, Quota};
 use kimi_switch_engine::{
-    AccessTokenExpiry, BlobMetadata, FileBlobProvider, FileBlobRuntime, RefreshOutcome,
+    BlobMetadata, CredentialExpiry, FileBlobProvider, FileBlobRuntime, RefreshOutcome,
 };
 
 pub const PROVIDER_ID: &str = "kimi";
@@ -51,9 +51,9 @@ impl FileBlobRuntime for KimiRuntime {
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>> {
         kimi_usage::fetch_quota_with_active_recovery(access_token, account, self).await
     }
-    // 停泊按需轮换（ADR-0019）：过期信息从凭证读出，阈值判定在引擎。
-    fn access_token_expiry(&self, blob: &str) -> Option<AccessTokenExpiry> {
-        kimi_files::access_token_expiry(blob)
+    // 回灌新旧比对与停泊按需轮换（ADR-0019）共用：过期信息从凭证读出，比对与阈值判定在引擎。
+    fn credential_expiry(&self, blob: &str) -> Option<CredentialExpiry> {
+        kimi_files::credential_expiry(blob)
     }
     // 轮换请求整体（含代理回退直连）受这一个超时约束，见 oauth::refresh_blob。
     fn refresh_timeout(&self) -> Option<std::time::Duration> {

@@ -1,6 +1,6 @@
 //! 解析 kimi-code.json：整段当 opaque blob，只从 access_token JWT 抽 user_id 等做展示。
 
-use kimi_switch_engine::{AccessTokenExpiry, BlobMetadata};
+use kimi_switch_engine::{BlobMetadata, CredentialExpiry};
 
 /// 解析 base64url JWT payload。
 pub fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
@@ -67,22 +67,25 @@ pub(crate) fn jwt_exp_claim(token: &str) -> Option<i64> {
     numeric_secs(decode_jwt_payload(token)?.get("exp")?)
 }
 
-/// 停泊按需轮换用的 access token 过期信息（ADR-0019）：过期时刻优先取 access token 的
-/// JWT `exp`，缺失时回退凭证的 `expires_at`；`expires_in` 一并读出供阈值用。
-/// 没有 access token、或过期时刻解析不出 → None（引擎据此先轮换再查询）。
-pub(crate) fn access_token_expiry(blob: &str) -> Option<AccessTokenExpiry> {
-    let value: serde_json::Value = serde_json::from_str(blob).ok()?;
-    let access = value.get("access_token")?.as_str()?;
-    let expires_at = jwt_exp_claim(access).or_else(|| numeric_secs(value.get("expires_at")?))?;
-    Some(AccessTokenExpiry {
-        expires_at,
-        expires_in: value.get("expires_in").and_then(numeric_secs),
-    })
-}
-
 /// JSON 数值秒：整型，或浮点取整；其余类型 → None。
 fn numeric_secs(value: &serde_json::Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_f64().map(|f| f as i64))
+}
+
+/// 凭证的过期信息（ADR-0019）：过期时刻优先取 access token 的 JWT `exp`，缺失时回退凭证里的
+/// `expires_at`（整型或浮点取整），都解析不出为 None；`expires_in` 一并读出。回灌新旧比对据
+/// 过期时刻判断两份凭证谁更新，停泊按需轮换据它与 `expires_in` 判定临期。
+pub(crate) fn credential_expiry(blob: &str) -> Option<CredentialExpiry> {
+    let value: serde_json::Value = serde_json::from_str(blob).ok()?;
+    let expires_at = value
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .and_then(jwt_exp_claim)
+        .or_else(|| numeric_secs(value.get("expires_at")?))?;
+    Some(CredentialExpiry {
+        expires_at,
+        expires_in: value.get("expires_in").and_then(numeric_secs),
+    })
 }
 
 fn base64url_decode(input: &str) -> Option<Vec<u8>> {
@@ -215,37 +218,45 @@ mod tests {
         assert!(jwt_needs_renewal(&expired));
     }
 
+    /// 凭证的过期信息（ADR-0019，回灌新旧比对与停泊按需轮换共用）：JWT `exp` 优先，缺失时回退
+    /// `expires_at`；`expires_in` 一并读出。
     #[test]
-    fn access_token_expiry_prefers_jwt_exp_then_falls_back_to_expires_at() {
-        let with_exp = crate::test_support::jwt_with_payload(r#"{"user_id":"u-123","exp":2000}"#);
-        let no_exp = crate::test_support::jwt_with_payload(r#"{"user_id":"u-123"}"#);
-        // JWT exp 优先于 expires_at；expires_in 一并读出。
-        assert_eq!(
-            access_token_expiry(&format!(
-                r#"{{"access_token":"{with_exp}","expires_at":1000,"expires_in":900}}"#
-            )),
-            Some(AccessTokenExpiry {
-                expires_at: 2000,
-                expires_in: Some(900),
+    fn credential_expiry_prefers_jwt_exp_then_falls_back_to_expires_at() {
+        let jwt = crate::test_support::jwt_with_payload;
+        let blob = |access: &str, tail: &str| {
+            format!(r#"{{"access_token":"{access}","refresh_token":"R1"{tail}}}"#)
+        };
+        let expiry = |expires_at: i64, expires_in: Option<i64>| {
+            Some(CredentialExpiry {
+                expires_at,
+                expires_in,
             })
-        );
-        // JWT 无 exp → 回退 expires_at（浮点取整）；expires_in 缺失为 None。
+        };
+
         assert_eq!(
-            access_token_expiry(&format!(
-                r#"{{"access_token":"{no_exp}","expires_at":1500.7}}"#
+            credential_expiry(&blob(
+                &jwt(r#"{"user_id":"u-1","exp":1000}"#),
+                r#","expires_at":2000,"expires_in":900"#
             )),
-            Some(AccessTokenExpiry {
-                expires_at: 1500,
-                expires_in: None,
-            })
+            expiry(1000, Some(900)),
+            "JWT exp 优先于 expires_at，expires_in 一并读出"
         );
-        // 过期时刻解析不出、没有 access token、不是 JSON → None（引擎据此先轮换再查询）。
         assert_eq!(
-            access_token_expiry(&format!(r#"{{"access_token":"{no_exp}"}}"#)),
-            None
+            credential_expiry(&blob(&jwt(r#"{"user_id":"u-1"}"#), r#","expires_at":2000"#)),
+            expiry(2000, None),
+            "JWT 没有 exp 时回退 expires_at；expires_in 缺失为 None"
         );
-        assert_eq!(access_token_expiry(r#"{"expires_at":1000}"#), None);
-        assert_eq!(access_token_expiry("not json"), None);
+        assert_eq!(
+            credential_expiry(&blob("opaque", r#","expires_at":2000.7"#)),
+            expiry(2000, None),
+            "access token 不是 JWT 时回退 expires_at，浮点取整"
+        );
+        assert_eq!(
+            credential_expiry(&blob(&jwt(r#"{"user_id":"u-1"}"#), r#","expires_in":900"#)),
+            None,
+            "两处都没有：解析不出，只有 expires_in 不算"
+        );
+        assert_eq!(credential_expiry("not json"), None);
     }
 
     #[test]
