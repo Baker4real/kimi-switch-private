@@ -33,5 +33,22 @@ chrono.workspace = true
 # Kimi Code 工作目录解析（只读镜像 provider 侧 kimi_home，install-hook 用）。
 directories.workspace = true
 
+# 跟随启动拉起器（issue #197）：交互会话判定、本会话 GUI 进程探测与脱离 hook 的进程创建。
+# 版本与 src-tauri 的 windows-sys 一致，不另引一份。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_StationsAndDesktops",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 tempfile = "3"
+
+# 真实执行器用例：建带 KILL_ON_JOB_CLOSE 的 Job，核对 GUI 脱离 Job 与 breakaway 被拒时的回退。
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.60", features = ["Win32_System_JobObjects"] }

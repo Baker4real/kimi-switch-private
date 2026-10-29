@@ -27,6 +27,11 @@
 //!   手动保持期不阻挡、冷却照常）复用既有自动切换判定与 activate。每个事件在审计日志
 //!   追加一行留痕（action `on_quota_failure`：分类与最终决定，不含会话标题与工作目录）；
 //!   任何情况下退出码恒 0，stdin 畸形同样只留痕放行。
+//! - `kimi-switch on-session-start` — 跟随启动（issue #197，ADR-0021）：Kimi Code
+//!   `SessionStart` hook 观察型入口。自动切换总开关开着、当前进程在 Windows 桌面交互会话里、
+//!   本会话又没有 GUI 进程时，拉起 CLI 同目录的 GUI（`--background`：最小化、不抢焦点），
+//!   不判定、不切换、不查额度。每个事件在审计日志追加一行留痕（action `on_session_start`，
+//!   不含会话标题与工作目录）；stdout 不输出任何内容，退出码恒 0，stdin 畸形照常判定。
 //! - `kimi-switch install-hook [--uninstall]` — 幂等写入 / 卸载 Kimi Code
 //!   `config.toml` 的 `[[hooks]]` StopFailure 条目（指向 `on-quota-failure`）。
 //!   除此命令外，工具任何路径不得隐式修改 Kimi Code 配置（spec #152 决策 16）。
@@ -35,7 +40,8 @@
 //! 显示的编号（1 起）。`login` / `swap` / `rm` / `bind-web` / `config` 仍是 anyhow 的 0/1。
 //!
 //! 启动一致性自检（issue #155，spec #152 决策 8）：除 `install-hook` /
-//! `on-quota-failure`（观察型，自带 live 对齐）外，每次 CLI 启动都以 live 登录文件
+//! `on-quota-failure`（观察型，自带 live 对齐）/ `on-session-start`（只读设置，
+//! 自检留给被拉起的 GUI）外，每次 CLI 启动都以 live 登录文件
 //! 为准比对并纠正注册表 active 标记；live 身份不在账号库时清除标记并在 stderr
 //! 提示可导入。纯本地读，一致时零副作用、零可见输出；提示只走 stderr，
 //! 不污染 stdout 的账号列表与 `--json` 事件流。
@@ -83,6 +89,8 @@ Without `--json`, stdout is the existing account list plus auto_swap lines.
 `--json` and these exit codes apply only to the default status path. \
 `login` / `swap` / `rm` / `bind-web` / `config` keep exit 0 or 1. \
 `on-quota-failure` (StopFailure hook observer) always exits 0. \
+`on-session-start` (SessionStart hook observer; launches the GUI when needed) \
+always exits 0 and writes nothing to stdout. \
 `install-hook` manages the Kimi Code StopFailure hook entry (idempotent).";
 
 #[derive(Parser)]
@@ -143,6 +151,16 @@ enum Cmd {
     /// decision; never the session title or cwd). Zero new network queries.
     /// Always exits 0 (observer hook; never blocks the session).
     OnQuotaFailure,
+
+    /// Observe a Kimi Code SessionStart hook event (stdin JSON). Invoked by the
+    /// hook; do not run it manually. When auto-swap is enabled and no
+    /// kimi-switch GUI runs in this interactive Windows desktop session, launch
+    /// the GUI next to this CLI in the background (minimized, no focus steal),
+    /// so polling-based auto-swap is present during the session. SSH and other
+    /// non-interactive sessions, and non-Windows platforms, never launch. Every
+    /// event appends one `on_session_start` trace line to the audit log (never
+    /// the session title or cwd). Writes nothing to stdout. Always exits 0.
+    OnSessionStart,
 
     /// Idempotently install (or remove with --uninstall) the Kimi Code
     /// StopFailure [[hooks]] entry wiring events to `on-quota-failure`.
@@ -219,11 +237,23 @@ async fn main() -> Result<ExitCode> {
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cli.log.clone()));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // 日志只走 stderr（fmt 默认写 stdout）：stdout 留给账号列表、`--json` 事件流，hook 子命令
+    // 的 stdout 必须为空（SessionStart 的 stdout 可能被加进模型上下文，issue #197）。
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     // 启动时加载 config.toml（缺失 / 解析失败时沿用默认值 + warn）。
     if let Err(e) = settings::reload_from_file() {
         tracing::warn!(err = %e, "load config failed; using built-in defaults");
+    }
+
+    // 跟随启动拉起器（issue #197）只读设置、只写审计：不构建账号库 / 凭证 / provider 上下文，
+    // 也不跑启动一致性自检（被拉起的 GUI 自己会跑）。退出码恒 0，stdout 不输出任何内容。
+    if matches!(cli.cmd, Some(Cmd::OnSessionStart)) {
+        on_session_start();
+        return Ok(ExitCode::SUCCESS);
     }
 
     // ctx 按命令消费：`on-quota-failure` 是观察型 hook，任何内部错误（含 ctx 构建
@@ -269,8 +299,10 @@ async fn main() -> Result<ExitCode> {
                 Some(Cmd::Rm { id }) => rm(&ctx, &id).await.map(|()| ExitCode::SUCCESS),
                 Some(Cmd::BindWeb { id }) => bind_web(&ctx, &id).await.map(|()| ExitCode::SUCCESS),
                 Some(Cmd::Config) => config().map(|()| ExitCode::SUCCESS),
-                // OnQuotaFailure / InstallHook 已在前面的分支消费，这里不可达。
-                Some(Cmd::OnQuotaFailure) | Some(Cmd::InstallHook { .. }) => unreachable!(),
+                // OnSessionStart / OnQuotaFailure / InstallHook 已在前面的分支消费，这里不可达。
+                Some(Cmd::OnSessionStart)
+                | Some(Cmd::OnQuotaFailure)
+                | Some(Cmd::InstallHook { .. }) => unreachable!(),
             }
         }
     }
@@ -1498,6 +1530,244 @@ fn cached_quota_snapshot(cache: &QuotaCache, id: &AccountId) -> Option<QuotaSnap
         membership,
         state: QuotaState::Cached(entry.quotas),
     })
+}
+
+// ---------------------------------------------------------------------------
+// on-session-start（跟随启动拉起器，issue #197 / ADR-0021）
+// ---------------------------------------------------------------------------
+
+/// 跟随启动拉起的 GUI 程序，取 CLI 同目录（ADR-0021 决策 9）。
+const GUI_PROGRAM: &str = "kimi-switch.exe";
+
+/// GUI 的后台启动参数（#196）：首次启动最小化到任务栏、不抢焦点；GUI 已在运行时不动已有窗口。
+const GUI_BACKGROUND_ARG: &str = "--background";
+
+/// 拉起计划：拉起器交给执行器的全部参数，也是拉起器内核的可观察结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchPlan {
+    program: PathBuf,
+    args: Vec<&'static str>,
+    /// 程序所在目录。hook 在会话的项目目录里执行，GUI 继承它就会一直占住那个目录。
+    working_dir: PathBuf,
+    /// 脱离 hook 的进程树：不挂控制台、自成进程组，并尽力脱离 hook 所在的 Job，
+    /// 不随 hook 进程或 Kimi Code 退出而结束。
+    detach: bool,
+    /// 是否继承本进程的句柄。拉起器恒为 false：GUI 一旦持有 hook 执行方交给本进程的
+    /// stdout / stderr 管道，执行方就会一直等管道关闭，直到 hook 超时。
+    inherit_handles: bool,
+}
+
+/// 拉起器所见的启动环境。入口装配真实探针与执行器，用例注入假的。
+trait LaunchEnv {
+    /// 本平台是否支持跟随启动：只有 Windows（ADR-0021 决策 6）。
+    fn platform_supported(&self) -> bool;
+    /// 当前进程是否在桌面交互会话里。SSH、服务等非交互会话为 false。
+    fn interactive_session(&self) -> bool;
+    /// 本 Windows 会话里是否已有本工具的 GUI 进程。
+    fn gui_running(&self) -> bool;
+    /// 本 CLI 可执行文件的路径，GUI 取它的同目录。
+    fn cli_exe(&self) -> std::io::Result<PathBuf>;
+    /// 按计划创建 GUI 进程。创建成功即返回，不等 GUI。
+    fn launch(&self, plan: &LaunchPlan) -> std::io::Result<()>;
+}
+
+/// 拉起器对一个 SessionStart 事件的决定，即留痕里 `decision` 的取值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStartDecision {
+    /// 自动切换总开关关闭（ADR-0021 决策 3）。
+    Disabled,
+    /// 非 Windows 平台（ADR-0021 决策 6）。
+    UnsupportedPlatform,
+    /// 当前进程不在桌面交互会话里（SSH、服务等）。
+    NonInteractive,
+    /// 本 Windows 会话里已有 GUI 进程。
+    AlreadyRunning,
+    /// 已按拉起计划创建 GUI 进程。
+    Launched,
+    /// GUI 程序缺失、解析不出 CLI 路径或创建进程失败；错误原文只进 stderr 日志。
+    LaunchFailed,
+}
+
+impl SessionStartDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::NonInteractive => "non_interactive",
+            Self::AlreadyRunning => "already_running",
+            Self::Launched => "launched",
+            Self::LaunchFailed => "launch_failed",
+        }
+    }
+}
+
+/// 入口装配的真实启动环境：探针与执行器见 [`follow_launch_sys`]。
+struct SystemLaunchEnv;
+
+impl LaunchEnv for SystemLaunchEnv {
+    fn platform_supported(&self) -> bool {
+        cfg!(windows)
+    }
+
+    fn interactive_session(&self) -> bool {
+        follow_launch_sys::interactive_session()
+    }
+
+    fn gui_running(&self) -> bool {
+        follow_launch_sys::gui_running(GUI_PROGRAM)
+    }
+
+    fn cli_exe(&self) -> std::io::Result<PathBuf> {
+        std::env::current_exe()
+    }
+
+    fn launch(&self, plan: &LaunchPlan) -> std::io::Result<()> {
+        let outside_job = follow_launch_sys::launch(plan)?;
+        if plan.detach && !outside_job {
+            tracing::warn!(
+                "on-session-start: the hook's job forbids breakaway; the GUI may exit with Kimi Code"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// 跟随启动的系统探针与执行器，Windows 实现见 `follow_launch_windows.rs`。
+#[cfg(windows)]
+#[path = "follow_launch_windows.rs"]
+mod follow_launch_sys;
+
+/// 非 Windows 平台在平台检查处就不拉起（ADR-0021 决策 6），这些桩不会被调用。
+#[cfg(not(windows))]
+mod follow_launch_sys {
+    pub(crate) fn interactive_session() -> bool {
+        false
+    }
+
+    pub(crate) fn gui_running(_image: &str) -> bool {
+        false
+    }
+
+    pub(crate) fn launch(_plan: &super::LaunchPlan) -> std::io::Result<bool> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Kimi Code `SessionStart` hook 观察型入口：stdin 读事件 JSON（只用于留痕），按判定顺序决定
+/// 是否拉起 GUI，每个事件在审计日志留一行痕（见 [`session_start_trace`]）。任何错误只写 stderr
+/// 日志，退出码由调用方恒置 0；stdin 读失败或不是 UTF-8 时照常判定，字段记 `-`。
+fn on_session_start() {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    if let Err(err) = std::io::stdin().lock().read_to_end(&mut bytes) {
+        tracing::warn!(err = %err, "on-session-start: read stdin failed");
+    }
+    let raw = String::from_utf8_lossy(&bytes);
+    let audit = match AuditLog::from_default_paths() {
+        Ok(audit) => audit,
+        Err(err) => {
+            // 数据目录解析失败时设置同样只能取默认值（总开关关闭），本就不会拉起，留痕也无处可写。
+            tracing::warn!(err = %err, "on-session-start: audit log unavailable");
+            return;
+        }
+    };
+    run_on_session_start_with(
+        &audit,
+        &raw,
+        &settings::current().auto_swap,
+        &SystemLaunchEnv,
+    );
+}
+
+/// `on-session-start` 的可测内核：判定是否拉起 GUI，拉起时把计划交给执行器，最后在审计日志
+/// 留一行痕。用例注入启动环境与 tempdir 里的审计日志。只读设置、只写审计：不碰账号库、凭证、
+/// 额度缓存与自动切换状态，不发网络请求。
+fn run_on_session_start_with(
+    audit: &AuditLog,
+    raw: &str,
+    auto_swap: &kimi_switch_core::settings::AutoSwap,
+    env: &dyn LaunchEnv,
+) {
+    let decision = decide_session_start(auto_swap, env);
+    // 每个事件恰好一行留痕，写在最终决定之后；写失败只 warn（AuditLog::append），不影响 hook。
+    audit.append(session_start_trace(raw, decision));
+}
+
+/// 判定顺序（issue #197）：总开关 → 平台 → 交互会话 → 本会话已有 GUI → 拉起。总开关关闭时
+/// 不调用任何探针。
+fn decide_session_start(
+    auto_swap: &kimi_switch_core::settings::AutoSwap,
+    env: &dyn LaunchEnv,
+) -> SessionStartDecision {
+    if !auto_swap.enabled {
+        return SessionStartDecision::Disabled;
+    }
+    if !env.platform_supported() {
+        return SessionStartDecision::UnsupportedPlatform;
+    }
+    if !env.interactive_session() {
+        return SessionStartDecision::NonInteractive;
+    }
+    if env.gui_running() {
+        return SessionStartDecision::AlreadyRunning;
+    }
+    let cli_exe = match env.cli_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(err = %err, "on-session-start: resolve CLI path failed");
+            return SessionStartDecision::LaunchFailed;
+        }
+    };
+    let Some(plan) = gui_launch_plan(&cli_exe) else {
+        tracing::warn!(cli = %cli_exe.display(), "on-session-start: CLI path has no parent directory");
+        return SessionStartDecision::LaunchFailed;
+    };
+    // 被 `cargo clean` 删掉或正在重建时 GUI 不在：只记一行拉起失败，不调用执行器。
+    if !plan.program.is_file() {
+        tracing::warn!(gui = %plan.program.display(), "on-session-start: GUI program not found");
+        return SessionStartDecision::LaunchFailed;
+    }
+    match env.launch(&plan) {
+        Ok(()) => SessionStartDecision::Launched,
+        Err(err) => {
+            tracing::warn!(err = %err, gui = %plan.program.display(), "on-session-start: launch GUI failed");
+            SessionStartDecision::LaunchFailed
+        }
+    }
+}
+
+/// 拉起计划：CLI 同目录的 GUI，带后台启动参数，工作目录为程序目录，脱离 hook 进程树，
+/// 不继承任何句柄。
+fn gui_launch_plan(cli_exe: &Path) -> Option<LaunchPlan> {
+    let dir = cli_exe.parent()?;
+    Some(LaunchPlan {
+        program: dir.join(GUI_PROGRAM),
+        args: vec![GUI_BACKGROUND_ARG],
+        working_dir: dir.to_path_buf(),
+        detach: true,
+        inherit_handles: false,
+    })
+}
+
+/// 跟随启动留痕（审计 action `on_session_start`，每个 SessionStart 恰好一行）：事件名、来源、
+/// 客户端类型与决定，空格分隔的 key=value。事件字段的清洗与被动留痕同口径（见 [`trace_field`]），
+/// 会话标题、工作目录与 stdin 原文一概不写。
+fn session_start_trace(raw: &str, decision: SessionStartDecision) -> AuditEvent {
+    let event = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let detail = format!(
+        "hook_event={} source={} client_type={} decision={}",
+        trace_field(event.as_ref(), "hook_event_name"),
+        trace_field(event.as_ref(), "source"),
+        trace_field(event.as_ref(), "client_type"),
+        decision.as_str(),
+    );
+    match decision {
+        SessionStartDecision::LaunchFailed => {
+            AuditEvent::err("on_session_start", "kimi", None, &detail)
+        }
+        _ => AuditEvent::ok("on_session_start", "kimi", None).with_detail(detail),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4513,6 +4783,9 @@ mod tests {
         let cli = Cli::try_parse_from(["kimi-switch", "on-quota-failure"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::OnQuotaFailure)));
 
+        let cli = Cli::try_parse_from(["kimi-switch", "on-session-start"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::OnSessionStart)));
+
         let cli = Cli::try_parse_from(["kimi-switch", "install-hook"]).unwrap();
         assert!(matches!(
             cli.cmd,
@@ -4555,7 +4828,7 @@ mod tests {
         );
     }
 
-    /// 帮助文本把两个新子命令写进命令面（用户要手动执行 install-hook）。
+    /// 帮助文本把 hook 子命令写进命令面（用户要手动执行 install-hook）。
     #[test]
     fn help_documents_hook_subcommands() {
         use clap::CommandFactory as _;
@@ -4565,6 +4838,362 @@ mod tests {
         assert!(help.contains("install-hook"), "{help}");
         assert!(help.contains("Always exits 0"), "{help}");
         assert!(help.contains("--uninstall"), "{help}");
+
+        // 拉起器（issue #197）：由 hook 唤起、退出码恒 0、不要手动执行。
+        assert!(help.contains("on-session-start"), "{help}");
+        let launcher = super::Cli::command()
+            .find_subcommand("on-session-start")
+            .expect("on-session-start")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(launcher.contains("SessionStart hook"), "{launcher}");
+        assert!(launcher.contains("Always exits 0"), "{launcher}");
+        assert!(launcher.contains("do not run it manually"), "{launcher}");
+    }
+
+    // -----------------------------------------------------------------------
+    // on-session-start（跟随启动拉起器，issue #197 / ADR-0021）
+    // -----------------------------------------------------------------------
+
+    /// 拉起器用例的启动环境：探针取值由用例给定，记下被调用的探针与交给执行器的拉起计划。
+    /// 执行器是假的，用例绝不真的拉起 GUI。
+    struct FakeLaunchEnv {
+        platform_supported: bool,
+        interactive: bool,
+        gui_running: bool,
+        cli_exe: std::path::PathBuf,
+        launch_error: Option<std::io::ErrorKind>,
+        probes: std::cell::RefCell<Vec<&'static str>>,
+        plans: std::cell::RefCell<Vec<super::LaunchPlan>>,
+    }
+
+    impl FakeLaunchEnv {
+        /// Windows 桌面交互会话、GUI 没在运行、执行器成功；CLI 位于 `bin`。
+        fn desktop(bin: &std::path::Path) -> Self {
+            Self {
+                platform_supported: true,
+                interactive: true,
+                gui_running: false,
+                cli_exe: bin.join("kimi-switch-cli.exe"),
+                launch_error: None,
+                probes: Default::default(),
+                plans: Default::default(),
+            }
+        }
+    }
+
+    impl super::LaunchEnv for FakeLaunchEnv {
+        fn platform_supported(&self) -> bool {
+            self.probes.borrow_mut().push("platform_supported");
+            self.platform_supported
+        }
+
+        fn interactive_session(&self) -> bool {
+            self.probes.borrow_mut().push("interactive_session");
+            self.interactive
+        }
+
+        fn gui_running(&self) -> bool {
+            self.probes.borrow_mut().push("gui_running");
+            self.gui_running
+        }
+
+        fn cli_exe(&self) -> std::io::Result<std::path::PathBuf> {
+            self.probes.borrow_mut().push("cli_exe");
+            Ok(self.cli_exe.clone())
+        }
+
+        fn launch(&self, plan: &super::LaunchPlan) -> std::io::Result<()> {
+            self.plans.borrow_mut().push(plan.clone());
+            match self.launch_error {
+                Some(kind) => Err(kind.into()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn auto_swap_enabled(enabled: bool) -> kimi_switch_core::settings::AutoSwap {
+        kimi_switch_core::settings::AutoSwap {
+            enabled,
+            ..kimi_switch_core::settings::AutoSwap::default()
+        }
+    }
+
+    /// SessionStart 载荷的真实形态：官方 hooks 文档的公共字段（hook_event_name、session_id、
+    /// session_title、client_type、cwd）加 SessionStart 专有的 source、model、profile。
+    /// 会话标题与工作目录是用户内容。
+    fn session_start_event(source: &str) -> String {
+        serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "7f3c9a2e-1b4d-4e5f-8a6b-0c1d2e3f4a5b",
+            "session_title": "修一下 README 里的安装步骤",
+            "client_type": "kimi_code_cli",
+            "cwd": r"D:\work\secret-project",
+            "source": source,
+            "model": "kimi-k2",
+            "profile": "default",
+        })
+        .to_string()
+    }
+
+    /// 审计日志里的 on_session_start 留痕。
+    fn session_traces(audit: &super::AuditLog) -> Vec<AuditEvent> {
+        std::fs::read_to_string(audit.path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+            .filter(|event| event.action == "on_session_start")
+            .collect()
+    }
+
+    /// 拉起：桌面交互会话里 GUI 没在运行时，拉起 CLI 同目录的 GUI，带后台启动参数；工作目录
+    /// 是程序目录（不占住会话的项目目录），脱离 hook 的进程树，不继承 hook 的标准输入输出；
+    /// 审计恰好一行 decision=launched。
+    #[test]
+    fn session_start_launches_gui_in_background() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin dir");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("kimi-switch.exe"), "").unwrap();
+        let env = FakeLaunchEnv::desktop(&bin);
+        let audit = super::AuditLog::new(tmp.path().join("audit.log"));
+
+        super::run_on_session_start_with(
+            &audit,
+            &session_start_event("startup"),
+            &auto_swap_enabled(true),
+            &env,
+        );
+
+        assert_eq!(
+            *env.plans.borrow(),
+            [super::LaunchPlan {
+                program: bin.join("kimi-switch.exe"),
+                args: vec!["--background"],
+                working_dir: bin.clone(),
+                detach: true,
+                inherit_handles: false,
+            }]
+        );
+        let traces = session_traces(&audit);
+        assert_eq!(
+            traces.len(),
+            1,
+            "每个 SessionStart 恰好一行留痕：{traces:?}"
+        );
+        assert_eq!(traces[0].result, "ok");
+        assert_eq!(
+            traces[0].detail.as_deref(),
+            Some("hook_event=SessionStart source=startup client_type=kimi_code_cli decision=launched")
+        );
+    }
+
+    /// 判定顺序：总开关关闭 → 非 Windows 平台 → 非交互会话 → 本会话已有 GUI → 拉起；GUI 程序
+    /// 缺失或执行器失败记 launch_failed（result=error）。每个分支审计恰好一行，只有走到拉起的
+    /// 分支才把计划交给执行器。
+    #[test]
+    fn session_start_decision_order_traces_each_branch() {
+        struct Case {
+            name: &'static str,
+            enabled: bool,
+            env: fn(&mut FakeLaunchEnv),
+            gui_exists: bool,
+            decision: &'static str,
+            result: &'static str,
+            launches: usize,
+        }
+        let cases = [
+            Case {
+                name: "总开关关闭",
+                enabled: false,
+                env: |_| {},
+                gui_exists: true,
+                decision: "disabled",
+                result: "ok",
+                launches: 0,
+            },
+            Case {
+                name: "非 Windows 平台",
+                enabled: true,
+                env: |env| env.platform_supported = false,
+                gui_exists: true,
+                decision: "unsupported_platform",
+                result: "ok",
+                launches: 0,
+            },
+            Case {
+                name: "非交互会话（SSH、服务）",
+                enabled: true,
+                env: |env| env.interactive = false,
+                gui_exists: true,
+                decision: "non_interactive",
+                result: "ok",
+                launches: 0,
+            },
+            Case {
+                name: "本会话已有 GUI",
+                enabled: true,
+                env: |env| env.gui_running = true,
+                gui_exists: true,
+                decision: "already_running",
+                result: "ok",
+                launches: 0,
+            },
+            Case {
+                name: "GUI 程序不在 CLI 同目录",
+                enabled: true,
+                env: |_| {},
+                gui_exists: false,
+                decision: "launch_failed",
+                result: "error",
+                launches: 0,
+            },
+            Case {
+                name: "执行器失败",
+                enabled: true,
+                env: |env| env.launch_error = Some(std::io::ErrorKind::PermissionDenied),
+                gui_exists: true,
+                decision: "launch_failed",
+                result: "error",
+                launches: 1,
+            },
+            Case {
+                name: "拉起",
+                enabled: true,
+                env: |_| {},
+                gui_exists: true,
+                decision: "launched",
+                result: "ok",
+                launches: 1,
+            },
+        ];
+        for case in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            if case.gui_exists {
+                std::fs::write(bin.join("kimi-switch.exe"), "").unwrap();
+            }
+            let mut env = FakeLaunchEnv::desktop(&bin);
+            (case.env)(&mut env);
+            let audit = super::AuditLog::new(tmp.path().join("audit.log"));
+
+            super::run_on_session_start_with(
+                &audit,
+                &session_start_event("resume"),
+                &auto_swap_enabled(case.enabled),
+                &env,
+            );
+
+            let traces = session_traces(&audit);
+            assert_eq!(traces.len(), 1, "{}：{traces:?}", case.name);
+            assert_eq!(traces[0].result, case.result, "{}", case.name);
+            let expected = format!(
+                "hook_event=SessionStart source=resume client_type=kimi_code_cli decision={}",
+                case.decision
+            );
+            assert_eq!(
+                traces[0].detail.as_deref(),
+                Some(expected.as_str()),
+                "{}",
+                case.name
+            );
+            assert_eq!(env.plans.borrow().len(), case.launches, "{}", case.name);
+        }
+    }
+
+    /// 总开关关闭时不调用任何探针，也不调用执行器，只留一行 decision=disabled。
+    #[test]
+    fn session_start_disabled_probes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = FakeLaunchEnv::desktop(tmp.path());
+        let audit = super::AuditLog::new(tmp.path().join("audit.log"));
+
+        super::run_on_session_start_with(
+            &audit,
+            &session_start_event("startup"),
+            &auto_swap_enabled(false),
+            &env,
+        );
+
+        assert!(env.probes.borrow().is_empty(), "{:?}", env.probes.borrow());
+        assert!(env.plans.borrow().is_empty());
+        assert_eq!(session_traces(&audit).len(), 1);
+    }
+
+    /// stdin 畸形或缺字段时照常按判定顺序拉起，读不到的字段记 `-`；字段清洗与被动留痕的
+    /// error_type 同口径（只留 `[A-Za-z0-9_.:-]`，至多 64 字符）。
+    #[test]
+    fn session_start_malformed_stdin_still_launches() {
+        let long = "x".repeat(80);
+        let long_payload = format!(r#"{{"source":"{long}"}}"#);
+        let cases = [
+            (
+                "not json at all",
+                "hook_event=- source=- client_type=-".to_string(),
+            ),
+            ("", "hook_event=- source=- client_type=-".to_string()),
+            ("[1, 2]", "hook_event=- source=- client_type=-".to_string()),
+            (
+                r#"{"hook_event_name":42,"source":"resume"}"#,
+                "hook_event=- source=resume client_type=-".to_string(),
+            ),
+            (
+                r#"{"hook_event_name":"SessionStart","client_type":"kimi code desktop/1.2.0 (win32)"}"#,
+                "hook_event=SessionStart source=- client_type=kimi_code_desktop_1.2.0__win32_"
+                    .to_string(),
+            ),
+            (
+                long_payload.as_str(),
+                format!("hook_event=- source={} client_type=-", "x".repeat(64)),
+            ),
+        ];
+        for (raw, fields) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("kimi-switch.exe"), "").unwrap();
+            let env = FakeLaunchEnv::desktop(tmp.path());
+            let audit = super::AuditLog::new(tmp.path().join("audit.log"));
+
+            super::run_on_session_start_with(&audit, raw, &auto_swap_enabled(true), &env);
+
+            assert_eq!(env.plans.borrow().len(), 1, "stdin 畸形也照常拉起：{raw}");
+            let traces = session_traces(&audit);
+            assert_eq!(traces.len(), 1, "{raw}");
+            let expected = format!("{fields} decision=launched");
+            assert_eq!(
+                traces[0].detail.as_deref(),
+                Some(expected.as_str()),
+                "{raw}"
+            );
+        }
+    }
+
+    /// 留痕不含用户内容：真实形态载荷的会话标题、工作目录与 stdin 原文都不进审计日志。
+    #[test]
+    fn session_start_trace_omits_user_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("kimi-switch.exe"), "").unwrap();
+        let env = FakeLaunchEnv::desktop(tmp.path());
+        let audit = super::AuditLog::new(tmp.path().join("audit.log"));
+        let raw = session_start_event("resume");
+
+        super::run_on_session_start_with(&audit, &raw, &auto_swap_enabled(true), &env);
+
+        assert_eq!(
+            session_traces(&audit)[0].detail.as_deref(),
+            Some(
+                "hook_event=SessionStart source=resume client_type=kimi_code_cli decision=launched"
+            )
+        );
+        let log = std::fs::read_to_string(audit.path()).unwrap();
+        assert!(!log.contains(&raw), "{log}");
+        for fragment in ["secret-project", "修一下", "README", "7f3c9a2e", "kimi-k2"] {
+            assert!(
+                !log.contains(fragment),
+                "留痕不得含载荷内容「{fragment}」：{log}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
