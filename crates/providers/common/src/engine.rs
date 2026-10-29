@@ -884,7 +884,14 @@ const FORCED_ROTATION_BUDGET_MARGIN: Duration = Duration::from_secs(2);
 /// 本次额度查询剩下的时间够不够发强制轮换：要盖得住轮换请求的超时上限加余量，外层超时才
 /// 不可能在轮换响应返回前取消查询（ADR-0019）。没有外层超时（`time_left` 为 `None`）时
 /// 照发；有外层超时而 runtime 说不出上限时不发（fail-closed）。
-fn forced_rotation_fits(time_left: Option<Duration>, refresh_timeout: Option<Duration>) -> bool {
+///
+/// 查询途中由 401 触发、被取消即丢失的轮换都用这一条规则：停泊账号的强制轮换（引擎），
+/// 以及 adapter 持官方刷新锁的当前账号 401 协调恢复（Kimi）。`time_left` 取自
+/// `quota_query::attempt_time_left`，`refresh_timeout` 取自 [`FileBlobRuntime::refresh_timeout`]。
+pub fn forced_rotation_fits(
+    time_left: Option<Duration>,
+    refresh_timeout: Option<Duration>,
+) -> bool {
     let Some(left) = time_left else {
         return true;
     };

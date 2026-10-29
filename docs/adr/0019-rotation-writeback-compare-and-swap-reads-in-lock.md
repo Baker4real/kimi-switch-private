@@ -3,7 +3,7 @@ type: adr
 title: 凭证侧：轮换写回比对与切换读取进锁
 status: accepted
 tags: [token-rotation, swap, swap-lock, credential-store, race]
-intent: Record the credential-side decisions of spec 185, starting with ticket 186. Every token rotation the tool performs sends its network request outside any lock and commits inside the swap lock against the refresh token it consumed - the stored credential is replaced only while it still holds that token, the live credential is written only while the account is current, the live file is still that account's and still holds that token, store before live; a store write error still lets the live compare-and-write run (the store error is only warned when live took the new credential), and when the swap lock cannot be entered at all (3 s timeout, or the lock file cannot be created, opened or locked) the store is still compare-written while live is left alone, so a new credential is never dropped for a lock fault. The credential store gains an atomic read-compare-write (set_if, atomic in FileStore under its own lock). activate's target read, capture-on-leave and pre-swap identity move into the same swap-lock critical section as the write, post-swap verify and registry commit, so a switch never writes a pre-rotation credential and never misses an intermediate account's live credential; manual swap stays network-free and never waits for an in-flight rotation. Ticket 187 routes the current account's proactive renewal through the same commit - switching away while a renewal is in flight no longer undoes the switch, and the renewed credential still lands in that account's store when the compare passes; dead-token fingerprint clearing and the renewal gate are unchanged. Ticket 188 routes the current account's 401 coordinated recovery through the same commit while it still holds the official refresh lock (official refresh lock -> swap lock, the official lock released only after the commit) - switching away while a recovery is in flight no longer overwrites the live credential, and the new credential lands in the original account's store by compare; dead-token fingerprint discipline is unchanged. Ticket 189 makes every live-to-store backfill (capture-on-leave including the post-swap salvage, the incidental backfill when reading the current account's credential, and the adoption branch of proactive renewal) a compare-and-write through set_if - the same refresh token writes, a store without a refresh token is written, different refresh tokens compare expiry (access token JWT exp first, then expires_at) and a strictly older live never overwrites the store, either side without an expiry keeps live winning, the guard for a live without a refresh token now covers all three, and live is never repaired; this revises ADR-0002 to newer-wins-when-comparable. Ticket 190 makes parked rotation on-demand - a parked account rotates before a quota query only when its access token has less than max(300 s, expires_in x 0.5) left (the same credential_expiry hook as the backfill compare; an unparsable expiry or a missing access token still rotates first), and a 401 before that forces one rotation plus one retry; both rotations commit through the writeback compare. The forced rotation is sent only while the quota attempt's remaining time (deadline published by query_quota_with_retry) covers the runtime's declared refresh timeout plus 2 s, otherwise the first 401 is returned and the next query retries with a full budget, so the per-attempt timeout can never cancel a refresh whose request was already sent.
+intent: Record the credential-side decisions of spec 185, starting with ticket 186. Every token rotation the tool performs sends its network request outside any lock and commits inside the swap lock against the refresh token it consumed - the stored credential is replaced only while it still holds that token, the live credential is written only while the account is current, the live file is still that account's and still holds that token, store before live; a store write error still lets the live compare-and-write run (the store error is only warned when live took the new credential), and when the swap lock cannot be entered at all (3 s timeout, or the lock file cannot be created, opened or locked) the store is still compare-written while live is left alone, so a new credential is never dropped for a lock fault. The credential store gains an atomic read-compare-write (set_if, atomic in FileStore under its own lock). activate's target read, capture-on-leave and pre-swap identity move into the same swap-lock critical section as the write, post-swap verify and registry commit, so a switch never writes a pre-rotation credential and never misses an intermediate account's live credential; manual swap stays network-free and never waits for an in-flight rotation. Ticket 187 routes the current account's proactive renewal through the same commit - switching away while a renewal is in flight no longer undoes the switch, and the renewed credential still lands in that account's store when the compare passes; dead-token fingerprint clearing and the renewal gate are unchanged. Ticket 188 routes the current account's 401 coordinated recovery through the same commit while it still holds the official refresh lock (official refresh lock -> swap lock, the official lock released only after the commit) - switching away while a recovery is in flight no longer overwrites the live credential, and the new credential lands in the original account's store by compare; dead-token fingerprint discipline is unchanged, and the refresh is sent only while the quota attempt's remaining time passes the same budget gate as the parked forced rotation (forced_rotation_fits), otherwise the lock is released and the 401 stays unrecovered. Ticket 189 makes every live-to-store backfill (capture-on-leave including the post-swap salvage, the incidental backfill when reading the current account's credential, and the adoption branch of proactive renewal) a compare-and-write through set_if - the same refresh token writes, a store without a refresh token is written, different refresh tokens compare expiry (access token JWT exp first, then expires_at) and a strictly older live never overwrites the store, either side without an expiry keeps live winning, the guard for a live without a refresh token now covers all three, and live is never repaired; this revises ADR-0002 to newer-wins-when-comparable. Ticket 190 makes parked rotation on-demand - a parked account rotates before a quota query only when its access token has less than max(300 s, expires_in x 0.5) left (the same credential_expiry hook as the backfill compare; an unparsable expiry or a missing access token still rotates first), and a 401 before that forces one rotation plus one retry; both rotations commit through the writeback compare. The forced rotation is sent only while the quota attempt's remaining time (deadline published by query_quota_with_retry) covers the runtime's declared refresh timeout plus 2 s, otherwise the first 401 is returned and the next query retries with a full budget, so the per-attempt timeout can never cancel a refresh whose request was already sent.
 documents:
   symbols:
     - commit_rotation_with
@@ -20,6 +20,7 @@ documents:
     - parked_rotation_due
     - forced_rotation_fits
     - attempt_time_left
+    - with_attempt_deadline
     - refresh_timeout
 ---
 # 凭证侧：轮换写回比对与切换读取进锁
@@ -137,6 +138,10 @@ spec #185 问题 1 的另一处：开启主动续期（ADR-0003 第 2 条）时�
 - 交换锁进不去时同决策 3：只按比对写库存，不碰当前登录文件。
 - 死 token 指纹纪律不变：刷新被拒时记录指纹并停试，轮换成功后清掉被消耗 token 的指纹。
 - 本次查询照用新 access token 重试，不论新凭证落在当前登录文件还是库存。
+- 预算门与停泊账号的强制轮换（决策 9）同一条规则、同一个函数（引擎公开的
+  `forced_rotation_fits`）：等官方刷新锁最多 15 秒，可能已用掉本次 attempt 的大半预算。拿到锁、
+  发刷新前核对剩余时间，不够轮换超时上限（`refresh_timeout`，10 秒）加 2 秒就不发，放锁按
+  未恢复的 401 返回（照旧归类为凭证过期型 401 或裸 401），留给下次查询。
 
 官方刷新锁在提交所在的阻塞任务里释放，查询被取消也不会在写回途中提前放锁。Kimi adapter
 （`KimiRuntime`）持有与引擎同一份凭证存储和注册表，经引擎公开的 `commit_rotation_with` 提交，
@@ -199,8 +204,8 @@ runtime 返回 `None`，与旧版一样每次查询前都轮换。
 401 查询之后，起步时预算可能已所剩无几；照发就让「请求已发出、服务端已消耗一次性 refresh token、
 响应被外层超时丢掉、只能重新授权」变得可达。机制：
 
-- `query_quota_with_retry` 经 task-local 公布本次 attempt 的超时时刻，引擎经
-  `quota_query::attempt_time_left` 读剩余时间。
+- `query_quota_with_retry` 的每次 attempt 经 `quota_query::with_attempt_deadline` 运行：它既施加
+  外层超时，也经 task-local 公布超时时刻，引擎经 `quota_query::attempt_time_left` 读剩余时间。
 - runtime 经 `FileBlobRuntime::refresh_timeout` 声明轮换请求发出后最多多久必定返回。Kimi 为 10 秒：
   连接到响应体读完都在这一个超时里，代理回退直连也只用剩余时间（ADR-0005）。
 - 判定在引擎（`forced_rotation_fits`）：剩余时间 ≥ 上限 + 2 秒才发。2 秒余量盖住发请求前的本地
@@ -231,8 +236,9 @@ runtime 返回 `None`，与旧版一样每次查询前都轮换。
 - 临期轮换仍排在单次查询开头，靠 `quota.fetch_timeout_ms`（默认 20 秒）大于轮换请求的 10 秒超时，
   保证外层超时不在响应返回前取消它。用户把单次超时调到 10 秒左右或更低时，这一处保留 #190 之前就有的
   暴露面（旧行为每次查询都先轮换）。当前账号主动续期同样排在查询开头，不在本票范围。
-- 预算门只认 `query_quota_with_retry` 公布的超时时刻。以后若有调用方在 `Provider::query_quota`
-  外面另加超时，必须同样公布（见 `attempt_time_left` 的文档），否则强制轮换会当作没有外层超时照发。
+- 预算门只认 `with_attempt_deadline` 公布的超时时刻。以后若有调用方在 `Provider::query_quota`
+  外面另加超时，必须经它加（见 `attempt_time_left` 的文档），否则强制轮换与 401 协调恢复会当作
+  没有外层超时照发。
 - 慢 401 之后的强制轮换被推迟到下次查询：该账号这一轮仍是 401，并进 90 秒鉴权退避（ADR-0009），
   退避结束后的查询拿到完整预算再强制轮换。
 
@@ -286,6 +292,8 @@ runtime 返回 `None`，与旧版一样每次查询前都轮换。
   覆盖了已切成另一账号的当前登录文件。本地 OAuth 替身收下刷新请求后停住，测试在交换锁内完成
   切换再放行。
 - `recovery_without_switch_writes_live_and_store`
+- `recovery_too_late_in_attempt_leaves_refresh_to_next_query`：attempt 只剩轮换超时上限加 1 秒时
+  不发刷新、放开官方刷新锁、返回未恢复。加预算门前为红：照发刷新并返回新 access token。
 
 既有 401 恢复、DeadToken 指纹、取消后释放锁用例保持绿；只在非 Windows 编译的几例只改了调用参数。
 

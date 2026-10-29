@@ -17,16 +17,27 @@ tokio::task_local! {
     static ATTEMPT_DEADLINE: tokio::time::Instant;
 }
 
-/// 本次额度查询 attempt 距外层超时还剩多久；不在 [`query_quota_with_retry`] 的 attempt 里
+/// 本次额度查询 attempt 距外层超时还剩多久；不在 [`with_attempt_deadline`] 的 attempt 里
 /// （没有外层超时会取消本次查询）时返回 `None`。
 ///
-/// 供 Provider 在发出「被取消即丢失」的请求前判断剩余时间够不够：停泊账号遇 401 的强制轮换
-/// 盖不住轮换请求的超时上限时不发（ADR-0019）。在 `Provider::query_quota` 外面另加超时的
-/// 调用方必须同样公布超时时刻，否则 Provider 会当作没有外层超时。
+/// 供 Provider 在发出「被取消即丢失」的请求前判断剩余时间够不够：停泊账号遇 401 的强制轮换、
+/// 当前账号的 401 协调恢复，盖不住轮换请求的超时上限时都不发（ADR-0019）。在
+/// `Provider::query_quota` 外面另加超时的调用方必须经 [`with_attempt_deadline`] 加，否则
+/// Provider 会当作没有外层超时。
 pub fn attempt_time_left() -> Option<Duration> {
     ATTEMPT_DEADLINE
         .try_with(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
         .ok()
+}
+
+/// 在外层超时 `deadline` 下运行一次额度查询 attempt：到点即取消 `attempt` 并返回 `Err(Elapsed)`，
+/// 期间经 [`attempt_time_left`] 向 Provider 公布剩余时间。[`query_quota_with_retry`] 的每次
+/// attempt 都经它运行；另加外层超时的调用方也必须用它，不能直接套 `tokio::time::timeout`。
+pub async fn with_attempt_deadline<F: std::future::Future>(
+    deadline: tokio::time::Instant,
+    attempt: F,
+) -> std::result::Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout_at(deadline, ATTEMPT_DEADLINE.scope(deadline, attempt)).await
 }
 
 /// 按当前配置查询 quota，失败或单次超时后做保守重试。
@@ -49,9 +60,7 @@ async fn query_quota_with_retry_config(
         // 超时时刻经 task-local 公布给 Provider（见 [`attempt_time_left`]）；
         // 时刻溢出（超时配置大到离谱）等同不设超时，与 `tokio::time::timeout` 一致。
         let outcome = match tokio::time::Instant::now().checked_add(timeout) {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline, ATTEMPT_DEADLINE.scope(deadline, query)).await
-            }
+            Some(deadline) => with_attempt_deadline(deadline, query).await,
             None => Ok(query.await),
         };
         let result = outcome.unwrap_or_else(|_| Err(Error::quota_timeout()));

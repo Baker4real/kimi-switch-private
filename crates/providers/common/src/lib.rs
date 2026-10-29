@@ -5,6 +5,6 @@ pub mod engine;
 pub mod json;
 pub mod runtime;
 
-pub use engine::FileBlobProvider;
+pub use engine::{forced_rotation_fits, FileBlobProvider};
 pub use json::{extract_access_token, extract_refresh_token, extract_token};
 pub use runtime::{BlobMetadata, CredentialExpiry, FileBlobRuntime, RefreshOutcome};
