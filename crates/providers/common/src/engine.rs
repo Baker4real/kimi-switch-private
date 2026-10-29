@@ -855,8 +855,10 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 交换锁等不到（3 秒上限）时放弃写当前登录文件，库存仍在凭证存储自身的锁下按比对
     /// 写入并记 warn：新凭证绝不丢弃。比对只看 refresh token，不比整串。
     ///
-    /// 借用参数、同步执行，供各写回点（停泊账号查询前轮换等）在 `spawn_blocking` 里共用。
-    fn commit_rotation_with(
+    /// 借用参数、同步执行，供各写回点在 `spawn_blocking` 里共用：引擎内的停泊账号查询前轮换，
+    /// 以及 adapter 自己持官方刷新锁完成刷新的写回点（Kimi 401 协调恢复；锁顺序官方刷新锁 →
+    /// 交换锁）。`store`、`registry`、`home` 必须是该 provider 装配时的同一份。
+    pub fn commit_rotation_with(
         runtime: &A,
         store: &dyn CredentialStore,
         registry: &AccountRegistry,
