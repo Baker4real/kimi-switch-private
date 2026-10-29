@@ -86,9 +86,9 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
         None
     }
 
-    /// [`Self::refresh`] 发出请求后最多多久必定返回（响应或错误）。停泊账号遇 401 的强制轮换
-    /// 只在本次额度查询剩余时间盖得住它加余量时才发，免得外层超时在响应返回前取消查询、
-    /// 丢掉服务端已消耗的一次性 refresh token（ADR-0019）。
+    /// 调用 [`Self::refresh`] 最多多久必定返回（响应或错误，含发请求前的本地准备）。停泊账号
+    /// 遇 401 的强制轮换只在本次额度查询剩余时间盖得住它加余量时才发，免得外层超时在响应返回前
+    /// 取消查询、丢掉服务端已消耗的一次性 refresh token（ADR-0019）。
     /// 默认 `None`：上限不明，有外层超时时一律不强制轮换（fail-closed）。
     fn refresh_timeout(&self) -> Option<Duration> {
         None
