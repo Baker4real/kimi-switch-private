@@ -20,6 +20,15 @@ pub struct BlobMetadata {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// access token 的过期信息，供停泊按需轮换判定临期（ADR-0019）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessTokenExpiry {
+    /// 过期时刻（Unix 秒）。
+    pub expires_at: i64,
+    /// 凭证声明的 access token 寿命（秒，即 `expires_in`）；缺失为 `None`。
+    pub expires_in: Option<i64>,
+}
+
 /// 刷新结果。
 pub enum RefreshOutcome {
     /// 刷新成功，返回轮换后的完整 blob。
@@ -55,12 +64,20 @@ pub trait FileBlobRuntime: Send + Sync + 'static {
     /// 刷新一个 blob，返回轮换后的完整 blob。对 parked 账号按需调用；
     /// 当前账号仅在主动续期判定通过时调用（见 `proactive_renewal_wanted`）。
     async fn refresh(&self, blob: &str) -> Result<RefreshOutcome>;
-    /// 查询额度。`access_token` 由引擎保证是新鲜的（parked 已按需刷新；
-    /// 当前账号开启主动续期时已按需轮换）。
+    /// 查询额度。parked 账号的 access token 临期时引擎已先轮换，未临期遇 401 时引擎强制
+    /// 轮换一次再重试一次（停泊按需轮换，ADR-0019）；当前账号开启主动续期时已按需轮换。
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>>;
 
     /// 可选：在 store/live 都拿不到时，从 provider 私有 legacy 布局恢复 blob。默认无。
     fn recover_legacy(&self, _home: &Path, _account: &Account) -> Option<String> {
+        None
+    }
+
+    /// 停泊按需轮换（ADR-0019）用的 access token 过期信息。blob 没有 access token、或过期
+    /// 时刻解析不出时返回 `None`，引擎据此维持「先轮换再查询」。阈值判定在引擎。
+    /// 默认 `None`：不提供该能力的 runtime 与旧版一样每次查询前都轮换停泊账号。
+    fn access_token_expiry(&self, blob: &str) -> Option<AccessTokenExpiry> {
+        let _ = blob;
         None
     }
 

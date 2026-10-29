@@ -24,7 +24,7 @@ use kimi_switch_core::swap::{swap_with_snapshot_protected, with_swap_lock, SwapT
 use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, Provider, Quota};
 
 use crate::json::{extract_access_token, extract_refresh_token};
-use crate::runtime::{BlobMetadata, FileBlobRuntime, RefreshOutcome};
+use crate::runtime::{AccessTokenExpiry, BlobMetadata, FileBlobRuntime, RefreshOutcome};
 
 // 测试 seam（issue #153）：让下一次 `write_blob` 的 live fsync 失败（一次性），
 // 覆盖「fsync 失败进入既有回滚路径而非静默成功」。
@@ -678,16 +678,11 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
             if self.runtime.proactive_renewal_wanted(&raw).await {
                 raw = self.renew_active_proactively(&account, raw).await?;
             }
-        } else if let Some(fresh) = self.refresh_parked_if_needed(&account, &raw).await? {
-            // parked 账号：access token 大概率过期，先按需刷新。
-            raw = fresh;
+        } else {
+            // 停泊按需轮换（ADR-0019）：临期才先轮换，未临期遇 401 强制轮换一次、重试一次。
+            return self.query_parked_quota(&account, &raw).await;
         }
-        let access = extract_access_token(&raw).ok_or_else(|| {
-            Error::quota_missing_credential(
-                "no access_token in credentials; schema may have changed",
-            )
-        })?;
-        self.runtime.fetch_quota(&access, &account).await
+        self.fetch_quota_with_blob(&account, &raw).await
     }
 
     /// 当前账号：当前登录文件 mtime 晚于 `failed_at` 即凭证恢复信号；停泊账号恒无信号。
@@ -766,9 +761,69 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     }
 }
 
+/// 停泊按需轮换阈值 max(300 秒, `expires_in` × 0.5) 的下限一项（秒），与官方 OAuth 管理器同一
+/// 口径（ADR-0019）。只写在 ADR 与 CONTEXT.md，不进配置。
+const PARKED_ROTATION_MIN_REMAINING_SECS: i64 = 300;
+
+/// 停泊账号此刻是否该先轮换再查询（停泊按需轮换，ADR-0019）：access token 剩余不足
+/// max(300 秒, `expires_in` × 0.5) 即临期，已过期同样算；`expires_in` 缺失时阈值取 300 秒；
+/// 过期时刻解析不出（`None`）→ 维持旧行为，先轮换。
+fn parked_rotation_due(expiry: Option<AccessTokenExpiry>, now: i64) -> bool {
+    let Some(expiry) = expiry else {
+        return true;
+    };
+    let remaining = expiry.expires_at.saturating_sub(now);
+    // 「剩余 < max(300, 寿命 × 0.5)」拆成两项各比一次；寿命一项两边乘 2，整数运算不丢半秒。
+    remaining < PARKED_ROTATION_MIN_REMAINING_SECS
+        || expiry
+            .expires_in
+            .is_some_and(|lifetime| remaining.saturating_mul(2) < lifetime)
+}
+
 impl<A: FileBlobRuntime> FileBlobProvider<A> {
+    /// 停泊账号的额度查询（停泊按需轮换，ADR-0019）：access token 临期（见
+    /// [`parked_rotation_due`]）或过期时刻解析不出时先轮换再查询。未临期直接用现有 access
+    /// token 查询；遇 401（服务端提前作废了 access token）强制轮换一次、重试一次。
+    ///
+    /// 两种轮换都走 [`Self::refresh_parked_if_needed`]，经轮换写回比对提交、守 DeadToken 指纹
+    /// 纪律。强制轮换被拒或不可用时返回首个 401，重试仍是 401 时原样返回：都按既有停泊 401
+    /// 口径呈现（裸 401），不归为凭证待续期。
+    async fn query_parked_quota(&self, account: &Account, raw: &str) -> Result<Vec<Quota>> {
+        let expiry = self.runtime.access_token_expiry(raw);
+        if parked_rotation_due(expiry, Utc::now().timestamp()) {
+            let fresh = self.refresh_parked_if_needed(account, raw).await?;
+            return self
+                .fetch_quota_with_blob(account, fresh.as_deref().unwrap_or(raw))
+                .await;
+        }
+        match self.fetch_quota_with_blob(account, raw).await {
+            Err(unauthorized) if unauthorized.http_status() == Some(401) => {
+                tracing::info!(
+                    account = %account.id,
+                    "parked quota query got 401 before access token expiry; forcing one rotation"
+                );
+                match self.refresh_parked_if_needed(account, raw).await? {
+                    Some(fresh) => self.fetch_quota_with_blob(account, &fresh).await,
+                    None => Err(unauthorized),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// 用 blob 里的 access token 查询额度。
+    async fn fetch_quota_with_blob(&self, account: &Account, raw: &str) -> Result<Vec<Quota>> {
+        let access = extract_access_token(raw).ok_or_else(|| {
+            Error::quota_missing_credential(
+                "no access_token in credentials; schema may have changed",
+            )
+        })?;
+        self.runtime.fetch_quota(&access, account).await
+    }
+
     /// parked 账号刷新一次，结果经轮换写回比对提交（[`Self::commit_rotation`]，ADR-0019）：
     /// 刷新请求在锁外，提交在交换锁内，轮换期间被切成当前账号时同步写当前登录文件。
+    /// 由 [`Self::query_parked_quota`] 在临期时、或未临期遇 401 时调用。
     /// 返回 `Some(新 blob)` 表示已轮换；本次查询照用新凭证，不论库存是否因比对不符放弃写入。
     ///
     /// DeadToken（issue #80）：复用当前账号主动续期的指纹纪律——发前若指纹在案则跳过
@@ -1012,7 +1067,11 @@ mod tests {
         home: PathBuf,
         refresh_behavior: RefreshBehavior,
         refresh_calls: AtomicUsize,
+        /// 额度查询次数（停泊按需轮换的「重试一次」靠它断言）。
+        fetch_calls: AtomicUsize,
         last_access_token: Mutex<Option<String>>,
+        /// 用这些 access token 查询额度一律返回 401，模拟服务端提前作废了 access token。
+        unauthorized_access_tokens: HashSet<String>,
         legacy_blob: Option<String>,
         /// 默认 "dedup_key"；部分测试覆盖成非默认名，模拟 Beta 把去重键落在
         /// 一个迁移前就存在、不叫 "dedup_key" 的字段名下。
@@ -1064,7 +1123,9 @@ mod tests {
                 home,
                 refresh_behavior,
                 refresh_calls: AtomicUsize::new(0),
+                fetch_calls: AtomicUsize::new(0),
                 last_access_token: Mutex::new(None),
+                unauthorized_access_tokens: HashSet::new(),
                 legacy_blob: None,
                 dedup_extra_key: "dedup_key",
                 proactive_wanted: false,
@@ -1170,11 +1231,23 @@ mod tests {
             })
         }
         async fn fetch_quota(&self, access_token: &str, _account: &Account) -> Result<Vec<Quota>> {
+            self.fetch_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_access_token.lock().unwrap() = Some(access_token.to_string());
+            if self.unauthorized_access_tokens.contains(access_token) {
+                return Err(Error::quota_http(401, "fake usages HTTP 401 Unauthorized"));
+            }
             Ok(vec![])
         }
         fn recover_legacy(&self, _home: &Path, _account: &Account) -> Option<String> {
             self.legacy_blob.clone()
+        }
+        // 测试 blob 不是 JWT：过期信息直接取顶层 `expires_at` / `expires_in`（整数秒）。
+        fn access_token_expiry(&self, blob: &str) -> Option<AccessTokenExpiry> {
+            let v: serde_json::Value = serde_json::from_str(blob).ok()?;
+            Some(AccessTokenExpiry {
+                expires_at: v.get("expires_at")?.as_i64()?,
+                expires_in: v.get("expires_in").and_then(|x| x.as_i64()),
+            })
         }
 
         async fn proactive_renewal_wanted(&self, _blob: &str) -> bool {
@@ -2007,6 +2080,7 @@ mod tests {
         );
     }
 
+    /// 凭证不带过期信息（过期时刻解析不出）→ 停泊按需轮换维持旧行为，先轮换再查询（ADR-0019）。
     #[tokio::test]
     async fn query_quota_refreshes_parked_account_and_persists_rotation() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2195,6 +2269,279 @@ mod tests {
                 .as_deref(),
             Some("PARKED"),
             "停泊死号后续查询仍用旧 access token"
+        );
+    }
+
+    // --- query_quota：停泊按需轮换（ADR-0019，#190）---
+
+    /// 停泊按需轮换用例的凭证：access token 在此刻之后 `remaining_secs` 秒过期，`expires_in` 可缺。
+    fn blob_expiring_in(uid: &str, remaining_secs: i64, expires_in: Option<i64>) -> String {
+        let mut blob = serde_json::json!({
+            "uid": uid,
+            "refresh_token": format!("R-{uid}"),
+            "access_token": format!("A-{uid}"),
+            "expires_at": Utc::now().timestamp() + remaining_secs,
+        });
+        if let Some(secs) = expires_in {
+            blob["expires_in"] = secs.into();
+        }
+        blob.to_string()
+    }
+
+    /// 未临期（15 分钟寿命还剩 14 分钟，阈值 max(300, 450) = 450 秒）→ 直接用现有 access token
+    /// 查询，不轮换，库存凭证不动。
+    #[tokio::test]
+    async fn parked_query_before_expiry_does_not_rotate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Rotate);
+        let p = provider_with(tmp.path(), runtime);
+        let blob = blob_expiring_in("u1", 840, Some(900));
+        let account = p.import_raw(blob.clone(), None, Some(false)).unwrap();
+
+        p.query_quota(&account.id).await.unwrap();
+
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            0,
+            "未临期不得轮换"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("A-u1")
+        );
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            blob,
+            "未轮换时库存凭证不动"
+        );
+    }
+
+    /// 临期（剩余不足阈值）或已过期 → 先轮换再查询，查询用轮换后的 access token。
+    #[tokio::test]
+    async fn parked_query_near_or_past_expiry_rotates_first() {
+        for (remaining, expires_in, case) in [
+            (400, Some(900), "剩 400 秒，不足半寿命 450 秒"),
+            (200, None, "expires_in 缺失，剩 200 秒不足 300 秒"),
+            (-60, Some(900), "已过期"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let runtime =
+                FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Rotate);
+            let p = provider_with(tmp.path(), runtime);
+            let blob = blob_expiring_in("u1", remaining, expires_in);
+            let account = p.import_raw(blob, None, Some(false)).unwrap();
+
+            p.query_quota(&account.id).await.unwrap();
+
+            assert_eq!(
+                p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+                1,
+                "{case}：应先轮换"
+            );
+            assert_eq!(
+                p.test_runtime()
+                    .last_access_token
+                    .lock()
+                    .unwrap()
+                    .as_deref(),
+                Some("ROTATED"),
+                "{case}：查询应用轮换后的 access token"
+            );
+        }
+    }
+
+    /// 阈值 max(300 秒, expires_in × 0.5) 的边界：剩余「不足」才临期，恰好等于阈值不算；
+    /// expires_in 缺失取 300 秒；已过期算临期；过期时刻解析不出照旧先轮换。
+    #[test]
+    fn parked_rotation_threshold_is_max_of_300s_and_half_lifetime() {
+        let now = 2_000_000_000_i64;
+        let due = |remaining: i64, expires_in: Option<i64>| {
+            parked_rotation_due(
+                Some(AccessTokenExpiry {
+                    expires_at: now + remaining,
+                    expires_in,
+                }),
+                now,
+            )
+        };
+        // 15 分钟寿命：阈值取半寿命 450 秒。
+        assert!(!due(450, Some(900)));
+        assert!(due(449, Some(900)));
+        // 寿命 400 秒：半寿命 200 秒低于下限，阈值取 300 秒。
+        assert!(!due(300, Some(400)));
+        assert!(due(299, Some(400)));
+        // expires_in 缺失：阈值取 300 秒。
+        assert!(!due(300, None));
+        assert!(due(299, None));
+        // 奇数寿命不丢半秒：901 秒的阈值是 450.5 秒，剩 450 秒已不足。
+        assert!(due(450, Some(901)));
+        assert!(!due(451, Some(901)));
+        // 已过期（含恰在过期时刻）算临期。
+        assert!(due(0, Some(900)));
+        assert!(due(-60, Some(900)));
+        // 过期时刻解析不出：维持旧行为，先轮换。
+        assert!(parked_rotation_due(None, now));
+    }
+
+    /// 未临期却遇 401（服务端提前作废了 access token）→ 强制轮换一次，用新 access token 重试一次；
+    /// 强制轮换的结果照常落库。
+    #[tokio::test]
+    async fn parked_401_before_expiry_forces_one_rotation_and_retries_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Rotate);
+        runtime.unauthorized_access_tokens.insert("A-u1".into());
+        let p = provider_with(tmp.path(), runtime);
+        let blob = blob_expiring_in("u1", 840, Some(900));
+        let account = p.import_raw(blob, None, Some(false)).unwrap();
+
+        p.query_quota(&account.id)
+            .await
+            .expect("强制轮换后重试应成功");
+
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            1,
+            "只强制轮换一次"
+        );
+        assert_eq!(
+            p.test_runtime().fetch_calls.load(Ordering::SeqCst),
+            2,
+            "首次 401 后只重试一次"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("ROTATED")
+        );
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            r#"{"uid":"u1","access_token":"ROTATED"}"#,
+            "强制轮换的结果必须写回库存"
+        );
+    }
+
+    /// 强制轮换被官方拒绝 → 按 DeadToken 指纹纪律记录在案，本次不重试查询，返回首个 401（停泊
+    /// 401 口径）；之后再遇 401 也不再轮换。
+    #[tokio::test]
+    async fn parked_forced_rotation_rejected_records_fingerprint_and_stops_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Dead);
+        runtime.unauthorized_access_tokens.insert("A-u1".into());
+        let p = provider_with(tmp.path(), runtime);
+        let blob = blob_expiring_in("u1", 840, Some(900));
+        let account = p.import_raw(blob.clone(), None, Some(false)).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+
+        let err = p.query_quota(&account.id).await.unwrap_err();
+
+        assert_eq!(err.http_status(), Some(401));
+        assert_eq!(
+            err.quota_failure().map(|failure| failure.kind),
+            Some(QuotaFailureKind::Http),
+            "按停泊 401 口径呈现，不归为凭证待续期"
+        );
+        assert_eq!(
+            fs::read_to_string(p.test_home().join("fake-dead-refresh")).unwrap(),
+            "R-u1",
+            "被拒 refresh token 的指纹必须记录在案"
+        );
+        assert_eq!(
+            p.test_runtime().fetch_calls.load(Ordering::SeqCst),
+            1,
+            "强制轮换被拒后不得重试查询"
+        );
+        assert_eq!(p.test_store_get("u1").unwrap(), blob, "账号库凭证保持不动");
+
+        p.query_quota(&account.id).await.unwrap_err();
+        assert_eq!(
+            p.test_runtime().refresh_calls.load(Ordering::SeqCst),
+            1,
+            "指纹在案：再遇 401 也不再轮换"
+        );
+    }
+
+    /// 强制轮换成功但重试仍是 401 → 原样返回，按停泊 401 口径呈现（裸 401），不归为凭证待续期。
+    #[tokio::test]
+    async fn parked_retry_still_401_keeps_parked_401_presentation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runtime =
+            FakeRuntime::with_behavior(tmp.path().join("home"), RefreshBehavior::Rotate);
+        runtime.unauthorized_access_tokens.insert("A-u1".into());
+        runtime.unauthorized_access_tokens.insert("ROTATED".into());
+        let p = provider_with(tmp.path(), runtime);
+        let blob = blob_expiring_in("u1", 840, Some(900));
+        let account = p.import_raw(blob, None, Some(false)).unwrap();
+
+        let err = p.query_quota(&account.id).await.unwrap_err();
+
+        assert_eq!(err.http_status(), Some(401));
+        assert_eq!(
+            err.quota_failure().map(|failure| failure.kind),
+            Some(QuotaFailureKind::Http),
+            "按停泊 401 口径呈现，不归为凭证待续期"
+        );
+        assert_eq!(p.test_runtime().refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            p.test_runtime().fetch_calls.load(Ordering::SeqCst),
+            2,
+            "只重试一次"
+        );
+    }
+
+    /// 强制轮换同样走轮换写回比对：未临期的 u2 查询遇 401，强制轮换请求已发出时用户切到 u2。
+    /// 放行后当前登录文件与库存凭证都持新凭证，重试用新 access token。
+    #[tokio::test]
+    async fn parked_forced_rotation_in_flight_then_switch_to_it_lands_new_token_in_live_and_store()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let mut runtime =
+            FakeRuntime::with_rotation_gate(tmp.path().join("home"), gate.clone(), U2_ROTATED);
+        runtime.unauthorized_access_tokens.insert("A-u2".into());
+        let p = provider_with(tmp.path(), runtime);
+        fs::create_dir_all(p.test_home()).unwrap();
+        p.import_raw(U1_BLOB.into(), None, Some(true)).unwrap();
+        let u2_blob = blob_expiring_in("u2", 840, Some(900));
+        p.import_raw(u2_blob, None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+        let u2 = AccountId("u2".into());
+
+        let query = p.query_quota(&u2);
+        let switch = async {
+            gate.wait_sent().await;
+            p.activate(&u2).await.unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, switch);
+        quota.expect("强制轮换后重试应成功");
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_ROTATED,
+            "轮换在途时切到 u2，强制轮换的结果必须同步进当前登录文件"
+        );
+        assert_eq!(p.test_store_get("u2").unwrap(), U2_ROTATED);
+        assert_eq!(
+            p.test_runtime().fetch_calls.load(Ordering::SeqCst),
+            2,
+            "先用未临期的旧 access token 查询遇 401，再用新 access token 重试"
+        );
+        assert_eq!(
+            p.test_runtime()
+                .last_access_token
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("A2-NEW")
         );
     }
 
