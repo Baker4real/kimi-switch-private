@@ -1032,8 +1032,14 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 2. 该账号此刻是 registry 当前账号、当前登录文件身份是它、且仍持被消耗的 refresh token
     ///    时，把新凭证原子写进当前登录文件；当前登录文件已经换人或已被别处更新时绝不覆盖。
     ///
-    /// 交换锁等不到（3 秒上限）时放弃写当前登录文件，库存仍在凭证存储自身的锁下按比对
-    /// 写入并记 warn：新凭证绝不丢弃。比对只看 refresh token，不比整串。
+    /// 第 1 步出错（凭证存储 IO 故障）照样执行第 2 步：此刻当前登录文件可能是新 refresh token
+    /// 唯一能落的地方。第 2 步写进了当前登录文件，新凭证已有归宿，库存错误只记 warn、返回成功，
+    /// 之后的回灌新旧比对（ADR-0019 决策 8）把它补回库存；第 2 步没写（不是当前账号、已换人
+    /// 或已被更新）或也出错，如实返回库存错误。
+    ///
+    /// 交换锁没进去（3 秒等待超时，或锁文件建不了、打不开、加锁出错）时临界区一步都没执行：
+    /// 放弃写当前登录文件，库存仍在凭证存储自身的锁下按比对写入并记 warn，新凭证绝不因锁
+    /// 不可用而丢弃。比对只看 refresh token，不比整串。
     ///
     /// 借用参数、同步执行，供各写回点在 `spawn_blocking` 里共用：引擎内的停泊账号查询前轮换与
     /// 当前账号主动续期（经 [`Self::commit_rotation`]），以及 adapter 自己持官方刷新锁完成刷新的
@@ -1049,42 +1055,56 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         rotated: &str,
     ) -> Result<()> {
         let consumed_refresh = extract_refresh_token(consumed);
+        let consumed_refresh = consumed_refresh.as_deref();
+        let entered = std::cell::Cell::new(false);
         let committed = with_swap_lock(&Self::swap_lock_dir(registry, home), || {
-            Self::store_rotation_if_unchanged(
+            entered.set(true);
+            let stored = Self::store_rotation_if_unchanged(
                 runtime,
                 store,
                 account,
-                consumed_refresh.as_deref(),
+                consumed_refresh,
                 rotated,
-            )?;
-            if Self::live_still_holds_consumed(
-                runtime,
-                registry,
-                home,
-                account,
-                consumed_refresh.as_deref(),
-            )? {
-                Self::write_blob(&runtime.live_cred_path(home), rotated)?;
+            );
+            let live =
+                Self::live_still_holds_consumed(runtime, registry, home, account, consumed_refresh)
+                    .and_then(|holds| {
+                        if holds {
+                            Self::write_blob(&runtime.live_cred_path(home), rotated)?;
+                        }
+                        Ok(holds)
+                    });
+            match (stored, live) {
+                (Ok(()), live) => live.map(|_| ()),
+                (Err(store_err), Ok(true)) => {
+                    tracing::warn!(
+                        account = %account.id,
+                        err = %store_err,
+                        "rotation writeback to stored credentials failed; new credentials kept in live credentials"
+                    );
+                    Ok(())
+                }
+                (Err(store_err), Ok(false)) => Err(store_err),
+                (Err(store_err), Err(live_err)) => {
+                    tracing::warn!(
+                        account = %account.id,
+                        err = %live_err,
+                        "rotation writeback to live credentials failed as well"
+                    );
+                    Err(store_err)
+                }
             }
-            Ok(())
         });
-        match committed {
-            // 超时只发生在进锁之前，锁内两步都还没执行。
-            Err(Error::SwitchLockTimeout) => {
-                tracing::warn!(
-                    account = %account.id,
-                    "swap lock busy; rotation written back to stored credentials only, live credentials untouched"
-                );
-                Self::store_rotation_if_unchanged(
-                    runtime,
-                    store,
-                    account,
-                    consumed_refresh.as_deref(),
-                    rotated,
-                )
-            }
-            other => other,
-        }
+        let lock_err = match committed {
+            Err(lock_err) if !entered.get() => lock_err,
+            other => return other,
+        };
+        tracing::warn!(
+            account = %account.id,
+            err = %lock_err,
+            "swap lock not entered; rotation written back to stored credentials only, live credentials untouched"
+        );
+        Self::store_rotation_if_unchanged(runtime, store, account, consumed_refresh, rotated)
     }
 
     /// 库存侧比对写：在凭证存储自身的锁下读当前库存，refresh token 仍等于被消耗的那个才写入
@@ -3899,6 +3919,78 @@ mod tests {
             U2_ROTATED,
             "交换锁等不到时库存仍按比对写入，新凭证不丢"
         );
+    }
+
+    /// 交换锁进不去（锁文件路径被一个目录占住，打开锁文件即失败；现实中如 sudo 跑过留下的
+    /// root 属主锁文件）：临界区一步没执行，回退为只按比对写库存，新凭证不丢。
+    #[tokio::test]
+    async fn parked_rotation_commit_when_swap_lock_cannot_be_entered_still_stores_new_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let p = gated_provider(tmp.path(), &gate);
+        let u2 = AccountId("u2".into());
+        // 交换锁文件在注册表同目录。
+        let lock_file = tmp.path().join(".kimi-switch.lock");
+
+        let query = p.query_quota(&u2);
+        let break_lock = async {
+            gate.wait_sent().await;
+            match fs::remove_file(&lock_file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("remove swap lock file: {e}"),
+            }
+            fs::create_dir(&lock_file).unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, break_lock);
+
+        assert_eq!(
+            p.test_store_get("u2").unwrap(),
+            U2_ROTATED,
+            "交换锁进不去时库存仍按比对写入，新凭证不丢"
+        );
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U1_BLOB);
+        quota.expect("库存已保住新凭证：查询照用新凭证完成");
+    }
+
+    /// 轮换期间 u2 被切成当前账号，提交时库存写入出错：当前登录文件仍须拿到新凭证（此刻它是
+    /// 新 refresh token 唯一能落的地方），库存错误只记 warn，查询照用新凭证完成。
+    #[tokio::test]
+    async fn parked_rotation_store_write_error_still_lands_new_token_in_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _switch_home = isolate_switch_home(tmp.path());
+        let gate = Arc::new(RotationGate::default());
+        let seed = FileStore::new(tmp.path().join("creds.json"));
+        seed.set("fake", "u1", "blob", U1_BLOB).unwrap();
+        seed.set("fake", "u2", "blob", U2_BLOB).unwrap();
+        let p = FileBlobProvider::new(
+            FakeRuntime::with_rotation_gate(tmp.path().join("home"), gate.clone(), U2_ROTATED),
+            Arc::new(FailingSetStore { inner: seed }),
+            Arc::new(AccountRegistry::new(tmp.path().join("registry.toml"))),
+        );
+        let mut u1 = fake_account("u1");
+        u1.active = true;
+        p.test_registry_upsert(u1).unwrap();
+        p.test_registry_upsert(fake_account("u2")).unwrap();
+        fs::create_dir_all(p.test_home()).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+        let u2 = AccountId("u2".into());
+
+        let query = p.query_quota(&u2);
+        let switch = async {
+            gate.wait_sent().await;
+            p.activate(&u2).await.unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, switch);
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_ROTATED,
+            "库存写不进时新凭证必须落进当前登录文件，否则两边都只剩已被消耗的 R2"
+        );
+        quota.expect("新凭证已落进当前登录文件：库存写入错误只记 warn，查询照用新凭证完成");
     }
 
     /// u1 为当前账号（live = u1），u2、u3 停泊；runtime 不轮换。
