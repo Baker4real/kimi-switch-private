@@ -21,7 +21,9 @@ use kimi_switch_core::membership_expiry::{
     EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME, EXTRA_NEXT_BILLING_TIME,
 };
 use kimi_switch_core::swap::{swap_with_snapshot_protected, with_swap_lock, SwapTarget};
-use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, Provider, Quota};
+use kimi_switch_core::{
+    Account, AccountId, AccountRegistry, ActivateOutcome, CredentialStore, Provider, Quota,
+};
 
 use crate::json::{extract_access_token, extract_refresh_token};
 use crate::runtime::{BlobMetadata, FileBlobRuntime, RefreshOutcome};
@@ -572,12 +574,18 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 }
 
 // ---------------------------------------------------------------------------
-// Provider 实现：activate + query_quota + 凭证恢复信号
+// Provider 实现：activate（含带前置条件的切换）+ query_quota + 凭证恢复信号
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
-    async fn activate(&self, id: &AccountId) -> Result<()> {
+impl<A: FileBlobRuntime> FileBlobProvider<A> {
+    /// activate 与带前置条件切换的共用实现。`expected_current` 为 `Some` 时是期望当前账号
+    /// （ADR-0020）：交换锁内先重读 registry 当前标记，不是它就返回
+    /// [`ActivateOutcome::Superseded`]；`None` 时恒为 [`ActivateOutcome::Activated`] 或错误。
+    async fn activate_expecting(
+        &self,
+        id: &AccountId,
+        expected_current: Option<AccountId>,
+    ) -> Result<ActivateOutcome> {
         // 阶段 1：只查 registry（无网络调用）。目标凭证在阶段 2 的交换锁内读取。
         let account = self.require_account(id)?;
 
@@ -604,6 +612,23 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
             // 与 registry 写入照常进锁。锁内纯本地 IO、零网络；轮换的网络请求在锁外，
             // 切换不等待任何在途轮换。
             with_swap_lock(&lock_dir, || {
+                // 期望当前账号（ADR-0020）：进锁后先重读 registry 当前标记。registry 写入与切换
+                // 同在这把锁下，判定到提交之间不会再有别的切换插进来。当前账号已不是期望账号
+                // （决定之后有手动切换抢先）就放弃：不读写凭证、不建快照、不碰 registry。
+                if let Some(expected) = &expected_current {
+                    if !registry
+                        .find(provider_id, expected)?
+                        .is_some_and(|current| current.active)
+                    {
+                        tracing::info!(
+                            account = %id_owned,
+                            expected_current = %expected,
+                            "activate superseded: current account changed before swap lock"
+                        );
+                        return Ok(ActivateOutcome::Superseded);
+                    }
+                }
+
                 let target_raw = FileBlobProvider::<A>::raw_blob_for_account_with(
                     runtime.as_ref(),
                     store.as_ref(),
@@ -660,11 +685,28 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
                         )?;
                         registry.set_active(provider_id, &id_owned)
                     },
-                )
+                )?;
+                Ok(ActivateOutcome::Activated)
             })
         })
         .await
         .map_err(|e| Error::provider(format!("spawn_blocking join failed: {e}")))?
+    }
+}
+
+#[async_trait]
+impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
+    async fn activate(&self, id: &AccountId) -> Result<()> {
+        self.activate_expecting(id, None).await.map(|_| ())
+    }
+
+    async fn activate_if_current(
+        &self,
+        id: &AccountId,
+        expected_current: &AccountId,
+    ) -> Result<ActivateOutcome> {
+        self.activate_expecting(id, Some(expected_current.clone()))
+            .await
     }
 
     async fn query_quota(&self, id: &AccountId) -> Result<Vec<Quota>> {
@@ -709,8 +751,10 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 当前账号主动续期（issue #44，ADR-0003 第 2 条）：查询前轮换临期 live 凭证并写回。
     /// 仅当 runtime 报告 [`FileBlobRuntime::proactive_renewal_wanted`] 时由 `query_quota` 调用。
     ///
-    /// 写序遵守 ADR-0002：账号库为唯一真本，先落账号库槽位，再原子写 live（tmp+rename，
-    /// 沿用现有 swap 写序）。轮换被官方拒绝（invalid_grant）时记录指纹并停止重试，
+    /// 轮换结果经轮换写回比对提交（[`Self::commit_rotation`]，ADR-0019）。写序仍遵守 ADR-0002：
+    /// 账号库为唯一真本，先落账号库槽位，再原子写 live（tmp+rename+fsync，沿用切换写法）。
+    /// 续期在途时用户切走了：当前登录文件已经换人，不写它、不撤销切换；库存比对通过，新凭证
+    /// 照样落进该账号的库存。轮换被官方拒绝（invalid_grant）时记录指纹并停止重试，
     /// 本地凭证不删除不墓碑化，本次查询按「凭证过期型 401」（issue #41）呈现。
     ///
     /// 如实收录：live 原子写失败（本地 IO）**不是**可恢复窗口。live 保持旧内容，
@@ -744,17 +788,12 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         }
         match self.runtime.refresh(&live).await? {
             RefreshOutcome::Rotated(new_blob) => {
-                // ADR-0002 写序：先落账号库槽位，再原子写 live。live 写失败时
-                // live 保持旧内容不被破坏——但此窗口不可恢复（如实收录，见函数 doc）：
-                // 下一次当前账号查询的 live 回灌会销毁库中新凭证副本，随后收敛到
-                // invalid_grant → 记指纹停试 → 凭证过期型 401 引导重新授权。
-                self.store.set(
-                    self.runtime.id(),
-                    account.id.0.as_str(),
-                    self.runtime.store_field(),
-                    &new_blob,
-                )?;
-                Self::write_blob(&self.live_path(), &new_blob)?;
+                // 轮换写回比对（ADR-0019）：`live` 是本次消耗掉的那份凭证。交换锁内先按比对写库存，
+                // 再仅当该账号仍是当前账号、当前登录文件仍持被消耗的 token 时原子写 live；续期在途时
+                // 被切走就不碰当前登录文件，不撤销切换。live 写失败时 live 保持旧内容不被破坏——
+                // 但此窗口不可恢复（如实收录，见函数 doc）。
+                self.commit_rotation(account, &live, &new_blob).await?;
+                // 指纹清除规则不变：只清掉这次被消耗的 blob 的拒止指纹。
                 self.runtime.proactive_renewal_rotated(&self.home, &live)?;
                 Ok(new_blob)
             }
@@ -2449,6 +2488,46 @@ mod tests {
         );
     }
 
+    /// 复现（spec #185 问题 1，#187）：当前账号 u1 的主动续期请求已发出时，用户切到 u2。
+    /// 放行后续期结果不得写回当前登录文件、撤销切换：当前登录文件仍是 u2；续期得到的
+    /// 新凭证仍落进 u1 的库存凭证，一次性 refresh token 的唯一有效副本不丢。
+    #[tokio::test]
+    async fn proactive_renewal_in_flight_then_switch_away_keeps_switch_and_stores_new_token() {
+        const U1_RENEWED: &str = r#"{"uid":"u1","refresh_token":"R1-NEW","access_token":"A1-NEW"}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(RotationGate::default());
+        let runtime = FakeRuntime {
+            proactive_wanted: true,
+            ..FakeRuntime::with_rotation_gate(tmp.path().join("home"), gate.clone(), U1_RENEWED)
+        };
+        let p = provider_with(tmp.path(), runtime);
+        fs::create_dir_all(p.test_home()).unwrap();
+        let u1 = p.import_raw(U1_BLOB.into(), None, Some(true)).unwrap();
+        let u2 = p.import_raw(U2_BLOB.into(), None, Some(false)).unwrap();
+        fs::write(p.test_live_path(), U1_BLOB).unwrap();
+
+        let query = p.query_quota(&u1.id);
+        let switch_away = async {
+            gate.wait_sent().await;
+            p.activate(&u2.id).await.unwrap();
+            gate.release();
+        };
+        let (quota, ()) = tokio::join!(query, switch_away);
+        quota.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(p.test_live_path()).unwrap(),
+            U2_BLOB,
+            "续期在途时切走：续期结果不得写回当前登录文件、撤销切换"
+        );
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+        assert_eq!(
+            p.test_store_get("u1").unwrap(),
+            U1_RENEWED,
+            "续期得到的新凭证必须落进原账号的库存凭证"
+        );
+    }
+
     /// issue #50（ADR-0004）：swap（activate）路径不触碰网页会员绑定状态——
     /// 网页凭证 field 与会员到期 extra 键只由「绑定网页登录」管道写入/清理，
     /// 切换只动 Code blob、live 与 active 标记。引擎本身零 HTTP，网页接口
@@ -3168,5 +3247,87 @@ mod tests {
 
         assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
         assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+    }
+
+    // --- ADR-0020：期望当前账号（带前置条件的切换）---
+
+    /// 前置条件一致：期望当前账号 u1 仍是 registry 当前账号，切换与无前置条件的 activate
+    /// 相同——当前登录文件换成 u2、当前标记移到 u2、留一份切换前快照，全程零网络。
+    #[tokio::test]
+    async fn activate_if_current_switches_when_expected_account_is_still_current() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+
+        let outcome = p
+            .activate_if_current(&AccountId("u2".into()), &AccountId("u1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ActivateOutcome::Activated);
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+        let snapshots = fs::read_dir(AppPaths::resolve().unwrap().snapshots_dir())
+            .unwrap()
+            .count();
+        assert_eq!(snapshots, 1, "前置条件一致时照常留一份切换前快照");
+        assert_activate_made_no_network_calls(&p);
+    }
+
+    /// 复现（spec #185 用户故事 42）：自动切换决定从 u1 切到 u2 之后、activate 拿到交换锁
+    /// 之前，用户手动切到了 u3（持交换锁写当前登录文件与 registry）。带前置条件的切换必须在
+    /// 锁内看到这次手动切换并返回「已被取代」：当前登录文件、registry 与快照目录都保持手动
+    /// 切换之后的样子，自动切换不覆盖用户的选择。
+    #[tokio::test]
+    async fn activate_if_current_is_superseded_by_manual_switch_before_swap_lock() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+        let lock_dir = tmp.path().to_path_buf();
+        let live = p.test_live_path();
+        let registry_file = tmp.path().join("registry.toml");
+        let after_manual = Arc::new(Mutex::new(None));
+        let after_manual_probe = after_manual.clone();
+        before_next_activate_lock(&p.test_home(), move || {
+            with_swap_lock(&lock_dir, || {
+                fs::write(&live, U3_BLOB)?;
+                AccountRegistry::new(registry_file.clone())
+                    .set_active("fake", &AccountId("u3".into()))
+            })
+            .unwrap();
+            *after_manual_probe.lock().unwrap() =
+                Some((fs::read(&live).unwrap(), fs::read(&registry_file).unwrap()));
+        });
+
+        let outcome = p
+            .activate_if_current(&AccountId("u2".into()), &AccountId("u1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ActivateOutcome::Superseded);
+        let (live_after_manual, registry_after_manual) = after_manual
+            .lock()
+            .unwrap()
+            .take()
+            .expect("手动切换探针应已运行");
+        assert_eq!(
+            fs::read(p.test_live_path()).unwrap(),
+            live_after_manual,
+            "已被取代时不得写当前登录文件"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("registry.toml")).unwrap(),
+            registry_after_manual,
+            "已被取代时不得写 registry"
+        );
+        assert_eq!(active_ids(&p), vec!["u3".to_string()]);
+        let snapshots = AppPaths::resolve().unwrap().snapshots_dir();
+        assert!(
+            !snapshots.exists() || fs::read_dir(&snapshots).unwrap().next().is_none(),
+            "已被取代时不进切换骨架，不留快照: {}",
+            snapshots.display()
+        );
     }
 }
