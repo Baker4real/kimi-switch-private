@@ -22,8 +22,11 @@ use kimi_switch_engine::{BlobMetadata, FileBlobProvider, FileBlobRuntime, Refres
 pub const PROVIDER_ID: &str = "kimi";
 
 /// Kimi runtime adapter：只提供差异点，机制在引擎。
+#[derive(Clone)]
 pub struct KimiRuntime {
     registry: Arc<AccountRegistry>,
+    /// 与引擎同一份凭证存储：401 协调恢复的轮换结果要经引擎的轮换写回比对提交（ADR-0019）。
+    store: Arc<dyn CredentialStore>,
 }
 
 #[async_trait]
@@ -44,7 +47,7 @@ impl FileBlobRuntime for KimiRuntime {
         oauth::refresh_blob(blob).await
     }
     async fn fetch_quota(&self, access_token: &str, account: &Account) -> Result<Vec<Quota>> {
-        kimi_usage::fetch_quota_with_active_recovery(access_token, account, &self.registry).await
+        kimi_usage::fetch_quota_with_active_recovery(access_token, account, self).await
     }
     fn credential_expiry(&self, blob: &str) -> Option<i64> {
         kimi_files::credential_expiry(blob)
@@ -65,6 +68,28 @@ impl FileBlobRuntime for KimiRuntime {
     }
 }
 
+impl KimiRuntime {
+    /// 401 协调恢复的轮换结果经引擎的轮换写回比对提交（ADR-0019）。阻塞 IO，调用方在
+    /// `spawn_blocking` 里调用；`home` 是本次恢复读取当前登录文件的 Kimi 工作目录。
+    fn commit_rotation(
+        &self,
+        home: &Path,
+        account: &Account,
+        consumed: &str,
+        rotated: &str,
+    ) -> Result<()> {
+        KimiProvider::commit_rotation_with(
+            self,
+            self.store.as_ref(),
+            self.registry.as_ref(),
+            home,
+            account,
+            consumed,
+            rotated,
+        )
+    }
+}
+
 /// 便捷别名：Kimi Provider = 文件型引擎 + Kimi adapter。
 pub type KimiProvider = FileBlobProvider<KimiRuntime>;
 
@@ -73,6 +98,7 @@ pub fn new(store: Arc<dyn CredentialStore>, registry: Arc<AccountRegistry>) -> K
     FileBlobProvider::new(
         KimiRuntime {
             registry: registry.clone(),
+            store: store.clone(),
         },
         store,
         registry,
@@ -176,6 +202,18 @@ mod test_support {
                 .unwrap()
                 .into_inner()
                 .unwrap()
+        }
+    }
+
+    /// 401 协调恢复用的 runtime：注册表与凭证存储都落在用例目录 `dir`（交换锁也在此目录）。
+    pub fn recovery_runtime(dir: &std::path::Path) -> crate::KimiRuntime {
+        crate::KimiRuntime {
+            registry: Arc::new(kimi_switch_core::AccountRegistry::new(
+                dir.join("registry.toml"),
+            )),
+            store: Arc::new(kimi_switch_core::FileStore::new(
+                dir.join("credentials.json"),
+            )),
         }
     }
 

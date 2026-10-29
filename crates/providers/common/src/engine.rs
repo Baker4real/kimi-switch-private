@@ -21,7 +21,9 @@ use kimi_switch_core::membership_expiry::{
     EXTRA_CURRENT_END_TIME, EXTRA_CURRENT_START_TIME, EXTRA_NEXT_BILLING_TIME,
 };
 use kimi_switch_core::swap::{swap_with_snapshot_protected, with_swap_lock, SwapTarget};
-use kimi_switch_core::{Account, AccountId, AccountRegistry, CredentialStore, Provider, Quota};
+use kimi_switch_core::{
+    Account, AccountId, AccountRegistry, ActivateOutcome, CredentialStore, Provider, Quota,
+};
 
 use crate::json::{extract_access_token, extract_refresh_token};
 use crate::runtime::{BlobMetadata, FileBlobRuntime, RefreshOutcome};
@@ -326,7 +328,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 取账号 blob：active 账号优先读 live（并顺手回灌 store 副本），parked 读 store，最后 legacy。
     ///
     /// 「顺手回灌」是 ADR-0002 修订记录的第二条回灌路径，按回灌新旧比对写库存
-    /// （[`Self::backfill_live_into_store_with`]，ADR-0019 决策 7）：重授权 live 写失败窗口内，
+    /// （[`Self::backfill_live_into_store_with`]，ADR-0019 决策 8）：重授权 live 写失败窗口内，
     /// 可比较时较旧的 live 不再撤销库存里的新凭证。读取本身仍返回 live，不主动改写它。
     ///
     /// 错误处理顺序与原始 Beta 实现一致：store 读取失败时不立即冒泡，而是先捕获错误、
@@ -473,7 +475,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 覆盖 live 前把 live 凭证回灌进其 owner 账号 store。
     /// 只接收借用参数，供 `activate` 的 `spawn_blocking` 闭包与同步 reconcile 共用一份实现。
     ///
-    /// 按回灌新旧比对写入（[`Self::backfill_live_into_store_with`]，ADR-0019 决策 7）：
+    /// 按回灌新旧比对写入（[`Self::backfill_live_into_store_with`]，ADR-0019 决策 8）：
     /// live 缺 refresh 且 store 已有 refresh 时跳过（防静默写死账号），live 严格较旧时也跳过。
     fn capture_live_into_store_with(
         runtime: &A,
@@ -519,7 +521,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 盖进刚替换的库存副本。写顺序固定「先库存后 live」：
     /// live 写失败时新凭证已安全落在库存，不会丢号。
     ///
-    /// 窗口期（store=新/live=旧）：其后的查询或切换按回灌新旧比对回灌（ADR-0019 决策 7，
+    /// 窗口期（store=新/live=旧）：其后的查询或切换按回灌新旧比对回灌（ADR-0019 决策 8，
     /// 修订 ADR-0002）。可比较时较旧的 live 不再撤销新凭证，切走再切回即生效；任一方解析不出
     /// 过期时刻时仍以 live 为准、新凭证被撤销。补救是重试重新授权。
     ///
@@ -549,7 +551,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 }
 
 // ---------------------------------------------------------------------------
-// 回灌新旧比对（ADR-0019 决策 7）：live → 账号库的回灌不让较旧的凭证覆盖较新的
+// 回灌新旧比对（ADR-0019 决策 8）：live → 账号库的回灌不让较旧的凭证覆盖较新的
 // ---------------------------------------------------------------------------
 
 /// 一份 live 凭证能否回灌进账号库当前副本的裁决。
@@ -629,12 +631,18 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
 }
 
 // ---------------------------------------------------------------------------
-// Provider 实现：activate + query_quota + 凭证恢复信号
+// Provider 实现：activate（含带前置条件的切换）+ query_quota + 凭证恢复信号
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
-    async fn activate(&self, id: &AccountId) -> Result<()> {
+impl<A: FileBlobRuntime> FileBlobProvider<A> {
+    /// activate 与带前置条件切换的共用实现。`expected_current` 为 `Some` 时是期望当前账号
+    /// （ADR-0020）：交换锁内先重读 registry 当前标记，不是它就返回
+    /// [`ActivateOutcome::Superseded`]；`None` 时恒为 [`ActivateOutcome::Activated`] 或错误。
+    async fn activate_expecting(
+        &self,
+        id: &AccountId,
+        expected_current: Option<AccountId>,
+    ) -> Result<ActivateOutcome> {
         // 阶段 1：只查 registry（无网络调用）。目标凭证在阶段 2 的交换锁内读取。
         let account = self.require_account(id)?;
 
@@ -661,6 +669,23 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
             // 与 registry 写入照常进锁。锁内纯本地 IO、零网络；轮换的网络请求在锁外，
             // 切换不等待任何在途轮换。
             with_swap_lock(&lock_dir, || {
+                // 期望当前账号（ADR-0020）：进锁后先重读 registry 当前标记。registry 写入与切换
+                // 同在这把锁下，判定到提交之间不会再有别的切换插进来。当前账号已不是期望账号
+                // （决定之后有手动切换抢先）就放弃：不读写凭证、不建快照、不碰 registry。
+                if let Some(expected) = &expected_current {
+                    if !registry
+                        .find(provider_id, expected)?
+                        .is_some_and(|current| current.active)
+                    {
+                        tracing::info!(
+                            account = %id_owned,
+                            expected_current = %expected,
+                            "activate superseded: current account changed before swap lock"
+                        );
+                        return Ok(ActivateOutcome::Superseded);
+                    }
+                }
+
                 let target_raw = FileBlobProvider::<A>::raw_blob_for_account_with(
                     runtime.as_ref(),
                     store.as_ref(),
@@ -717,11 +742,28 @@ impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
                         )?;
                         registry.set_active(provider_id, &id_owned)
                     },
-                )
+                )?;
+                Ok(ActivateOutcome::Activated)
             })
         })
         .await
         .map_err(|e| Error::provider(format!("spawn_blocking join failed: {e}")))?
+    }
+}
+
+#[async_trait]
+impl<A: FileBlobRuntime> Provider for FileBlobProvider<A> {
+    async fn activate(&self, id: &AccountId) -> Result<()> {
+        self.activate_expecting(id, None).await.map(|_| ())
+    }
+
+    async fn activate_if_current(
+        &self,
+        id: &AccountId,
+        expected_current: &AccountId,
+    ) -> Result<ActivateOutcome> {
+        self.activate_expecting(id, Some(expected_current.clone()))
+            .await
     }
 
     async fn query_quota(&self, id: &AccountId) -> Result<Vec<Quota>> {
@@ -774,7 +816,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     ///
     /// live 原子写失败（本地 IO）时：账号库已是新凭证，live 保持被消耗的旧凭证，本次查询报错。
     /// 之后读取当前账号凭证（[`Self::raw_blob_for_account`]）与切走时的 capture-on-leave 都按
-    /// 回灌新旧比对回灌（ADR-0019 决策 7）：可比较时旧 live 不再覆盖账号库，切走再切回即恢复；
+    /// 回灌新旧比对回灌（ADR-0019 决策 8）：可比较时旧 live 不再覆盖账号库，切走再切回即恢复；
     /// 任一方解析不出过期时刻时仍以 live 为准，旧 live 回灌库槽位、销毁新轮换 refresh token 的
     /// 唯一副本，此后轮换必被官方 invalid_grant 拒绝，收敛到凭证过期型 401 + 指纹停试，
     /// 需用户按引导重新授权（ADR-0003 已接受边界）。
@@ -787,7 +829,7 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         };
         if extract_access_token(&live).as_deref() != extract_access_token(&raw).as_deref() {
             // 官方已抢先轮换（与官方 100ms 重读采纳机制同款）：直接采纳最新 live，
-            // 按回灌新旧比对顺手回灌账号库（ADR-0019 决策 7）；本次查询不再消耗 refresh token。
+            // 按回灌新旧比对顺手回灌账号库（ADR-0019 决策 8）；本次查询不再消耗 refresh token。
             // 回灌只是顺手保鲜：库写失败不应让手握有效 live 的查询整体失败，
             // 与 `raw_blob_for_account` 的回灌容错（`let _ =`）一致。
             let _ = Self::backfill_live_into_store_with(
@@ -910,8 +952,11 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
     /// 交换锁等不到（3 秒上限）时放弃写当前登录文件，库存仍在凭证存储自身的锁下按比对
     /// 写入并记 warn：新凭证绝不丢弃。比对只看 refresh token，不比整串。
     ///
-    /// 借用参数、同步执行，供各写回点（停泊账号查询前轮换等）在 `spawn_blocking` 里共用。
-    fn commit_rotation_with(
+    /// 借用参数、同步执行，供各写回点在 `spawn_blocking` 里共用：引擎内的停泊账号查询前轮换与
+    /// 当前账号主动续期（经 [`Self::commit_rotation`]），以及 adapter 自己持官方刷新锁完成刷新的
+    /// 写回点（Kimi 401 协调恢复；锁顺序官方刷新锁 → 交换锁）。`store`、`registry`、`home`
+    /// 必须是该 provider 装配时的同一份。
+    pub fn commit_rotation_with(
         runtime: &A,
         store: &dyn CredentialStore,
         registry: &AccountRegistry,
@@ -1465,7 +1510,7 @@ mod tests {
         assert!(p.test_store_get("unmanaged").is_none());
     }
 
-    // --- 回灌新旧比对（ADR-0019 决策 7）：经 capture-on-leave 通道断言 ---
+    // --- 回灌新旧比对（ADR-0019 决策 8）：经 capture-on-leave 通道断言 ---
 
     /// 把 u1 的库存设成 `stored`、当前登录文件设成 `live`，回灌一次，返回 u1 的库存。
     fn backfill_once(p: &FileBlobProvider<FakeRuntime>, stored: &str, live: &str) -> String {
@@ -1981,7 +2026,7 @@ mod tests {
         );
     }
 
-    /// 回灌新旧比对（ADR-0019 决策 7，修订 ADR-0002）：重授权 live 写失败留下
+    /// 回灌新旧比对（ADR-0019 决策 8，修订 ADR-0002）：重授权 live 写失败留下
     /// store=新/live=旧 窗口后，其后一次切换的 capture-on-leave 不再用旧 live 撤销新凭证；
     /// 再切回该账号时当前登录文件拿到的就是重新授权的结果，重新授权不白做。
     #[tokio::test]
@@ -2035,7 +2080,7 @@ mod tests {
         );
     }
 
-    /// 回灌新旧比对（ADR-0019 决策 7，修订 ADR-0002）：重授权 live 写失败留下
+    /// 回灌新旧比对（ADR-0019 决策 8，修订 ADR-0002）：重授权 live 写失败留下
     /// store=新/live=旧 窗口后，对当前账号一次额度查询不再用旧 live 撤销新凭证。
     /// 两份凭证都带过期时刻、live 严格较旧，读取时的顺手回灌放弃覆盖；查询仍用当前登录文件，
     /// live 也不被主动改写。
@@ -2483,7 +2528,7 @@ mod tests {
     /// live 保持旧凭证不被破坏（注入手法同重授权 live 写失败测试）。
     ///
     /// 本测试只钉失败瞬间的落库/落盘状态。之后能否保住账号库里的新凭证取决于回灌新旧比对
-    /// （ADR-0019 决策 7）：可比较时旧 live 不再覆盖它；任一方解析不出过期时刻时仍以 live
+    /// （ADR-0019 决策 8）：可比较时旧 live 不再覆盖它；任一方解析不出过期时刻时仍以 live
     /// 为准，新轮换 refresh token 的唯一副本被销毁 → 轮换必被官方 invalid_grant 拒绝 →
     /// 记指纹停试 → 收敛到凭证过期型 401，需用户按引导重新授权。
     #[tokio::test]
@@ -2629,7 +2674,7 @@ mod tests {
         assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), official);
     }
 
-    /// 采纳回灌同样按回灌新旧比对（ADR-0019 决策 7）：官方抢先轮换、本次采纳当前登录文件时，
+    /// 采纳回灌同样按回灌新旧比对（ADR-0019 决策 8）：官方抢先轮换、本次采纳当前登录文件时，
     /// 账号库里的凭证比它还新，就不被覆盖；本次查询照用当前登录文件。
     #[tokio::test]
     async fn proactive_renewal_adoption_keeps_newer_stored_credentials() {
@@ -3491,5 +3536,87 @@ mod tests {
 
         assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
         assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+    }
+
+    // --- ADR-0020：期望当前账号（带前置条件的切换）---
+
+    /// 前置条件一致：期望当前账号 u1 仍是 registry 当前账号，切换与无前置条件的 activate
+    /// 相同——当前登录文件换成 u2、当前标记移到 u2、留一份切换前快照，全程零网络。
+    #[tokio::test]
+    async fn activate_if_current_switches_when_expected_account_is_still_current() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+
+        let outcome = p
+            .activate_if_current(&AccountId("u2".into()), &AccountId("u1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ActivateOutcome::Activated);
+        assert_eq!(fs::read_to_string(p.test_live_path()).unwrap(), U2_BLOB);
+        assert_eq!(active_ids(&p), vec!["u2".to_string()]);
+        let snapshots = fs::read_dir(AppPaths::resolve().unwrap().snapshots_dir())
+            .unwrap()
+            .count();
+        assert_eq!(snapshots, 1, "前置条件一致时照常留一份切换前快照");
+        assert_activate_made_no_network_calls(&p);
+    }
+
+    /// 复现（spec #185 用户故事 42）：自动切换决定从 u1 切到 u2 之后、activate 拿到交换锁
+    /// 之前，用户手动切到了 u3（持交换锁写当前登录文件与 registry）。带前置条件的切换必须在
+    /// 锁内看到这次手动切换并返回「已被取代」：当前登录文件、registry 与快照目录都保持手动
+    /// 切换之后的样子，自动切换不覆盖用户的选择。
+    #[tokio::test]
+    async fn activate_if_current_is_superseded_by_manual_switch_before_swap_lock() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = three_account_provider(tmp.path());
+        let lock_dir = tmp.path().to_path_buf();
+        let live = p.test_live_path();
+        let registry_file = tmp.path().join("registry.toml");
+        let after_manual = Arc::new(Mutex::new(None));
+        let after_manual_probe = after_manual.clone();
+        before_next_activate_lock(&p.test_home(), move || {
+            with_swap_lock(&lock_dir, || {
+                fs::write(&live, U3_BLOB)?;
+                AccountRegistry::new(registry_file.clone())
+                    .set_active("fake", &AccountId("u3".into()))
+            })
+            .unwrap();
+            *after_manual_probe.lock().unwrap() =
+                Some((fs::read(&live).unwrap(), fs::read(&registry_file).unwrap()));
+        });
+
+        let outcome = p
+            .activate_if_current(&AccountId("u2".into()), &AccountId("u1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ActivateOutcome::Superseded);
+        let (live_after_manual, registry_after_manual) = after_manual
+            .lock()
+            .unwrap()
+            .take()
+            .expect("手动切换探针应已运行");
+        assert_eq!(
+            fs::read(p.test_live_path()).unwrap(),
+            live_after_manual,
+            "已被取代时不得写当前登录文件"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("registry.toml")).unwrap(),
+            registry_after_manual,
+            "已被取代时不得写 registry"
+        );
+        assert_eq!(active_ids(&p), vec!["u3".to_string()]);
+        let snapshots = AppPaths::resolve().unwrap().snapshots_dir();
+        assert!(
+            !snapshots.exists() || fs::read_dir(&snapshots).unwrap().next().is_none(),
+            "已被取代时不进切换骨架，不留快照: {}",
+            snapshots.display()
+        );
     }
 }
