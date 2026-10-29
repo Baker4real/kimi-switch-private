@@ -1,12 +1,12 @@
 //! 额度耗尽自动切换、pace 预切换、重置前抢用、回驻与配额失败被动切换：纯决策 +
-//! 上次切换时刻 / 手动保持期 / 回驻确认计数 / 抢用往返记忆的可丢弃状态。
+//! 上次切换时刻 / 手动保持期 / 回驻确认计数 / 抢用往返记忆 / 耗尽账本的可丢弃状态。
 //!
 //! 决策函数无 IO、无网络；状态文件读写失败静默忽略。判定读快照前先过点重置
 //! （ADR-0020）：`reset_at` 已过的窗口按已用 0、下次重置未知参与判定，见
-//! [`reset_passed_windows`]。停泊候选另经本地凭证快检
-//! （issue #158）：`locally_invalid` 集合里的「已确认失效」账号（invalid_grant 指纹
-//! 在案；#158 续跑裁定只认指纹、不认 JWT exp）不作为任何自动路径的候选，
-//! 见 [`crate::credential_health`]。
+//! [`reset_passed_windows`]。停泊候选另过排除集合 `excluded`，两类账号不作为任何
+//! 自动路径的候选：本地凭证快检（issue #158）「已确认失效」的账号（invalid_grant 指纹
+//! 在案；#158 续跑裁定只认指纹、不认 JWT exp，见 [`crate::credential_health`]），以及
+//! 耗尽账本（issue #192）里有生效记录的账号，见 [`record_exhaustion`]。
 //! 配额失败被动切换（issue #162，spec #152 决策 14；#184 改认官方 429）：Kimi Code
 //! `StopFailure` hook 的额度耗尽原文是当前账号耗尽的权威证据，经 [`classify_stop_failure`]
 //! 分类（命中条件见该函数）、[`overlay_exhausted_snapshot`] 合成耗尽快照后，走
@@ -107,12 +107,13 @@ enum TriggerSource {
 
 /// 根据已收集的额度快照判定是否自动切换。纯函数，不碰盘、不联网。
 ///
-/// `locally_invalid` 是「本地凭证已确认失效」的账号集合（issue #158，spec #152
-/// 决策 15；#158 续跑裁定收紧为只认 invalid_grant 指纹、不认 JWT exp），由
-/// [`crate::credential_health::locally_invalid_accounts`] 纯本地收集；
+/// `excluded` 是停泊候选排除集合：「本地凭证已确认失效」的账号（issue #158，spec #152
+/// 决策 15；#158 续跑裁定收紧为只认 invalid_grant 指纹、不认 JWT exp，由
+/// [`crate::credential_health::locally_invalid_accounts`] 纯本地收集），以及耗尽账本里
+/// 有生效记录的账号（issue #192）。[`decide_auto_swap_from_state`] 从状态文件收集两者；
 /// 集合中的账号不作为任何自动路径（耗尽 / pace / 回驻 / 重置前抢用与回程）的停泊
 /// 候选。无信号时传空集合——unknown ≠ 失效，语义与快照缺失一致。当前账号在集合中
-/// 不影响它被切走；手动切换不经此过滤。
+/// 不影响它被切走，也不因此多一次触发；手动切换不经此过滤。
 ///
 /// 停泊候选须先过阈值资格线，再满足最大已用比例 ≤ 当前最大已用 − [`AutoSwap::candidate_margin`]。
 /// 比例一律按过点重置后的快照计算（ADR-0020），当前账号与停泊账号同口径。
@@ -135,7 +136,7 @@ pub fn decide_auto_swap(
     settings: &AutoSwap,
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> AutoSwapDecision {
     let mut trip = None;
     decide_auto_swap_with_trip(
@@ -146,7 +147,7 @@ pub fn decide_auto_swap(
         last_auto_swap_at,
         None,
         &mut trip,
-        locally_invalid,
+        excluded,
         TriggerSource::Snapshot,
     )
 }
@@ -162,7 +163,7 @@ fn decide_auto_swap_with_trip(
     last_auto_swap_at: Option<DateTime<Utc>>,
     manual_hold_until: Option<DateTime<Utc>>,
     trip: &mut Option<BurnTrip>,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
     trigger: TriggerSource,
 ) -> AutoSwapDecision {
     if !settings.enabled {
@@ -202,7 +203,7 @@ fn decide_auto_swap_with_trip(
         snapshots,
         settings,
         trip,
-        locally_invalid,
+        excluded,
     ) {
         return decision;
     }
@@ -221,7 +222,7 @@ fn decide_auto_swap_with_trip(
                 snapshots,
                 settings,
                 now,
-                locally_invalid,
+                excluded,
             ) {
                 return AutoSwapDecision::Swap(target);
             }
@@ -232,7 +233,7 @@ fn decide_auto_swap_with_trip(
                 settings,
                 now,
                 manual_hold_until,
-                locally_invalid,
+                excluded,
             ) {
                 return AutoSwapDecision::Swap(target);
             }
@@ -246,7 +247,7 @@ fn decide_auto_swap_with_trip(
         current,
         current_quotas,
         settings,
-        locally_invalid,
+        excluded,
     ) else {
         return stay(AutoSwapSkipReason::NoEligibleCandidate);
     };
@@ -268,7 +269,7 @@ fn decide_pace_swap(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     now: DateTime<Utc>,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> Option<AutoSwapTarget> {
     if !settings.pace_pre_swap {
         return None;
@@ -283,7 +284,7 @@ fn decide_pace_swap(
         current,
         current_quotas,
         settings,
-        locally_invalid,
+        excluded,
     )?;
     Some(AutoSwapTarget {
         from: current.id.clone(),
@@ -305,13 +306,13 @@ fn decide_burn_swap(
     settings: &AutoSwap,
     now: DateTime<Utc>,
     manual_hold_until: Option<DateTime<Utc>>,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> Option<AutoSwapTarget> {
     if !settings.pre_reset_burn || manual_hold_until.is_some_and(|until| now < until) {
         return None;
     }
     let (best, trigger_window, usage_ratio) =
-        pick_best_burn_candidate(accounts, snapshots, current, settings, now, locally_invalid)?;
+        pick_best_burn_candidate(accounts, snapshots, current, settings, now, excluded)?;
     Some(AutoSwapTarget {
         from: current.id.clone(),
         to: best.id.clone(),
@@ -330,7 +331,7 @@ fn decide_burn_return(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     trip: &mut Option<BurnTrip>,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> Option<AutoSwapDecision> {
     let existing = trip.as_ref()?;
     if current.id != existing.target {
@@ -346,7 +347,7 @@ fn decide_burn_return(
         snapshots,
         settings,
         existing,
-        locally_invalid,
+        excluded,
     ) {
         Some(target) => Some(AutoSwapDecision::Swap(target)),
         None => {
@@ -374,7 +375,7 @@ fn burn_return_swap(
     snapshots: &[QuotaSnapshot],
     settings: &AutoSwap,
     trip: &BurnTrip,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> Option<AutoSwapTarget> {
     let origin = eligible_return_origin(
         accounts,
@@ -382,7 +383,7 @@ fn burn_return_swap(
         &trip.origin,
         &current.id,
         settings.threshold,
-        locally_invalid,
+        excluded,
     )?;
     let (trigger_window, usage_ratio) = trigger_window(current_quotas, settings.threshold)
         .unwrap_or_else(|| {
@@ -408,13 +409,13 @@ fn eligible_return_origin<'a>(
     origin_id: &AccountId,
     current_id: &AccountId,
     threshold: f64,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> Option<&'a Account> {
     if origin_id == current_id {
         return None;
     }
     let account = accounts.iter().find(|account| account.id == *origin_id)?;
-    if !parked_candidate_admitted(account, locally_invalid) {
+    if !parked_candidate_admitted(account, excluded) {
         return None;
     }
     let snap = snapshot_of(snapshots, &account.id)?;
@@ -431,12 +432,12 @@ fn pick_best_burn_candidate<'a>(
     current: &Account,
     settings: &AutoSwap,
     now: DateTime<Utc>,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> Option<(&'a Account, QuotaWindow, f64)> {
     let mut eligible: Vec<(&Account, &[Quota], QuotaWindow, f64)> = accounts
         .iter()
         .filter(|account| account.id != current.id)
-        .filter(|account| parked_candidate_admitted(account, locally_invalid))
+        .filter(|account| parked_candidate_admitted(account, excluded))
         .filter_map(|account| {
             let snap = snapshot_of(snapshots, &account.id)?;
             let quotas = usable_quotas(snap)?;
@@ -465,13 +466,13 @@ fn pick_best_eligible<'a>(
     current: &Account,
     current_quotas: &[Quota],
     settings: &AutoSwap,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
 ) -> Option<&'a Account> {
     let current_max = candidate_max_ratio(current_quotas);
     let mut eligible: Vec<(&Account, &[Quota], Option<&str>)> = accounts
         .iter()
         .filter(|account| account.id != current.id)
-        .filter(|account| parked_candidate_admitted(account, locally_invalid))
+        .filter(|account| parked_candidate_admitted(account, excluded))
         .filter_map(|account| {
             let snap = snapshot_of(snapshots, &account.id)?;
             let quotas = usable_quotas(snap)?;
@@ -516,8 +517,9 @@ pub struct AutoSwapReturn {
 /// 回驻判定：当前账号未达耗尽阈值、但存在档位严格更低的合格停泊账号时，切回其中
 /// 档位最低者。纯函数，不碰盘、不联网。
 ///
-/// `locally_invalid` 语义与 [`decide_auto_swap`] 相同（issue #158）：本地凭证已确认
-/// 失效的账号不作为回驻目标，经 [`parked_candidate_admitted`] 与其它自动路径共用同一闸。
+/// `excluded` 语义与 [`decide_auto_swap`] 相同（issue #158 / #192）：本地凭证已确认
+/// 失效、或耗尽账本里有生效记录的账号不作为回驻目标，经 [`parked_candidate_admitted`]
+/// 与其它自动路径共用同一闸。
 ///
 /// 闸门与 [`decide_auto_swap`] 共用语义：总开关或回驻子开关关、无当前账号、冷却期
 /// （与耗尽切换共享一把锁）、安顿宽限、手动保持期都不回驻。当前账号快照不可用、
@@ -537,7 +539,7 @@ pub fn decide_resident_return(
     now: DateTime<Utc>,
     last_auto_swap_at: Option<DateTime<Utc>>,
     manual_hold_until: Option<DateTime<Utc>>,
-    locally_invalid: &HashSet<AccountId>,
+    excluded: &HashSet<AccountId>,
     confirm_counts: &mut HashMap<AccountId, u32>,
 ) -> Option<AutoSwapReturn> {
     if !settings.enabled || !settings.resident_lower_tier {
@@ -580,7 +582,7 @@ pub fn decide_resident_return(
     let mut eligible: Vec<(&Account, &[Quota], &str)> = accounts
         .iter()
         .filter(|account| account.id != current.id)
-        .filter(|account| parked_candidate_admitted(account, locally_invalid))
+        .filter(|account| parked_candidate_admitted(account, excluded))
         .filter_map(|account| {
             let snap = snapshot_of(snapshots, &account.id)?;
             let quotas = usable_quotas(snap)?;
@@ -637,13 +639,14 @@ fn stay(reason: AutoSwapSkipReason) -> AutoSwapDecision {
     AutoSwapDecision::Stay { reason }
 }
 
-/// 停泊候选第一道闸（issue #158）：账号未摘出自动切换，且本地凭证未「已确认失效」
-/// （[`crate::credential_health`]：invalid_grant 指纹在案；#158 续跑裁定口径）。
+/// 停泊候选第一道闸（issue #158 / #192）：账号未摘出自动切换，且不在排除集合里——
+/// 本地凭证未「已确认失效」（[`crate::credential_health`]：invalid_grant 指纹在案；
+/// #158 续跑裁定口径），耗尽账本里也没有生效记录（[`record_exhaustion`]）。
 /// 耗尽 / pace / 重置前抢用 / 抢用回程 / 回驻的全部停泊候选筛选共用此判定，
-/// 是本地凭证过滤的单点；手动切换不经过这里。unknown ≠ 失效：不在
-/// `locally_invalid` 集合中的账号照常参与。
-fn parked_candidate_admitted(account: &Account, locally_invalid: &HashSet<AccountId>) -> bool {
-    !account_auto_swap_opt_out(account) && !locally_invalid.contains(&account.id)
+/// 是本地凭证过滤与耗尽账本过滤的单点；手动切换不经过这里。unknown ≠ 失效：不在
+/// `excluded` 集合中的账号照常参与。
+fn parked_candidate_admitted(account: &Account, excluded: &HashSet<AccountId>) -> bool {
+    !account_auto_swap_opt_out(account) && !excluded.contains(&account.id)
 }
 
 fn snapshot_of<'a>(snapshots: &'a [QuotaSnapshot], id: &AccountId) -> Option<&'a QuotaSnapshot> {
@@ -963,6 +966,64 @@ struct AutoSwapStateFile {
     /// 重置前抢用往返记忆（issue #148）。缺字段视为无记忆；空值序列化时跳过。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     burn_trip: Option<BurnTrip>,
+    /// 耗尽账本（issue #192），见 [`record_exhaustion`]。缺字段视为空表；空表序列化时
+    /// 跳过。旧版本进程读到本字段时忽略（状态文件不拒绝未知字段），改写时丢掉也可接受。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exhaustion_ledger: Vec<ExhaustionRecord>,
+}
+
+/// 耗尽账本的一条记录（issue #192）：配额失败被动切换观察到的「该账号此刻已耗尽」。
+/// 键为（账号, 窗口），同键以新证据覆盖。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ExhaustionRecord {
+    account_id: AccountId,
+    /// 耗尽窗口；文案辨认不出为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<QuotaWindow>,
+    /// 观察到耗尽的时刻。
+    observed_at: DateTime<Utc>,
+    /// 恢复时刻，见 [`exhaustion_recovers_at`]。
+    recovers_at: DateTime<Utc>,
+}
+
+impl ExhaustionRecord {
+    /// 生效：恢复时刻晚于此刻，且该账号没有取得时间晚于观察时刻的可用快照（`Ready` /
+    /// 非 stale `Cached`）。有更新的可用快照时以真实额度为准。
+    fn in_effect(&self, snapshots: &[QuotaSnapshot], now: DateTime<Utc>) -> bool {
+        self.recovers_at > now
+            && !snapshot_of(snapshots, &self.account_id).is_some_and(|snapshot| {
+                snapshot.fetched_at > self.observed_at && usable_quotas(snapshot).is_some()
+            })
+    }
+}
+
+/// 耗尽记录的恢复时刻：缓存快照里该窗口的 `reset_at` 晚于观察时刻则取之；否则按窗口
+/// 时长保守估计。窗口辨认不出按 5 小时窗。
+fn exhaustion_recovers_at(
+    cached: Option<&QuotaSnapshot>,
+    window: Option<QuotaWindow>,
+    observed_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let window = window.unwrap_or(QuotaWindow::FiveHour);
+    cached
+        .and_then(usable_quotas)
+        .and_then(|quotas| quotas.iter().find(|quota| quota.window == window))
+        .and_then(|quota| quota.reset_at)
+        .filter(|reset_at| *reset_at > observed_at)
+        .unwrap_or_else(|| observed_at + exhaustion_window_length(window))
+}
+
+/// 恢复时刻估计用的窗口时长：5 小时窗 5 小时、7 天窗 7 天、月度窗 31 天。分类器只辨认
+/// 这三种窗口（见 [`window_from_usage_limit_texts`]），其余窗口与辨认不出一样按 5 小时窗。
+fn exhaustion_window_length(window: QuotaWindow) -> chrono::Duration {
+    match window {
+        QuotaWindow::SevenDay => chrono::Duration::days(7),
+        QuotaWindow::Month => chrono::Duration::days(31),
+        QuotaWindow::FiveHour
+        | QuotaWindow::FirstPartyModels
+        | QuotaWindow::Api
+        | QuotaWindow::Custom => chrono::Duration::hours(5),
+    }
 }
 
 /// 整份状态文件；文件缺失或损坏返回 `None`（既有语义：视为从未自动切换）。
@@ -1008,10 +1069,11 @@ pub fn write_resident_confirm_counts(path: &Path, counts: &HashMap<AccountId, u3
         None => {
             write_state_or_warn(
                 path,
-                &AutoSwapStateFile {
+                AutoSwapStateFile {
                     resident_confirm: mapped,
                     ..AutoSwapStateFile::default()
                 },
+                Utc::now(),
             );
         }
         Some(mut state) => {
@@ -1019,15 +1081,15 @@ pub fn write_resident_confirm_counts(path: &Path, counts: &HashMap<AccountId, u3
                 return;
             }
             state.resident_confirm = mapped;
-            write_state_or_warn(path, &state);
+            write_state_or_warn(path, state, Utc::now());
         }
     }
 }
 
 /// 读状态文件中的回驻确认计数、判定、写回。调用方不必自己搬 HashMap。
 /// 往返记忆存续时整段跳过（issue #149），不读改写确认计数。
-/// 停泊目标额外经本地凭证快检过滤（issue #158）：`credentials.json` 与拒止指纹文件
-/// 只读一次，读取失败一律 fail-open（视为信号未知）。
+/// 停泊目标额外过排除集合：本地凭证快检（issue #158；`credentials.json` 与拒止指纹
+/// 文件只读一次）与耗尽账本（issue #192），读取失败一律 fail-open（视为信号未知）。
 pub fn decide_resident_return_from_state(
     path: &Path,
     accounts: &[Account],
@@ -1042,7 +1104,7 @@ pub fn decide_resident_return_from_state(
         return None;
     }
     let mut confirm_counts = read_resident_confirm_counts(path);
-    let locally_invalid = crate::credential_health::locally_invalid_accounts(path, accounts, now);
+    let excluded = parked_exclusions(path, accounts, snapshots, now);
     let target = decide_resident_return(
         accounts,
         snapshots,
@@ -1050,18 +1112,44 @@ pub fn decide_resident_return_from_state(
         now,
         last_auto_swap_at,
         manual_hold_until,
-        &locally_invalid,
+        &excluded,
         &mut confirm_counts,
     );
     write_resident_confirm_counts(path, &confirm_counts);
     target
 }
 
+/// 停泊候选排除集合（见 [`decide_auto_swap`] 的 `excluded`）：本地凭证已确认失效的
+/// 账号（issue #158），并上耗尽账本里有生效记录的账号（issue #192）。本地文件只读、
+/// 零网络，读取失败一律 fail-open（视为信号未知）。
+fn parked_exclusions(
+    path: &Path,
+    accounts: &[Account],
+    snapshots: &[QuotaSnapshot],
+    now: DateTime<Utc>,
+) -> HashSet<AccountId> {
+    let mut excluded = crate::credential_health::locally_invalid_accounts(path, accounts, now);
+    excluded.extend(
+        read_exhaustion_ledger(path)
+            .into_iter()
+            .filter(|record| record.in_effect(snapshots, now))
+            .map(|record| record.account_id),
+    );
+    excluded
+}
+
+/// 耗尽账本。文件缺失、损坏或无该字段视为空表。
+fn read_exhaustion_ledger(path: &Path) -> Vec<ExhaustionRecord> {
+    read_state(path)
+        .map(|state| state.exhaustion_ledger)
+        .unwrap_or_default()
+}
+
 /// 读往返记忆、判定、不合格时写回清除。调用方不必自己搬 [`BurnTrip`]。
 /// 手动保持期同样从状态文件读入，只挡新开抢用（ADR-0014 第 10 条）。
-/// 停泊候选额外经本地凭证快检过滤（issue #158）：invalid_grant 指纹在案的账号
-/// 不作为任何自动路径候选（续跑裁定只认指纹，不认 JWT exp）；本地文件只读、
-/// 零网络，读取失败 fail-open。
+/// 停泊候选额外过排除集合：invalid_grant 指纹在案的账号（issue #158；续跑裁定只认
+/// 指纹，不认 JWT exp）与耗尽账本里有生效记录的账号（issue #192）不作为任何自动路径
+/// 候选；本地文件只读、零网络，读取失败 fail-open。
 pub fn decide_auto_swap_from_state(
     path: &Path,
     accounts: &[Account],
@@ -1093,7 +1181,7 @@ fn decide_auto_swap_from_state_with_trigger(
 ) -> AutoSwapDecision {
     let mut trip = read_burn_trip(path);
     let before = trip.clone();
-    let locally_invalid = crate::credential_health::locally_invalid_accounts(path, accounts, now);
+    let excluded = parked_exclusions(path, accounts, snapshots, now);
     let decision = decide_auto_swap_with_trip(
         accounts,
         snapshots,
@@ -1102,28 +1190,40 @@ fn decide_auto_swap_from_state_with_trigger(
         last_auto_swap_at,
         read_manual_hold_until(path),
         &mut trip,
-        &locally_invalid,
+        &excluded,
         trigger,
     );
     if trip != before {
-        persist_burn_trip(path, trip);
+        persist_burn_trip(path, trip, now);
     }
     decision
 }
 
-/// 无合格候选提示里的「最早恢复」时刻（ADR-0020）：过点重置后，可用快照（`Ready` /
-/// 非 stale `Cached`）窗口上仍在未来的最早 `reset_at`；没有就返回 `None`，提示不写时刻。
-/// GUI 无候选 toast 与 CLI 无候选提示（含 `--json` 的 `earliestReset`）共用本函数。
+/// 无合格候选提示里的「最早恢复」时刻（ADR-0020）：以下两者中最早的那个，必在未来——
+/// - 过点重置后，可用快照（`Ready` / 非 stale `Cached`）窗口上的 `reset_at`；
+/// - 耗尽账本里生效记录的恢复时刻（issue #192；`path` 是自动切换状态文件）。只算快照
+///   列表里的账号：快照覆盖账号库全部账号，已删除账号的记录不算。
+///
+/// 没有就返回 `None`，提示不写时刻。GUI 无候选 toast 与 CLI 无候选提示（含 `--json` 的
+/// `earliestReset`）共用本函数。
 pub fn earliest_recovery_at(
+    path: &Path,
     snapshots: &[QuotaSnapshot],
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     let view = past_reset_view(snapshots, now);
-    view.iter()
+    let resets = view
+        .iter()
         .filter_map(usable_quotas)
         .flatten()
-        .filter_map(|quota| quota.reset_at)
-        .min()
+        .filter_map(|quota| quota.reset_at);
+    let recoveries = read_exhaustion_ledger(path)
+        .into_iter()
+        .filter(|record| {
+            snapshot_of(snapshots, &record.account_id).is_some() && record.in_effect(snapshots, now)
+        })
+        .map(|record| record.recovers_at);
+    resets.chain(recoveries).min()
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,6 +1544,34 @@ pub fn overlay_exhausted_snapshot(
     }
 }
 
+/// 把耗尽原文这一权威证据记进耗尽账本（issue #192 / ADR-0020）：配额失败被动切换命中
+/// 额度耗尽时，在被动串行化锁内、判定之前为当前账号写一条，无论最终切没切。参数与
+/// [`overlay_exhausted_snapshot`] 同形：`cached` 是该账号的缓存快照（overlay 之前），
+/// `now` 即观察时刻。
+///
+/// overlay 只让「此刻已耗尽」进本次判定；账本把这份证据留到恢复时刻，此后各自动路径
+/// 判定时，该账号不作停泊候选（生效条件见 `ExhaustionRecord::in_effect`）。同一账号同一
+/// 窗口的旧记录被新证据覆盖。只写可丢弃的自动切换状态文件，不写额度缓存。
+pub fn record_exhaustion(
+    path: &Path,
+    account_id: &AccountId,
+    cached: Option<&QuotaSnapshot>,
+    window: Option<QuotaWindow>,
+    now: DateTime<Utc>,
+) {
+    let mut state = read_state(path).unwrap_or_default();
+    state
+        .exhaustion_ledger
+        .retain(|record| !(record.account_id == *account_id && record.window == window));
+    state.exhaustion_ledger.push(ExhaustionRecord {
+        account_id: account_id.clone(),
+        window,
+        observed_at: now,
+        recovers_at: exhaustion_recovers_at(cached, window, now),
+    });
+    write_state_or_warn(path, state, now);
+}
+
 /// 配额失败被动切换判定门面（issue #162）：调用方先用 [`overlay_exhausted_snapshot`]
 /// 把当前账号快照换成权威耗尽证据，再经本门面进入与轮询路径同一判定单点。
 ///
@@ -1498,7 +1626,7 @@ pub fn write_burn_trip_and_last_auto_swap_at(path: &Path, at: DateTime<Utc>, tri
     state.last_auto_swap_at = Some(at);
     state.resident_confirm.clear();
     state.burn_trip = Some(trip.clone());
-    write_state_or_warn(path, &state);
+    write_state_or_warn(path, state, at);
 }
 
 /// 自动切换 activate 成功后写冷却时刻。抢用同时写入往返记忆；回程与其它路径清掉既有记忆。
@@ -1517,16 +1645,17 @@ pub fn record_auto_swap_success(
     write_last_auto_swap_at(path, at);
 }
 
-fn persist_burn_trip(path: &Path, trip: Option<BurnTrip>) {
+fn persist_burn_trip(path: &Path, trip: Option<BurnTrip>, now: DateTime<Utc>) {
     match read_state(path) {
         None if trip.is_none() => {}
         None => {
             write_state_or_warn(
                 path,
-                &AutoSwapStateFile {
+                AutoSwapStateFile {
                     burn_trip: trip,
                     ..AutoSwapStateFile::default()
                 },
+                now,
             );
         }
         Some(mut state) => {
@@ -1534,7 +1663,7 @@ fn persist_burn_trip(path: &Path, trip: Option<BurnTrip>) {
                 return;
             }
             state.burn_trip = trip;
-            write_state_or_warn(path, &state);
+            write_state_or_warn(path, state, now);
         }
     }
 }
@@ -1546,7 +1675,7 @@ pub fn write_last_auto_swap_at(path: &Path, at: DateTime<Utc>) {
     state.last_auto_swap_at = Some(at);
     state.resident_confirm.clear();
     state.burn_trip = None;
-    write_state_or_warn(path, &state);
+    write_state_or_warn(path, state, at);
 }
 
 /// 写入手动保持期截止，读改写不动上次自动切换时刻（没有切换史保持 None），
@@ -1559,11 +1688,17 @@ pub fn set_manual_hold_until(path: &Path, until: DateTime<Utc>) {
     state.manual_hold_until = Some(until);
     state.resident_confirm.clear();
     state.burn_trip = None;
-    write_state_or_warn(path, &state);
+    write_state_or_warn(path, state, Utc::now());
 }
 
-fn write_state_or_warn(path: &Path, state: &AutoSwapStateFile) {
-    if let Err(err) = try_write_state(path, state) {
+/// 写状态文件，顺带清掉恢复时刻已到（不晚于 `now`）的耗尽记录（issue #192），状态文件
+/// 因此不随账本膨胀。`now` 取本次写入携带的时刻；没有时刻参数的写入（回驻确认计数、
+/// 手动保持期）取此刻。失败只 warn，不回传错误。
+fn write_state_or_warn(path: &Path, mut state: AutoSwapStateFile, now: DateTime<Utc>) {
+    state
+        .exhaustion_ledger
+        .retain(|record| record.recovers_at > now);
+    if let Err(err) = try_write_state(path, &state) {
         tracing::warn!(
             err = %err,
             path = %path.display(),
@@ -5037,6 +5172,8 @@ mod tests {
     /// 不再给出；全部已过点时不显示时刻。
     #[test]
     fn earliest_recovery_at_skips_passed_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("auto_swap.json");
         let five = QuotaWindow::FiveHour;
         let seven = QuotaWindow::SevenDay;
         let passed = now() - chrono::Duration::hours(1);
@@ -5045,6 +5182,7 @@ mod tests {
 
         assert_eq!(
             earliest_recovery_at(
+                &state,
                 &[
                     ready_resets("alice", &[(five, 99, 100, Some(later))]),
                     ready_resets(
@@ -5058,6 +5196,7 @@ mod tests {
         );
         assert_eq!(
             earliest_recovery_at(
+                &state,
                 &[ready_resets("bob", &[(five, 99, 100, Some(now()))])],
                 now()
             ),
@@ -5066,6 +5205,7 @@ mod tests {
         );
         assert_eq!(
             earliest_recovery_at(
+                &state,
                 &[ready_resets("bob", &[(five, 99, 100, Some(passed))])],
                 now()
             ),
@@ -5078,6 +5218,8 @@ mod tests {
     /// Cached 不计入；可用窗口都缺 `reset_at` 时为 None（原 `earliest_reset_at` 用例迁入）。
     #[test]
     fn earliest_recovery_at_counts_only_usable_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("auto_swap.json");
         let five = QuotaWindow::FiveHour;
         let seven = QuotaWindow::SevenDay;
         let at = |hours: i64| now() + chrono::Duration::hours(hours);
@@ -5089,6 +5231,7 @@ mod tests {
 
         assert_eq!(
             earliest_recovery_at(
+                &state,
                 &[
                     ready_resets("alice", &[(five, 99, 100, Some(at(8)))]),
                     ready_resets("bob", &[(five, 99, 100, Some(at(4)))]),
@@ -5106,6 +5249,7 @@ mod tests {
         );
         assert_eq!(
             earliest_recovery_at(
+                &state,
                 &[
                     cached_at("cached", false, Some(at(3))),
                     cached_at("stale", true, Some(at(1))),
@@ -5116,9 +5260,10 @@ mod tests {
             ),
             Some(at(3))
         );
-        assert_eq!(earliest_recovery_at(&[], now()), None);
+        assert_eq!(earliest_recovery_at(&state, &[], now()), None);
         assert_eq!(
             earliest_recovery_at(
+                &state,
                 &[
                     ready("alice", &[(five, 99, 100)]),
                     cached_at("stale", true, Some(at(1))),
@@ -5179,5 +5324,490 @@ mod tests {
             membered_resets("bob", &[(five, 10, 100, Some(days))], "LEVEL_INTERMEDIATE"),
         ]);
         assert_eq!(got.map(|target| target.to.0), Some("bob".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // 耗尽账本（issue #192 / ADR-0020）
+    // -----------------------------------------------------------------------
+
+    /// 同一快照，取得时间改为 `fetched_at`（缓存停在哪一刻）。
+    fn fetched(mut snapshot: QuotaSnapshot, fetched_at: DateTime<Utc>) -> QuotaSnapshot {
+        snapshot.fetched_at = fetched_at;
+        snapshot
+    }
+
+    fn swap_target(decision: AutoSwapDecision) -> Option<String> {
+        match decision {
+            AutoSwapDecision::Swap(target) => Some(target.to.0),
+            AutoSwapDecision::Stay { .. } => None,
+        }
+    }
+
+    /// 生效的耗尽记录让所属账号不作停泊候选；到恢复时刻失效；该账号有取得时间晚于观察
+    /// 时刻的可用快照（Ready / 非 stale Cached）时立即失效，以真实额度为准。当前账号
+    /// 自己的记录不产生额外触发。
+    #[test]
+    fn decide_auto_swap_from_state_ledger_excludes_parked_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let five = QuotaWindow::FiveHour;
+        let observed = now() - chrono::Duration::hours(1);
+        let before = observed - chrono::Duration::hours(1);
+        let after = observed + chrono::Duration::minutes(1);
+        // bob 一小时前撞上 5 小时窗耗尽，缓存里没有 reset_at：观察时刻 + 5 小时恢复。
+        record_exhaustion(&path, &AccountId("bob".into()), None, Some(five), observed);
+        let recovers = observed + chrono::Duration::hours(5);
+        let decide = |accounts: &[Account], snapshots: &[QuotaSnapshot], at: DateTime<Utc>| {
+            decide_auto_swap_from_state(&path, accounts, snapshots, &on(), at, None)
+        };
+
+        // 缓存停在观察之前，bob 显示有余量：记录生效，跳过 bob 切 carol。
+        let three = vec![
+            settled("alice", true),
+            settled("bob", false),
+            settled("carol", false),
+        ];
+        let stale_bob = fetched(cached("bob", false, &[(five, 10, 100)]), before);
+        let got = decide(
+            &three,
+            &[
+                ready("alice", &[(five, 99, 100)]),
+                stale_bob.clone(),
+                ready("carol", &[(five, 20, 100)]),
+            ],
+            now(),
+        );
+        assert_eq!(swap_target(got), Some("carol".into()));
+
+        // 唯一候选被记录排除 → 无合格候选。
+        let two = vec![settled("alice", true), settled("bob", false)];
+        let two_snaps = vec![ready("alice", &[(five, 99, 100)]), stale_bob];
+        assert_eq!(
+            decide(&two, &two_snaps, now()),
+            stay(AutoSwapSkipReason::NoEligibleCandidate)
+        );
+
+        // 到恢复时刻失效。
+        assert_eq!(
+            swap_target(decide(&two, &two_snaps, recovers)),
+            Some("bob".into())
+        );
+
+        // 观察之后取得的可用快照（Ready / 非 stale Cached）→ 记录失效。
+        for newer in [
+            fetched(ready("bob", &[(five, 10, 100)]), after),
+            fetched(cached("bob", false, &[(five, 10, 100)]), after),
+        ] {
+            let got = decide(&two, &[ready("alice", &[(five, 99, 100)]), newer], now());
+            assert_eq!(swap_target(got), Some("bob".into()));
+        }
+
+        // 当前账号自己的记录不产生额外触发：alice 快照健康 → 不切。
+        record_exhaustion(
+            &path,
+            &AccountId("alice".into()),
+            None,
+            Some(five),
+            observed,
+        );
+        assert_eq!(
+            decide(
+                &two,
+                &[
+                    fetched(ready("alice", &[(five, 10, 100)]), before),
+                    fetched(ready("bob", &[(five, 10, 100)]), before),
+                ],
+                now(),
+            ),
+            stay(AutoSwapSkipReason::BelowThreshold)
+        );
+    }
+
+    /// 恢复时刻：缓存里该账号该窗口的 `reset_at` 晚于观察时刻则取之，否则按窗口时长
+    /// 保守估计（5 小时窗 +5 小时、7 天窗 +7 天、月度窗 +31 天）；窗口辨认不出按 5 小时窗。
+    /// 恢复前一秒该账号仍不作候选，到点重新合格。缓存 `reset_at` 观察时已过的那一例里，
+    /// 过点重置会让缓存里 100% 的窗口按已用 0 参与判定，账本仍把它挡到恢复时刻。
+    #[test]
+    fn exhaustion_record_recovery_time_table() {
+        let five = QuotaWindow::FiveHour;
+        let seven = QuotaWindow::SevenDay;
+        let month = QuotaWindow::Month;
+        let observed = now();
+        let before = observed - chrono::Duration::hours(1);
+        let passed = observed - chrono::Duration::minutes(30);
+        let reset_5h = observed + chrono::Duration::hours(2);
+        let reset_7d = observed + chrono::Duration::days(3);
+        let hours = chrono::Duration::hours;
+        let days = chrono::Duration::days;
+        // bob 观察之前的缓存，各窗口带 reset_at。
+        let bob_cache = |parts: &[(QuotaWindow, u64, u64, Option<DateTime<Utc>>)]| {
+            fetched(ready_resets("bob", parts), before)
+        };
+        let both = bob_cache(&[
+            (five, 40, 100, Some(reset_5h)),
+            (seven, 40, 100, Some(reset_7d)),
+        ]);
+        let five_passed = bob_cache(&[(five, 100, 100, Some(passed))]);
+        let only_five = bob_cache(&[(five, 40, 100, Some(reset_5h))]);
+        let accounts = vec![settled("alice", true), settled("bob", false)];
+
+        let cases = [
+            (
+                "5 小时窗取未来的 reset_at",
+                Some(five),
+                Some(&both),
+                reset_5h,
+            ),
+            (
+                "7 天窗取未来的 reset_at",
+                Some(seven),
+                Some(&both),
+                reset_7d,
+            ),
+            (
+                "reset_at 观察时已过 → +5 小时",
+                Some(five),
+                Some(&five_passed),
+                observed + hours(5),
+            ),
+            (
+                "缓存缺该窗口 → 7 天窗 +7 天",
+                Some(seven),
+                Some(&only_five),
+                observed + days(7),
+            ),
+            (
+                "月度窗 +31 天",
+                Some(month),
+                Some(&both),
+                observed + days(31),
+            ),
+            (
+                "无缓存 → 5 小时窗 +5 小时",
+                Some(five),
+                None,
+                observed + hours(5),
+            ),
+            ("窗口辨认不出按 5 小时窗", None, Some(&both), reset_5h),
+            (
+                "窗口辨认不出、5 小时窗 reset_at 已过 → +5 小时",
+                None,
+                Some(&five_passed),
+                observed + hours(5),
+            ),
+        ];
+        for (name, window, cache, recovers) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auto_swap.json");
+            record_exhaustion(&path, &AccountId("bob".into()), cache, window, observed);
+            let bob = cache
+                .cloned()
+                .unwrap_or_else(|| fetched(ready("bob", &[(five, 40, 100)]), before));
+            let snapshots = vec![ready("alice", &[(five, 99, 100)]), bob];
+            let decide =
+                |at| decide_auto_swap_from_state(&path, &accounts, &snapshots, &on(), at, None);
+            assert_eq!(
+                decide(recovers - chrono::Duration::seconds(1)),
+                stay(AutoSwapSkipReason::NoEligibleCandidate),
+                "{name}：恢复前仍排除"
+            );
+            assert_eq!(
+                swap_target(decide(recovers)),
+                Some("bob".into()),
+                "{name}：到点重新合格"
+            );
+        }
+    }
+
+    /// 耗尽账本对各自动路径口径一致：有生效记录的账号不作 pace 预切换、重置前抢用、
+    /// 抢用回程、回驻与被动触发的停泊候选（耗尽路径见
+    /// `decide_auto_swap_from_state_ledger_excludes_parked_candidate`）；同一夹具没有记录
+    /// 时，各路径照常切到它。
+    #[test]
+    fn ledger_excludes_parked_candidate_on_every_auto_path() {
+        let five = QuotaWindow::FiveHour;
+        let w10 = &[(five, 10, 100)];
+        let observed = now() - chrono::Duration::hours(1);
+        let before = observed - chrono::Duration::hours(1);
+        let old = |snapshot: QuotaSnapshot| fetched(snapshot, before);
+        let two = vec![settled("alice", true), settled("bob", false)];
+        // 每条路径各用两份状态文件：一份记着 bob 一小时前的耗尽，一份没有。
+        let dir = tempfile::tempdir().unwrap();
+        let state_pair = |name: &str| {
+            let recorded = dir.path().join(format!("{name}-recorded.json"));
+            record_exhaustion(
+                &recorded,
+                &AccountId("bob".into()),
+                None,
+                Some(five),
+                observed,
+            );
+            [
+                (recorded, None),
+                (dir.path().join(format!("{name}-clean.json")), Some("bob")),
+            ]
+        };
+
+        // pace：5 小时窗已流逝一半、已用 85%。
+        let half = now() + chrono::Duration::minutes(150);
+        let snaps = vec![
+            ready_reset("alice", &[(five, 85, 100)], half),
+            old(ready("bob", w10)),
+        ];
+        for (path, expected) in state_pair("pace") {
+            let got = decide_auto_swap_from_state(&path, &two, &snaps, &pace_on(), now(), None);
+            assert_eq!(swap_target(got).as_deref(), expected, "pace");
+        }
+
+        // 重置前抢用：bob 的 5 小时窗 30 分钟后重置、已用 80%。
+        let near = now() + chrono::Duration::minutes(30);
+        let snaps = vec![
+            ready("alice", w10),
+            old(ready_reset("bob", &[(five, 80, 100)], near)),
+        ];
+        for (path, expected) in state_pair("burn") {
+            let got = decide_auto_swap_from_state(&path, &two, &snaps, &burn_on(), now(), None);
+            assert_eq!(swap_target(got).as_deref(), expected, "抢用");
+        }
+
+        // 抢用回程：从 bob 烧到 alice，alice 的目标窗口已翻过记录的重置点。
+        let recorded_reset = now() + chrono::Duration::hours(1);
+        let flipped = recorded_reset + chrono::Duration::hours(5);
+        let snaps = vec![old(ready("bob", w10)), ready_reset("alice", w10, flipped)];
+        for (path, expected) in state_pair("return") {
+            seed_trip(&path, &trip("bob", "alice", five, recorded_reset));
+            let last = read_last_auto_swap_at(&path);
+            let got = decide_auto_swap_from_state(&path, &two, &snaps, &on(), now(), last);
+            assert_eq!(swap_target(got).as_deref(), expected, "回程");
+        }
+
+        // 回驻：bob 档位更低。
+        let snaps = vec![
+            membered("alice", w10, "LEVEL_ADVANCED"),
+            old(membered("bob", w10, "LEVEL_INTERMEDIATE")),
+        ];
+        for (path, expected) in state_pair("resident") {
+            let got = decide_resident_return_from_state(
+                &path,
+                &two,
+                &snaps,
+                &resident(),
+                now(),
+                None,
+                None,
+            );
+            assert_eq!(got.map(|target| target.to.0).as_deref(), expected, "回驻");
+        }
+
+        // 被动触发：alice 的耗尽原文经 overlay 进判定。
+        let overlay = overlay_exhausted_snapshot(&AccountId("alice".into()), None, None, now());
+        let snaps = vec![overlay, old(ready("bob", w10))];
+        for (path, expected) in state_pair("passive") {
+            let got = decide_auto_swap_passive_from_state(&path, &two, &snaps, &on(), now(), None);
+            assert_eq!(swap_target(got).as_deref(), expected, "被动");
+        }
+    }
+
+    /// 「最早恢复」纳入生效耗尽记录的恢复时刻，仍只给未来时刻：记录到点后、或该账号有
+    /// 更新的可用快照时不再计入（stale 回落不算更新的可用快照）；不在快照列表里的账号
+    /// （已删除）的记录不算。
+    #[test]
+    fn earliest_recovery_at_counts_ledger_recovery() {
+        let five = QuotaWindow::FiveHour;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let observed = now() - chrono::Duration::hours(1);
+        let before = observed - chrono::Duration::hours(1);
+        let after = observed + chrono::Duration::minutes(1);
+        let later = now() + chrono::Duration::hours(8);
+        // bob 一小时前耗尽 → 4 小时后恢复，早于 alice 窗口 8 小时后的重置。
+        record_exhaustion(&path, &AccountId("bob".into()), None, Some(five), observed);
+        let recovers = observed + chrono::Duration::hours(5);
+        let alice = ready_resets("alice", &[(five, 99, 100, Some(later))]);
+        let with_bob = |bob: QuotaSnapshot| vec![alice.clone(), bob];
+        let old_bob = fetched(ready("bob", &[(five, 10, 100)]), before);
+
+        assert_eq!(
+            earliest_recovery_at(&path, &with_bob(old_bob.clone()), now()),
+            Some(recovers)
+        );
+        assert_eq!(
+            earliest_recovery_at(&path, &with_bob(old_bob.clone()), recovers),
+            Some(later),
+            "到点的记录不再给出"
+        );
+        assert_eq!(
+            earliest_recovery_at(
+                &path,
+                &with_bob(fetched(ready("bob", &[(five, 10, 100)]), after)),
+                now()
+            ),
+            Some(later),
+            "更新的可用快照让记录失效"
+        );
+        assert_eq!(
+            earliest_recovery_at(
+                &path,
+                &with_bob(fetched(cached("bob", true, &[(five, 10, 100)]), after)),
+                now()
+            ),
+            Some(recovers),
+            "stale 回落不是可用快照"
+        );
+
+        // 已删除账号 carol 的记录更早到点，但不在快照列表里，不算。
+        let carol_observed = now() - chrono::Duration::hours(4);
+        record_exhaustion(
+            &path,
+            &AccountId("carol".into()),
+            None,
+            Some(five),
+            carol_observed,
+        );
+        assert_eq!(
+            earliest_recovery_at(&path, &with_bob(old_bob), now()),
+            Some(recovers)
+        );
+    }
+
+    /// 状态文件里耗尽账本的（账号, 窗口）列表。文件格式本身是跨版本契约。
+    fn ledger_keys(path: &Path) -> Vec<(String, Option<String>)> {
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        raw.get("exhaustion_ledger")
+            .and_then(|ledger| ledger.as_array())
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|record| {
+                        (
+                            record["account_id"].as_str().unwrap().to_string(),
+                            record["window"].as_str().map(String::from),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 状态文件兼容：存量文件（无账本字段）照常读写；账本与冷却、手动保持期、回驻确认
+    /// 计数、往返记忆的写入互不覆盖；空账本不写进文件；文件里有不认识的字段也照读，
+    /// 旧版本进程读到账本字段同理。
+    #[test]
+    fn exhaustion_ledger_state_file_compat() {
+        // 没有时刻参数的写入按墙钟清理到点记录，本例的时刻因此取墙钟。
+        let wall = Utc::now();
+        let five = QuotaWindow::FiveHour;
+        let bob_key = || vec![("bob".to_string(), Some("five_hour".to_string()))];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        std::fs::write(
+            &path,
+            r#"{"last_auto_swap_at":"2026-09-03T12:00:00Z","manual_hold_until":"2026-09-03T20:00:00Z"}"#,
+        )
+        .unwrap();
+        let hold = now() + chrono::Duration::hours(8);
+        assert!(ledger_keys(&path).is_empty(), "存量文件读作空账本");
+
+        record_exhaustion(&path, &AccountId("bob".into()), None, Some(five), wall);
+        assert_eq!(ledger_keys(&path), bob_key());
+        assert_eq!(read_last_auto_swap_at(&path), Some(now()), "写账本保留冷却");
+        assert_eq!(
+            read_manual_hold_until(&path),
+            Some(hold),
+            "写账本保留保持期"
+        );
+
+        write_last_auto_swap_at(&path, wall);
+        set_manual_hold_until(&path, wall + chrono::Duration::hours(8));
+        write_resident_confirm_counts(&path, &HashMap::from([(AccountId("carol".into()), 1)]));
+        write_burn_trip_and_last_auto_swap_at(
+            &path,
+            wall,
+            &trip("alice", "carol", five, wall + chrono::Duration::hours(1)),
+        );
+        assert_eq!(ledger_keys(&path), bob_key(), "其余写入保留账本");
+
+        let fresh = dir.path().join("fresh.json");
+        write_last_auto_swap_at(&fresh, wall);
+        assert!(
+            !std::fs::read_to_string(&fresh)
+                .unwrap()
+                .contains("exhaustion_ledger"),
+            "空账本不写进文件"
+        );
+
+        let future = dir.path().join("future.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["field_from_a_newer_version"] = serde_json::json!({"any": 1});
+        std::fs::write(&future, raw.to_string()).unwrap();
+        assert_eq!(read_last_auto_swap_at(&future), Some(wall));
+        assert_eq!(ledger_keys(&future), bob_key());
+        let snaps = vec![ready("bob", &[(five, 10, 100)])];
+        assert_eq!(
+            earliest_recovery_at(&future, &snaps, wall),
+            Some(wall + chrono::Duration::hours(5)),
+            "不认识的字段不影响读账本"
+        );
+    }
+
+    /// 每次写状态文件时，恢复时刻已到的记录被清掉、未到的保留；同一账号同一窗口以新证据
+    /// 覆盖，窗口不同则各记一条。
+    #[test]
+    fn exhaustion_ledger_cleanup_and_overwrite_on_write() {
+        let five = QuotaWindow::FiveHour;
+        let hours = chrono::Duration::hours;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let key = |id: &str, window: Option<&str>| (id.to_string(), window.map(String::from));
+        // bob 一小时前已到点，carol 三小时后才恢复。
+        record_exhaustion(
+            &path,
+            &AccountId("bob".into()),
+            None,
+            Some(five),
+            now() - hours(6),
+        );
+        record_exhaustion(
+            &path,
+            &AccountId("carol".into()),
+            None,
+            Some(five),
+            now() - hours(2),
+        );
+        assert_eq!(
+            ledger_keys(&path),
+            vec![
+                key("bob", Some("five_hour")),
+                key("carol", Some("five_hour"))
+            ]
+        );
+
+        write_last_auto_swap_at(&path, now());
+        assert_eq!(
+            ledger_keys(&path),
+            vec![key("carol", Some("five_hour"))],
+            "到点的 bob 被清掉"
+        );
+
+        // carol 同窗口的新证据覆盖旧记录：恢复时刻跟着新的观察时刻走。
+        record_exhaustion(&path, &AccountId("carol".into()), None, Some(five), now());
+        assert_eq!(ledger_keys(&path), vec![key("carol", Some("five_hour"))]);
+        let carol = vec![fetched(
+            ready("carol", &[(five, 10, 100)]),
+            now() - hours(3),
+        )];
+        assert_eq!(
+            earliest_recovery_at(&path, &carol, now()),
+            Some(now() + hours(5))
+        );
+
+        // 窗口不同是另一条记录。
+        record_exhaustion(&path, &AccountId("carol".into()), None, None, now());
+        assert_eq!(
+            ledger_keys(&path),
+            vec![key("carol", Some("five_hour")), key("carol", None)]
+        );
     }
 }

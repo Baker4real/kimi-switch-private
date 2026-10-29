@@ -18,7 +18,7 @@ use kimi_switch_engine::{extract_access_token, extract_refresh_token, RefreshOut
 use sha2::{Digest, Sha256};
 
 use crate::kimi_files::decode_jwt_payload;
-use crate::{kimi_files, paths};
+use crate::{kimi_files, paths, KimiRuntime};
 
 const MIN_COORDINATED_REFRESH_VERSION: (u64, u64, u64) = (1, 31, 0);
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -163,9 +163,11 @@ async fn refresh_blob_at(blob: &str, oauth_base: &str) -> Result<RefreshOutcome>
 ///
 /// Python 版 1.31+ 使用 flock 锁；TypeScript 版 0.x 在 Unix 使用 proper-lockfile 目录锁。
 /// 不支持协调锁的平台、旧版或版本未知时宁可保留 401，也不争抢一次性 refresh token。
+/// 轮换结果持官方锁经轮换写回比对提交（`commit_rotation_and_release`，ADR-0019）。
 pub async fn recover_active_401(
     attempted_access_token: &str,
     account: &Account,
+    runtime: &KimiRuntime,
 ) -> Result<Option<String>> {
     let Some(protocol) = installed_kimi_refresh_lock_protocol().await else {
         tracing::warn!(
@@ -179,6 +181,7 @@ pub async fn recover_active_401(
         &paths::kimi_home(),
         &oauth_host(),
         protocol,
+        runtime,
     )
     .await
 }
@@ -360,6 +363,7 @@ pub(crate) async fn recover_active_401_at(
     home: &Path,
     oauth_base: &str,
     protocol: RefreshLockProtocol,
+    runtime: &KimiRuntime,
 ) -> Result<Option<String>> {
     let credential_path = paths::active_cred_path(home);
     let Some(locked) =
@@ -397,16 +401,18 @@ pub(crate) async fn recover_active_401_at(
     let outcome = refresh_blob_at(&locked.raw, oauth_base).await;
     match outcome {
         Ok(RefreshOutcome::Rotated(rotated)) => {
+            // 本次查询照用新 access token 重试，不论轮换结果最终落在当前登录文件还是库存。
             let fresh_access = extract_access_token(&rotated);
-            let write_result = write_credentials_and_release(
+            commit_rotation_and_release(
                 locked.guard,
-                credential_path,
-                paths::dead_refresh_fingerprint_path(home),
-                current_refresh_fingerprint,
+                runtime.clone(),
+                home.to_path_buf(),
+                account.clone(),
+                locked.raw,
                 rotated,
+                current_refresh_fingerprint,
             )
-            .await;
-            write_result?;
+            .await?;
             Ok(fresh_access)
         }
         Ok(RefreshOutcome::DeadToken) => {
@@ -622,18 +628,30 @@ fn start_directory_heartbeat(path: PathBuf) -> (Sender<()>, JoinHandle<()>) {
     (sender, handle)
 }
 
-async fn write_credentials_and_release(
+/// 401 协调恢复的提交（ADR-0019）：轮换结果经引擎的轮换写回比对写回。交换锁内重读，库存仍持
+/// 被消耗的 refresh token 才替换；当前登录文件仍属原账号、仍持被消耗的 token、原账号仍是
+/// registry 当前账号，才写当前登录文件。恢复在途时切走了，当前登录文件不动，新凭证只落原账号
+/// 库存。随后清掉被消耗 token 的拒止指纹，最后释放官方刷新锁。
+///
+/// 锁顺序：官方刷新锁 → 交换锁。提交是纯本地 IO，交换锁内不做网络请求；官方锁随提交同在
+/// 阻塞任务里释放，查询被取消也不会在写回途中提前放锁。
+async fn commit_rotation_and_release(
     guard: RefreshLockGuard,
-    path: PathBuf,
-    dead_fingerprint_path: PathBuf,
+    runtime: KimiRuntime,
+    home: PathBuf,
+    account: Account,
+    consumed: String,
+    rotated: String,
     fingerprint_to_clear: Option<String>,
-    contents: String,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let result = (|| {
-            atomic_private_write(&path, &contents)?;
+            runtime.commit_rotation(&home, &account, &consumed, &rotated)?;
             if let Some(fingerprint) = fingerprint_to_clear {
-                remove_dead_refresh_fingerprint(&dead_fingerprint_path, &fingerprint)?;
+                remove_dead_refresh_fingerprint(
+                    &paths::dead_refresh_fingerprint_path(&home),
+                    &fingerprint,
+                )?;
             }
             Ok(())
         })();
@@ -875,9 +893,8 @@ fn refresh_fingerprint(refresh_token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(windows))]
+    use crate::test_support::recovery_runtime;
     use chrono::Utc;
-    #[cfg(not(windows))]
     use kimi_switch_core::AccountId;
 
     #[test]
@@ -972,6 +989,7 @@ mod tests {
         let home = temporary.path().to_path_buf();
         let account = active_account();
         let attempted = old_access.clone();
+        let runtime = recovery_runtime(temporary.path());
         let recovery = tokio::spawn(async move {
             recover_active_401_at(
                 &attempted,
@@ -979,6 +997,7 @@ mod tests {
                 &home,
                 "http://127.0.0.1:1",
                 RefreshLockProtocol::PythonFile,
+                &runtime,
             )
             .await
         });
@@ -1032,6 +1051,7 @@ mod tests {
         let home = temporary.path().to_path_buf();
         let account = active_account();
         let attempted = old_access.clone();
+        let runtime = recovery_runtime(temporary.path());
         let recovery = tokio::spawn(async move {
             recover_active_401_at(
                 &attempted,
@@ -1039,6 +1059,7 @@ mod tests {
                 &home,
                 "http://127.0.0.1:1",
                 RefreshLockProtocol::TypeScriptDirectory,
+                &runtime,
             )
             .await
         });
@@ -1145,6 +1166,7 @@ mod tests {
         let access = jwt("OLD");
         std::fs::write(&credential_path, blob(&access, "R1")).unwrap();
         let server = MockServer::start(vec![("401 Unauthorized", r#"{"error":"invalid_grant"}"#)]);
+        let runtime = recovery_runtime(temporary.path());
 
         assert!(recover_active_401_at(
             &access,
@@ -1152,6 +1174,7 @@ mod tests {
             temporary.path(),
             server.base_url(),
             RefreshLockProtocol::TypeScriptDirectory,
+            &runtime,
         )
         .await
         .unwrap()
@@ -1162,6 +1185,7 @@ mod tests {
             temporary.path(),
             server.base_url(),
             RefreshLockProtocol::TypeScriptDirectory,
+            &runtime,
         )
         .await
         .unwrap()
@@ -1208,6 +1232,7 @@ mod tests {
         });
         let home = temporary.path().to_path_buf();
         let account = active_account();
+        let runtime = recovery_runtime(temporary.path());
         let recovery = tokio::spawn(async move {
             recover_active_401_at(
                 &access,
@@ -1215,6 +1240,7 @@ mod tests {
                 &home,
                 &oauth_base,
                 RefreshLockProtocol::TypeScriptDirectory,
+                &runtime,
             )
             .await
         });
@@ -1230,17 +1256,226 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[cfg(not(windows))]
+    /// 401 协调恢复在途时切走（spec #185 用户故事 7、8）：刷新请求已发出、服务端已消耗 R1 时，
+    /// 用户把当前账号切到 u-456。放行后当前登录文件仍是 u-456 的凭证，原账号 u-123 的库存持
+    /// 轮换出的新 token。Python 文件锁协议在 Windows 上同样可用，本用例不加平台门控。
+    #[tokio::test]
+    async fn recovery_in_flight_then_switch_keeps_live_and_stores_new_token() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().to_path_buf();
+        let credential_path = paths::active_cred_path(&home);
+        std::fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
+        let runtime = recovery_runtime(&home);
+        let old_access = jwt("OLD");
+        let original = blob(&old_access, "R1");
+        std::fs::write(&credential_path, &original).unwrap();
+        // 额度查询读取当前账号凭证时已把 live 回灌进库存。
+        runtime
+            .store
+            .set("kimi", "u-123", "blob", &original)
+            .unwrap();
+        runtime.registry.upsert(active_account()).unwrap();
+        let other = parked_account("u-456");
+        runtime.registry.upsert(other.clone()).unwrap();
+        let other_blob = blob(
+            &crate::test_support::jwt_with_payload(r#"{"user_id":"u-456","client_id":"c-1"}"#),
+            "R9",
+        );
+        let new_access = jwt("NEW");
+        let server = HeldRefreshServer::start(format!(
+            r#"{{"access_token":"{new_access}","refresh_token":"R2","expires_in":3600,"scope":"kimi-code","token_type":"Bearer"}}"#
+        ));
+
+        let recovery = {
+            let attempted = old_access.clone();
+            let home = home.clone();
+            let oauth_base = server.base_url.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                recover_active_401_at(
+                    &attempted,
+                    &active_account(),
+                    &home,
+                    &oauth_base,
+                    RefreshLockProtocol::PythonFile,
+                    &runtime,
+                )
+                .await
+            })
+        };
+        let server = server.wait_received().await;
+        // 恢复在途时切到 u-456：与 activate 提交时一样，在交换锁内写当前登录文件、改 registry 当前标记。
+        kimi_switch_core::swap::with_swap_lock(&home, || {
+            std::fs::write(&credential_path, &other_blob)?;
+            runtime.registry.set_active("kimi", &other.id)
+        })
+        .unwrap();
+        server.release_and_finish();
+
+        assert_eq!(recovery.await.unwrap().unwrap(), Some(new_access));
+        assert_eq!(
+            std::fs::read_to_string(&credential_path).unwrap(),
+            other_blob,
+            "恢复在途时已切走：恢复结果绝不覆盖当前登录文件"
+        );
+        let stored = runtime.store.get("kimi", "u-123", "blob").unwrap().unwrap();
+        assert_eq!(
+            extract_refresh_token(&stored).as_deref(),
+            Some("R2"),
+            "当前登录文件写入放弃后，新凭证必须落进原账号库存"
+        );
+    }
+
+    /// 未发生切换时恢复照常写当前登录文件（Python 文件锁协议，Windows 本机可跑）：交换锁内
+    /// 比对通过，库存仍持被消耗的 R1，新凭证先替换库存、再原子写进当前登录文件。
+    #[tokio::test]
+    async fn recovery_without_switch_writes_live_and_store() {
+        use crate::test_support::MockServer;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let credential_path = paths::active_cred_path(home);
+        std::fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
+        let runtime = recovery_runtime(home);
+        let old_access = jwt("OLD");
+        let original = blob(&old_access, "R1");
+        std::fs::write(&credential_path, &original).unwrap();
+        runtime
+            .store
+            .set("kimi", "u-123", "blob", &original)
+            .unwrap();
+        runtime.registry.upsert(active_account()).unwrap();
+        let server = MockServer::start(vec![(
+            "200 OK",
+            r#"{"access_token":"NEW","refresh_token":"R2","expires_in":3600}"#,
+        )]);
+
+        let fresh = recover_active_401_at(
+            &old_access,
+            &active_account(),
+            home,
+            server.base_url(),
+            RefreshLockProtocol::PythonFile,
+            &runtime,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fresh.as_deref(), Some("NEW"));
+        let live = std::fs::read_to_string(&credential_path).unwrap();
+        assert_eq!(
+            extract_refresh_token(&live).as_deref(),
+            Some("R2"),
+            "未发生切换：恢复照常写当前登录文件"
+        );
+        let stored = runtime.store.get("kimi", "u-123", "blob").unwrap().unwrap();
+        assert_eq!(extract_refresh_token(&stored).as_deref(), Some("R2"));
+        assert_eq!(server.finish(), vec!["POST /api/oauth/token HTTP/1.1"]);
+    }
+
+    /// 本地 OAuth 替身：收下刷新请求后先停住（此刻服务端已消耗旧 refresh token），测试放行后
+    /// 才回 200 与 `body`。用它构造「刷新在途」的交错，不靠 sleep 赌时序。
+    struct HeldRefreshServer {
+        base_url: String,
+        received: tokio::sync::oneshot::Receiver<()>,
+        release: Sender<()>,
+        handle: JoinHandle<()>,
+    }
+
+    /// 已收到刷新请求、停在放行前的替身。
+    struct HeldRequest {
+        release: Sender<()>,
+        handle: JoinHandle<()>,
+    }
+
+    impl HeldRefreshServer {
+        fn start(body: String) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let (received_tx, received) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_full_request(&mut stream);
+                let _ = received_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("测试应在 5 秒内放行刷新响应");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            Self {
+                base_url,
+                received,
+                release,
+                handle,
+            }
+        }
+
+        /// 等到刷新请求已到达替身、停在放行前。
+        async fn wait_received(self) -> HeldRequest {
+            tokio::time::timeout(Duration::from_secs(5), self.received)
+                .await
+                .expect("刷新请求应在 5 秒内到达")
+                .unwrap();
+            HeldRequest {
+                release: self.release,
+                handle: self.handle,
+            }
+        }
+    }
+
+    impl HeldRequest {
+        /// 放行刷新响应，并等替身写完。
+        fn release_and_finish(self) {
+            self.release.send(()).unwrap();
+            self.handle.join().unwrap();
+        }
+    }
+
+    /// 读完一个 HTTP 请求（请求头 + Content-Length 指明的 body），避免关连接时残留未读字节。
+    fn read_full_request(stream: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            if count == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            let text = String::from_utf8_lossy(&request);
+            let Some(head_end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let body_length = text[..head_end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= head_end + 4 + body_length {
+                return;
+            }
+        }
+    }
+
     fn jwt(suffix: &str) -> String {
         format!("header.eyJ1c2VyX2lkIjoidS0xMjMiLCJjbGllbnRfaWQiOiJjLTEifQ.{suffix}")
     }
 
-    #[cfg(not(windows))]
     fn blob(access: &str, refresh: &str) -> String {
         format!(r#"{{"access_token":"{access}","refresh_token":"{refresh}"}}"#)
     }
 
-    #[cfg(not(windows))]
     fn active_account() -> Account {
         Account {
             provider: "kimi".into(),
@@ -1250,6 +1485,15 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             extra: serde_json::Map::new(),
+        }
+    }
+
+    fn parked_account(id: &str) -> Account {
+        Account {
+            id: AccountId(id.into()),
+            label: id.into(),
+            active: false,
+            ..active_account()
         }
     }
 

@@ -93,6 +93,8 @@ mod tests {
 
     use async_trait::async_trait;
 
+    use crate::provider::ActivateOutcome;
+
     struct FlakyProvider {
         calls: AtomicUsize,
     }
@@ -101,6 +103,14 @@ mod tests {
     impl Provider for FlakyProvider {
         async fn activate(&self, _id: &AccountId) -> Result<()> {
             Ok(())
+        }
+
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
         }
 
         async fn query_quota(&self, _id: &AccountId) -> Result<Vec<Quota>> {
@@ -139,6 +149,14 @@ mod tests {
             Ok(())
         }
 
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
+        }
+
         async fn query_quota(&self, _id: &AccountId) -> Result<Vec<Quota>> {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(Vec::new())
@@ -172,6 +190,14 @@ mod tests {
     impl Provider for AlwaysErrorProvider {
         async fn activate(&self, _id: &AccountId) -> Result<()> {
             Ok(())
+        }
+
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
         }
 
         async fn query_quota(&self, _id: &AccountId) -> Result<Vec<Quota>> {
@@ -263,6 +289,14 @@ mod tests {
     impl Provider for TimeLeftProbe {
         async fn activate(&self, _id: &AccountId) -> Result<()> {
             Ok(())
+        }
+
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
         }
 
         async fn query_quota(&self, _id: &AccountId) -> Result<Vec<Quota>> {

@@ -58,7 +58,7 @@ pub use membership_expiry::{
     EXTRA_NEXT_BILLING_TIME, WEB_STORE_FIELD,
 };
 pub use model::{Account, AccountId, Quota, QuotaStatus, QuotaWindow};
-pub use provider::Provider;
+pub use provider::{ActivateOutcome, Provider};
 pub use quota_cache::{CachedEntry, QuotaCache, ValidEntry};
 pub use quota_query::query_quota_with_retry;
 pub use quota_snapshot::{

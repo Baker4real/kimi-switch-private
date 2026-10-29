@@ -16,10 +16,10 @@ use kimi_switch_core::{
     official_nickname_known, persist_auto_swap_opt_out, prettify_membership,
     read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
     set_manual_hold_until, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
-    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason,
-    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCollectReason,
-    QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
-    StartupCheckOutcome, WEB_STORE_FIELD,
+    ActivateOutcome, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn,
+    AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota,
+    QuotaCollectReason, QuotaCollectStats, QuotaFailureKind, QuotaSnapshot, QuotaState,
+    QuotaWindow, RemovedAccounts, StartupCheckOutcome, WEB_STORE_FIELD,
 };
 use kimi_switch_kimi::device_flow::{self, DeviceAuthorization};
 use kimi_switch_kimi::web_membership::{self, WebBinding};
@@ -259,23 +259,14 @@ impl Backend {
         apply_snapshot_auto_swap(
             &settings,
             || self.has_pending_auth(),
-            || {
-                self.registry
-                    .list_by_provider("kimi")
-                    .ok()
-                    .and_then(|listed| {
-                        listed
-                            .into_iter()
-                            .find(|account| account.active)
-                            .map(|account| account.id)
-                    })
-            },
             accounts,
             snapshots,
             Utc::now(),
             last,
             hold,
-            move |id| async move { kimi.activate(&id).await },
+            move |to, expected_current| async move {
+                kimi.activate_if_current(&to, &expected_current).await
+            },
             &self.audit,
             &state_path,
         )
@@ -1191,12 +1182,13 @@ impl AutoSwapSnapshotEffect {
 }
 
 /// collect 完成后的自动切换编排。`pending_auth` 或开关关闭立即返回；activate 失败不写冷却。
-/// 决定之后、真正 activate 之前再读 pending 与当前账号：已变则放弃（不 toast、不审计、不写冷却）。
+/// 决定之后、真正 activate 之前再读 pending：设备码授权已开始则放弃（不 toast、不审计、不写冷却）。
+/// `activate(目标, 期望当前账号)` 是带前置条件的切换（期望当前账号，ADR-0020），期望当前账号取
+/// 决定时的当前账号；返回「已被取代」（用户已手动抢先切换）同样放弃，不 toast、不审计、不写冷却。
 /// 耗尽判定 Stay 时再评估回驻（issue #95 / ADR-0008）；回驻无目标静默，activate 失败同样不写冷却。
-pub(crate) async fn apply_snapshot_auto_swap<F, Fut, P, C>(
+pub(crate) async fn apply_snapshot_auto_swap<F, Fut, P>(
     auto_swap: &kimi_switch_core::settings::AutoSwap,
     pending_auth: P,
-    current_active: C,
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
     now: DateTime<Utc>,
@@ -1208,9 +1200,8 @@ pub(crate) async fn apply_snapshot_auto_swap<F, Fut, P, C>(
 ) -> AutoSwapSnapshotEffect
 where
     P: Fn() -> bool,
-    C: Fn() -> Option<AccountId>,
-    F: FnOnce(AccountId) -> Fut,
-    Fut: std::future::Future<Output = kimi_switch_core::Result<()>>,
+    F: FnOnce(AccountId, AccountId) -> Fut,
+    Fut: std::future::Future<Output = kimi_switch_core::Result<ActivateOutcome>>,
 {
     if pending_auth() || !auto_swap.enabled {
         return AutoSwapSnapshotEffect::none();
@@ -1235,7 +1226,7 @@ where
             ));
             AutoSwapSnapshotEffect {
                 message: Some(UiMessage::auto_swap_no_candidate(earliest_recovery_at(
-                    snapshots, now,
+                    state_path, snapshots, now,
                 ))),
                 swapped: false,
             }
@@ -1252,14 +1243,15 @@ where
             ) {
                 None => AutoSwapSnapshotEffect::none(),
                 Some(target) => {
-                    if pending_auth() || current_active().as_ref() != Some(&target.from) {
+                    if pending_auth() {
                         return AutoSwapSnapshotEffect::none();
                     }
                     // activate 段计时（issue #153 续跑）：自动切换与手动切换同口径，
                     // 只覆盖 activate 段，耗时写入审计 duration_ms。
                     let activate_started = std::time::Instant::now();
-                    match activate(target.to.clone()).await {
-                        Ok(()) => {
+                    match activate(target.to.clone(), target.from.clone()).await {
+                        Ok(ActivateOutcome::Superseded) => AutoSwapSnapshotEffect::none(),
+                        Ok(ActivateOutcome::Activated) => {
                             write_last_auto_swap_at(state_path, Utc::now());
                             audit.append(
                                 AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
@@ -1295,14 +1287,15 @@ where
             }
         }
         AutoSwapDecision::Swap(target) => {
-            if pending_auth() || current_active().as_ref() != Some(&target.from) {
+            if pending_auth() {
                 return AutoSwapSnapshotEffect::none();
             }
             // activate 段计时（issue #153 续跑）：耗尽 / pace / 抢用 / 回程共用，
             // 与手动切换同口径写入审计 duration_ms。
             let activate_started = std::time::Instant::now();
-            match activate(target.to.clone()).await {
-                Ok(()) => {
+            match activate(target.to.clone(), target.from.clone()).await {
+                Ok(ActivateOutcome::Superseded) => AutoSwapSnapshotEffect::none(),
+                Ok(ActivateOutcome::Activated) => {
                     record_auto_swap_success(state_path, Utc::now(), &target, snapshots);
                     audit.append(
                         AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
@@ -1659,7 +1652,6 @@ mod pending_lifecycle_tests {
         let live_effect = apply_snapshot_auto_swap(
             &settings,
             || has_live_pending(Some(&pending), issued_at),
-            || Some(AccountId("alice".into())),
             &[
                 auto_swap_acc("alice", true, now),
                 auto_swap_acc("bob", false, now),
@@ -1671,7 +1663,7 @@ mod pending_lifecycle_tests {
             now,
             None,
             None,
-            |_id| async { panic!("有效期内不得自动切换") },
+            |_to, _expected| async { panic!("有效期内不得自动切换") },
             &audit,
             &state,
         )
@@ -1682,7 +1674,6 @@ mod pending_lifecycle_tests {
         let expired_effect = apply_snapshot_auto_swap(
             &settings,
             || has_live_pending(Some(&pending), expired_at),
-            || Some(AccountId("alice".into())),
             &[
                 auto_swap_acc("alice", true, now),
                 auto_swap_acc("bob", false, now),
@@ -1694,12 +1685,12 @@ mod pending_lifecycle_tests {
             now,
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     activated.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(id.0, "bob");
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -1862,6 +1853,13 @@ mod quota_cache_path_tests {
             async fn activate(&self, _: &AccountId) -> kimi_switch_core::Result<()> {
                 panic!("无账号时不应切换");
             }
+            async fn activate_if_current(
+                &self,
+                _: &AccountId,
+                _: &AccountId,
+            ) -> kimi_switch_core::Result<ActivateOutcome> {
+                panic!("无账号时不应切换");
+            }
             async fn query_quota(&self, _: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
                 panic!("无账号时不应查额度");
             }
@@ -1898,6 +1896,13 @@ mod quota_cache_path_tests {
         #[async_trait::async_trait]
         impl Provider for BareQuotaProvider {
             async fn activate(&self, _: &AccountId) -> kimi_switch_core::Result<()> {
+                panic!("本测试不切换");
+            }
+            async fn activate_if_current(
+                &self,
+                _: &AccountId,
+                _: &AccountId,
+            ) -> kimi_switch_core::Result<ActivateOutcome> {
                 panic!("本测试不切换");
             }
             async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {

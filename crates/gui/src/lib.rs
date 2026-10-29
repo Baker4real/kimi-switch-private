@@ -21,8 +21,8 @@ mod tests {
 
     use chrono::{Local, TimeZone, Utc};
     use kimi_switch_core::{
-        Account, AccountId, Provider, Quota, QuotaCache, QuotaCollectReason, QuotaCollectStats,
-        QuotaSnapshot, QuotaState, QuotaStatus, QuotaWindow,
+        Account, AccountId, ActivateOutcome, Provider, Quota, QuotaCache, QuotaCollectReason,
+        QuotaCollectStats, QuotaSnapshot, QuotaState, QuotaStatus, QuotaWindow,
     };
     use kimi_switch_kimi::web_membership::WebBinding;
 
@@ -35,7 +35,7 @@ mod tests {
         finish_edge_web_bind, import_success_message, pre_reset_burn_message,
         pre_reset_burn_return_message, reauth_success_message, rename_success_message,
         startup_notice_message, swap_after_activate, swap_failure_message, swap_success_message,
-        AutoSwapSnapshotEffect, BindWebReady, WebMembershipRefresh, DEAD_CREDENTIAL_WARNING,
+        BindWebReady, WebMembershipRefresh, DEAD_CREDENTIAL_WARNING,
     };
     use kimi_switch_core::{AuditEvent, AuditLog};
 
@@ -723,6 +723,14 @@ mod tests {
     impl Provider for FocusCountingProvider {
         async fn activate(&self, _id: &AccountId) -> kimi_switch_core::Result<()> {
             Ok(())
+        }
+
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> kimi_switch_core::Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
         }
 
         async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
@@ -1667,6 +1675,13 @@ mod tests {
             async fn activate(&self, _id: &AccountId) -> kimi_switch_core::Result<()> {
                 Ok(())
             }
+            async fn activate_if_current(
+                &self,
+                _id: &AccountId,
+                _expected_current: &AccountId,
+            ) -> kimi_switch_core::Result<ActivateOutcome> {
+                Ok(ActivateOutcome::Activated)
+            }
             async fn query_quota(&self, _id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Err(kimi_switch_core::Error::quota_credential_expired(
@@ -1894,6 +1909,14 @@ mod tests {
             Ok(())
         }
 
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> kimi_switch_core::Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
+        }
+
         async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![sample_quota(
@@ -1915,6 +1938,14 @@ mod tests {
     impl Provider for SlowQuotaProvider {
         async fn activate(&self, _id: &AccountId) -> kimi_switch_core::Result<()> {
             Ok(())
+        }
+
+        async fn activate_if_current(
+            &self,
+            _id: &AccountId,
+            _expected_current: &AccountId,
+        ) -> kimi_switch_core::Result<ActivateOutcome> {
+            Ok(ActivateOutcome::Activated)
         }
 
         async fn query_quota(&self, id: &AccountId) -> kimi_switch_core::Result<Vec<Quota>> {
@@ -2076,7 +2107,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &settings,
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[
                 auto_swap_ready("alice", 100, 100),
@@ -2085,7 +2115,7 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            |_id| async { panic!("disabled 不得 activate") },
+            |_to, _expected| async { panic!("disabled 不得 activate") },
             &audit,
             &state,
         )
@@ -2105,7 +2135,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || true,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[
                 auto_swap_ready("alice", 99, 100),
@@ -2114,7 +2143,7 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            |_id| async { panic!("pending_auth 不得 activate") },
+            |_to, _expected| async { panic!("pending_auth 不得 activate") },
             &audit,
             &state,
         )
@@ -2140,7 +2169,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), bob],
             &[
                 auto_swap_ready("alice", 99, 100),
@@ -2149,11 +2177,11 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2208,7 +2236,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &settings,
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), bob],
             &[
                 auto_swap_ready_at("alice", 85, 100, Some(half)),
@@ -2217,11 +2244,11 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2265,7 +2292,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &settings,
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), bob],
             &[
                 auto_swap_ready("alice", 10, 100),
@@ -2274,11 +2300,11 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2336,7 +2362,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("bob".into())),
             &[alice, auto_swap_acc("bob", true)],
             &[
                 auto_swap_ready("alice", 10, 100),
@@ -2345,11 +2370,11 @@ mod tests {
             auto_swap_now(),
             kimi_switch_core::read_last_auto_swap_at(&state),
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2404,7 +2429,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("bob".into())),
             &[
                 alice,
                 auto_swap_acc("bob", true),
@@ -2418,11 +2442,11 @@ mod tests {
             auto_swap_now(),
             kimi_switch_core::read_last_auto_swap_at(&state),
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2458,7 +2482,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("alice".into())),
             &[
                 auto_swap_acc("alice", true),
                 auto_swap_opted_out("bob", false),
@@ -2472,11 +2495,11 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2503,7 +2526,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("alice".into())),
             &[
                 auto_swap_opted_out("alice", true),
                 auto_swap_acc("bob", false),
@@ -2515,11 +2537,11 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2551,13 +2573,12 @@ mod tests {
         let first = apply_snapshot_auto_swap(
             &settings,
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), bob.clone()],
             &[alice_snap.clone(), bob_snap.clone()],
             auto_swap_now(),
             None,
             None,
-            |_id| async { panic!("确认期未满不得 activate") },
+            |_to, _expected| async { panic!("确认期未满不得 activate") },
             &audit,
             &state,
         )
@@ -2577,17 +2598,16 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &settings,
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), bob],
             &[alice_snap, bob_snap],
             auto_swap_now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2630,13 +2650,12 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &settings,
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[alice_snap, bob_snap],
             auto_swap_now(),
             None,
             Some(auto_swap_now() + chrono::Duration::hours(1)),
-            |_id| async { panic!("保持期内不得回驻") },
+            |_to, _expected| async { panic!("保持期内不得回驻") },
             &audit,
             &state,
         )
@@ -2656,7 +2675,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[
                 auto_swap_ready("alice", 99, 100),
@@ -2665,7 +2683,7 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            |_id| async { Err(kimi_switch_core::Error::provider("disk full")) },
+            |_to, _expected| async { Err(kimi_switch_core::Error::provider("disk full")) },
             &audit,
             &state,
         )
@@ -2696,7 +2714,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[
                 auto_swap_ready("alice", 99, 100),
@@ -2705,7 +2722,7 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2754,7 +2771,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("alice".into())),
             &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
             &[
                 auto_swap_ready_at("alice", 99, 100, Some(late)),
@@ -2763,7 +2779,7 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2795,7 +2811,6 @@ mod tests {
         let effect = apply_snapshot_auto_swap(
             &auto_swap_on(),
             || false,
-            || Some(AccountId("alice".into())),
             &[
                 auto_swap_acc("alice", true),
                 auto_swap_opted_out("bob", false),
@@ -2807,7 +2822,7 @@ mod tests {
             auto_swap_now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2819,52 +2834,119 @@ mod tests {
         );
     }
 
-    /// 决定之后、activate 之前：pending / 当前账号已变则放弃，不 toast、不审计、不写冷却。
+    /// 决定之后、activate 之前设备码授权已开始：放弃，不 toast、不审计、不写冷却。
     #[tokio::test]
-    async fn snapshot_auto_swap_stale_pending_or_current_skips_activate() {
-        async fn run(
-            pending_auth: impl Fn() -> bool,
-            current_active: impl Fn() -> Option<AccountId>,
-        ) -> (tempfile::TempDir, AutoSwapSnapshotEffect) {
-            let tmp = tempfile::tempdir().unwrap();
-            let audit = AuditLog::new(tmp.path().join("audit.log"));
-            let state = tmp.path().join("auto_swap.json");
-            let effect = apply_snapshot_auto_swap(
-                &auto_swap_on(),
-                pending_auth,
-                current_active,
-                &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
-                &[
-                    auto_swap_ready("alice", 99, 100),
-                    auto_swap_ready("bob", 10, 100),
-                ],
-                auto_swap_now(),
-                None,
-                None,
-                |_id| async { panic!("过期决策不得 activate") },
-                &audit,
-                &state,
-            )
-            .await;
-            (tmp, effect)
-        }
-
+    async fn snapshot_auto_swap_stale_pending_skips_activate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
         let pending = AtomicBool::new(false);
-        let (tmp, effect) = run(
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
             || pending.swap(true, Ordering::SeqCst),
-            || Some(AccountId("alice".into())),
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            |_to, _expected| async { panic!("过期决策不得 activate") },
+            &audit,
+            &state,
         )
         .await;
         assert!(effect.message.is_none());
         assert!(!effect.swapped);
-        assert!(!tmp.path().join("auto_swap.json").exists());
-        assert!(!tmp.path().join("audit.log").exists());
+        assert!(!state.exists());
+        assert!(!audit.path().exists());
+    }
 
-        let (tmp, effect) = run(|| false, || Some(AccountId("carol".into()))).await;
-        assert!(effect.message.is_none());
+    /// 期望当前账号（ADR-0020）：切换带着决定时的当前账号 alice 作前置条件；交换锁内发现
+    /// 当前账号已不是 alice（用户手动抢先切换了），返回「已被取代」：不 toast、不审计、
+    /// 不写冷却。
+    #[tokio::test]
+    async fn snapshot_auto_swap_superseded_skips_toast_audit_and_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let requested = Arc::new(Mutex::new(None));
+        let requested_cb = requested.clone();
+        let effect = apply_snapshot_auto_swap(
+            &auto_swap_on(),
+            || false,
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[
+                auto_swap_ready("alice", 99, 100),
+                auto_swap_ready("bob", 10, 100),
+            ],
+            auto_swap_now(),
+            None,
+            None,
+            move |to: AccountId, expected: AccountId| {
+                *requested_cb.lock().unwrap() = Some((to.0, expected.0));
+                async { Ok(ActivateOutcome::Superseded) }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            requested.lock().unwrap().clone(),
+            Some(("bob".to_string(), "alice".to_string())),
+            "期望当前账号取决定时的当前账号"
+        );
+        assert!(effect.message.is_none(), "已被取代不弹 toast");
         assert!(!effect.swapped);
-        assert!(!tmp.path().join("auto_swap.json").exists());
-        assert!(!tmp.path().join("audit.log").exists());
+        assert!(!state.exists(), "已被取代不写冷却");
+        assert!(!audit.path().exists(), "已被取代不留切换审计");
+    }
+
+    /// 回驻同口径（ADR-0020）：已被取代时不 toast、不审计、不写冷却，成功收尾对回驻确认
+    /// 计数的清理也不发生。
+    #[tokio::test]
+    async fn snapshot_resident_return_superseded_skips_toast_audit_and_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.resident_lower_tier = true;
+        settings.resident_confirm_n = 1;
+        let mut alice_snap = auto_swap_ready("alice", 10, 100);
+        alice_snap.membership = Some("LEVEL_ADVANCED".into());
+        let mut bob_snap = auto_swap_ready("bob", 20, 100);
+        bob_snap.membership = Some("LEVEL_INTERMEDIATE".into());
+        let effect = apply_snapshot_auto_swap(
+            &settings,
+            || false,
+            &[auto_swap_acc("alice", true), auto_swap_acc("bob", false)],
+            &[alice_snap, bob_snap],
+            auto_swap_now(),
+            None,
+            None,
+            |to, expected| async move {
+                assert_eq!((to.0.as_str(), expected.0.as_str()), ("bob", "alice"));
+                Ok(ActivateOutcome::Superseded)
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.message.is_none(), "已被取代不弹 toast");
+        assert!(!effect.swapped);
+        assert!(!audit.path().exists(), "已被取代不留切换审计");
+        assert!(
+            kimi_switch_core::read_last_auto_swap_at(&state).is_none(),
+            "已被取代不写冷却"
+        );
+        assert_eq!(
+            kimi_switch_core::read_resident_confirm_counts(&state)
+                .get(&AccountId("bob".into()))
+                .copied(),
+            Some(1),
+            "已被取代不走成功收尾，确认计数保持判定时写下的值"
+        );
     }
 
     /// 成功 auto-swap toast 优先于同一次 snapshot 里的「刚刚更新过」。

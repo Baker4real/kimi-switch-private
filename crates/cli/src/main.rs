@@ -54,9 +54,9 @@ use kimi_switch_core::{
     locally_invalid_accounts, membership_expiry_from_extra, prettify_membership,
     read_last_auto_swap_at, read_manual_hold_until, record_auto_swap_success,
     set_manual_hold_until, settings, write_last_auto_swap_at, Account, AccountId, AccountRegistry,
-    AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn, AutoSwapSkipReason,
-    AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCache,
-    QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
+    ActivateOutcome, AuditEvent, AuditLog, AutoSwapDecision, AutoSwapKind, AutoSwapReturn,
+    AutoSwapSkipReason, AutoSwapTarget, CredentialStore, FileStore, KeyringStore, Provider, Quota,
+    QuotaCache, QuotaSnapshot, QuotaState, QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 use serde::Serialize;
@@ -608,7 +608,9 @@ async fn maybe_run_status_auto_swap(
         Utc::now(),
         last,
         manual_hold_until,
-        move |id| async move { kimi.activate(&id).await },
+        move |to, expected_current| async move {
+            kimi.activate_if_current(&to, &expected_current).await
+        },
         &ctx.audit,
         &state_path,
     )
@@ -618,6 +620,8 @@ async fn maybe_run_status_auto_swap(
 /// collect 完成后的自动切换编排。开关关闭立即返回；activate 失败不写冷却。
 /// 耗尽判定 Stay 时再评估回驻（issue #97 / ADR-0008）：无合格目标完全静默，
 /// 不套用「没有可切换的账号」提示；回驻 activate 失败同样不写冷却。
+/// `activate(目标, 期望当前账号)` 是带前置条件的切换（期望当前账号，ADR-0020），期望当前账号
+/// 取决定时的当前账号；返回「已被取代」时以 `superseded` 为不切原因，不审计、不写冷却。
 async fn apply_status_auto_swap<F, Fut>(
     auto_swap: &kimi_switch_core::settings::AutoSwap,
     accounts: &[Account],
@@ -630,8 +634,8 @@ async fn apply_status_auto_swap<F, Fut>(
     state_path: &Path,
 ) -> AutoSwapStatusEffect
 where
-    F: FnOnce(AccountId) -> Fut,
-    Fut: std::future::Future<Output = kimi_switch_core::Result<()>>,
+    F: FnOnce(AccountId, AccountId) -> Fut,
+    Fut: std::future::Future<Output = kimi_switch_core::Result<ActivateOutcome>>,
 {
     if !auto_swap.enabled {
         return AutoSwapStatusEffect::stay("disabled");
@@ -654,7 +658,7 @@ where
                 current.map(|account| account.id.0.as_str()),
                 "no eligible candidate",
             ));
-            AutoSwapStatusEffect::no_candidate(earliest_recovery_at(snapshots, now))
+            AutoSwapStatusEffect::no_candidate(earliest_recovery_at(state_path, snapshots, now))
         }
         // 未达耗尽阈值 / 冷却 / 宽限期等 Stay：耗尽路径不动作，转交回驻判定。
         AutoSwapDecision::Stay { reason } => {
@@ -672,8 +676,9 @@ where
                 // 只覆盖 activate 段，耗时写入审计 duration_ms。
                 Some(target) => {
                     let activate_started = std::time::Instant::now();
-                    match activate(target.to.clone()).await {
-                        Ok(()) => {
+                    match activate(target.to.clone(), target.from.clone()).await {
+                        Ok(ActivateOutcome::Superseded) => AutoSwapStatusEffect::stay("superseded"),
+                        Ok(ActivateOutcome::Activated) => {
                             write_last_auto_swap_at(state_path, Utc::now());
                             audit.append(
                                 AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
@@ -704,8 +709,9 @@ where
             // activate 段计时（issue #153 续跑）：耗尽 / pace / 抢用 / 回程共用，
             // 与手动切换同口径写入审计 duration_ms。
             let activate_started = std::time::Instant::now();
-            match activate(target.to.clone()).await {
-                Ok(()) => {
+            match activate(target.to.clone(), target.from.clone()).await {
+                Ok(ActivateOutcome::Superseded) => AutoSwapStatusEffect::stay("superseded"),
+                Ok(ActivateOutcome::Activated) => {
                     record_auto_swap_success(state_path, Utc::now(), &target, snapshots);
                     audit.append(
                         AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
@@ -1207,10 +1213,32 @@ async fn run_on_quota_failure_with(
     decision.map(drop)
 }
 
+// 测试 seam（ADR-0020）：被动路径决定之后、带前置条件切换之前运行一次性探针，供端到端用例
+// 在这一刻插入一次手动切换（决定与交换锁之间的竞态窗口）。探针登记在调用线程上，用例须用
+// 默认的 current-thread runtime。
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PASSIVE_ACTIVATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_next_passive_activate(probe: impl FnOnce() + 'static) {
+    BEFORE_PASSIVE_ACTIVATE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+}
+
+#[cfg(test)]
+fn run_passive_activate_probe() {
+    if let Some(probe) = BEFORE_PASSIVE_ACTIVATE.with(|slot| slot.borrow_mut().take()) {
+        probe();
+    }
+}
+
 /// 被动触发的最终决定（留痕用）。
 enum PassiveDecision {
     /// 不切换及原因：`not_exhausted` / `disabled` / `busy` / `no_active_account` /
-    /// `superseded`，或判定的跳过原因（[`skip_reason_json`]）。
+    /// `superseded`（决定之后已有别的切换抢先：交换锁内的期望当前账号比对不符，或被动锁内
+    /// 重读到冷却），或判定的跳过原因（[`skip_reason_json`]）。
     Stay(&'static str),
     /// 已切换。
     Swap { from: AccountId, to: AccountId },
@@ -1225,7 +1253,7 @@ async fn passive_swap(
     auto_swap: &kimi_switch_core::settings::AutoSwap,
 ) -> Result<PassiveDecision> {
     use kimi_switch_core::auto_swap::{
-        decide_auto_swap_passive_from_state, overlay_exhausted_snapshot,
+        decide_auto_swap_passive_from_state, overlay_exhausted_snapshot, record_exhaustion,
     };
 
     // 2. 总开关沿用既有语义：自动切换关闭时被动路径同闸，切换侧零副作用。
@@ -1235,8 +1263,8 @@ async fn passive_swap(
 
     let paths = AppPaths::resolve()?;
 
-    // 3. 被动串行化锁（独立于交换锁，无嵌套）：把「读状态 → 判定 → activate →
-    //    写冷却」整段排成队列。并发触发时后到者在锁内重读状态，看到冷却或新
+    // 3. 被动串行化锁（独立于交换锁，无嵌套）：把「记耗尽账本 → 读状态 → 判定 →
+    //    activate → 写冷却」整段排成队列。并发触发时后到者在锁内重读状态，看到冷却或新
     //    当前账号健康即自然落空（issue #162 锁 + 冷却收敛；冷却写在 activate
     //    返回之后，没有这把锁时 [提交, 写冷却] 间隙里迟到的触发会把耗尽证据
     //    错按在新当前账号上再切一跳）。等待超时视为另一触发处理中：观察型放弃。
@@ -1268,17 +1296,16 @@ async fn passive_swap(
     // 保住被动判定的档位排序与回驻资格。
     kimi_switch_core::apply_cached_membership(&mut snapshots, &accounts);
 
-    // 5. 耗尽原文 = 当前账号耗尽的权威证据：合成/覆盖当前账号快照后进既有判定。
+    // 5. 耗尽原文 = 当前账号耗尽的权威证据：先记进耗尽账本（判定之前，无论最终切没切；
+    //    恢复前该账号不作任何自动路径的候选），再合成/覆盖当前账号快照后进既有判定。
     //    耗尽语义（冷却、合格线、防抖边际、摘出、回驻确认期、往返记忆、候选本地
-    //    凭证快检）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。overlay 与
-    //    判定共用同一 `now`：过点重置按同一时刻划线，抵消不了覆写的耗尽窗口（ADR-0020）。
+    //    凭证快检、耗尽账本）全部由 core 判定单点继承；安顿宽限与手动保持期不阻挡。账本、
+    //    overlay 与判定共用同一 `now`：过点重置按同一时刻划线，抵消不了覆写的耗尽窗口
+    //    （ADR-0020）。
     let now = Utc::now();
-    let overlay = overlay_exhausted_snapshot(
-        &current.id,
-        snapshots.iter().find(|item| item.account_id == current.id),
-        window,
-        now,
-    );
+    let cached_current = snapshots.iter().find(|item| item.account_id == current.id);
+    record_exhaustion(&state_path, &current.id, cached_current, window, now);
+    let overlay = overlay_exhausted_snapshot(&current.id, cached_current, window, now);
     match snapshots
         .iter_mut()
         .find(|item| item.account_id == current.id)
@@ -1314,23 +1341,24 @@ async fn passive_swap(
         // 冷却等其余 Stay：会话侧静默落空（观察型，不打扰会话），只留痕。
         AutoSwapDecision::Stay { reason } => Ok(PassiveDecision::Stay(skip_reason_json(reason))),
         AutoSwapDecision::Swap(target) => {
-            // 决定之后、真正 activate 之前重读当前账号与冷却（GUI 编排同款防线）：
-            // 并发的 GUI/CLI 轮询切换已完成时放弃，不重复 activate、不审计。
-            let still_current = ctx
-                .list_ordered()?
-                .iter()
-                .any(|account| account.active && account.id == target.from);
+            // 决定之后、真正 activate 之前在被动锁内重读冷却：并发的轮询切换刚写下冷却时放弃，
+            // 不重复 activate、不审计。当前账号不在这里重读：切换带着决定时的当前账号作前置
+            // 条件，在交换锁内比对（期望当前账号，ADR-0020），决定之后已有别的切换抢先就返回
+            // 「已被取代」，同样不审计、不写冷却。
             let cooldown_held = read_last_auto_swap_at(&state_path).is_some_and(|at| {
                 Utc::now() < at + chrono::Duration::milliseconds(auto_swap.cooldown_ms)
             });
-            if !still_current || cooldown_held {
+            if cooldown_held {
                 return Ok(PassiveDecision::Stay("superseded"));
             }
+            #[cfg(test)]
+            run_passive_activate_probe();
             // activate 段计时（issue #153 续跑）：被动路径与轮询 / 手动切换同口径，
             // 耗时写入审计 duration_ms。
             let activate_started = std::time::Instant::now();
-            match ctx.kimi.activate(&target.to).await {
-                Ok(()) => {
+            match ctx.kimi.activate_if_current(&target.to, &target.from).await {
+                Ok(ActivateOutcome::Superseded) => Ok(PassiveDecision::Stay("superseded")),
+                Ok(ActivateOutcome::Activated) => {
                     record_auto_swap_success(&state_path, Utc::now(), &target, &snapshots);
                     ctx.audit.append(
                         AuditEvent::ok("auto_swap", "kimi", Some(target.to.0.as_str()))
@@ -1836,7 +1864,8 @@ mod tests {
     }
 
     use super::{
-        Account, AccountId, AuditEvent, AuditLog, Quota, QuotaSnapshot, QuotaState, QuotaWindow,
+        Account, AccountId, ActivateOutcome, AuditEvent, AuditLog, Quota, QuotaSnapshot,
+        QuotaState, QuotaWindow,
     };
     use chrono::{DateTime, Utc};
 
@@ -1912,7 +1941,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("disabled 不得 activate") },
+            |_to, _expected| async { panic!("disabled 不得 activate") },
             &audit,
             &state,
         )
@@ -1940,11 +1969,11 @@ mod tests {
             now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2004,11 +2033,11 @@ mod tests {
             now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2068,11 +2097,11 @@ mod tests {
             now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2146,11 +2175,11 @@ mod tests {
             now(),
             kimi_switch_core::read_last_auto_swap_at(&state),
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2219,11 +2248,11 @@ mod tests {
             now(),
             kimi_switch_core::read_last_auto_swap_at(&state),
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2268,11 +2297,11 @@ mod tests {
             now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2319,7 +2348,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("确认期未满不得 activate") },
+            |_to, _expected| async { panic!("确认期未满不得 activate") },
             &audit,
             &state,
         )
@@ -2343,11 +2372,11 @@ mod tests {
             now(),
             None,
             None,
-            move |id| {
+            move |id, _expected| {
                 let activated = activated_cb.clone();
                 async move {
                     *activated.lock().unwrap() = Some(id);
-                    Ok(())
+                    Ok(ActivateOutcome::Activated)
                 }
             },
             &audit,
@@ -2394,7 +2423,7 @@ mod tests {
             now(),
             None,
             Some(now() + chrono::Duration::hours(1)),
-            |_id| async { panic!("保持期内不得 activate") },
+            |_to, _expected| async { panic!("保持期内不得 activate") },
             &audit,
             &state,
         )
@@ -2422,7 +2451,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("回驻关闭不得 activate") },
+            |_to, _expected| async { panic!("回驻关闭不得 activate") },
             &audit,
             &state,
         )
@@ -2446,7 +2475,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { Err(kimi_switch_core::Error::provider("disk full")) },
+            |_to, _expected| async { Err(kimi_switch_core::Error::provider("disk full")) },
             &audit,
             &state,
         )
@@ -2481,7 +2510,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2540,7 +2569,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2574,7 +2603,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { Ok(()) },
+            |_to, _expected| async { Ok(ActivateOutcome::Activated) },
             &audit,
             &state,
         )
@@ -2610,7 +2639,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { Ok(()) },
+            |_to, _expected| async { Ok(ActivateOutcome::Activated) },
             &audit,
             &state,
         )
@@ -2642,7 +2671,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("disabled 不得 activate") },
+            |_to, _expected| async { panic!("disabled 不得 activate") },
             &audit,
             &state,
         )
@@ -2667,7 +2696,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("低于阈值不得 activate") },
+            |_to, _expected| async { panic!("低于阈值不得 activate") },
             &audit,
             &state,
         )
@@ -2677,6 +2706,87 @@ mod tests {
         assert_eq!(event["schemaVersion"], 1);
         assert_eq!(event["type"], "stay");
         assert_eq!(event["reason"], "below_threshold");
+    }
+
+    /// 期望当前账号（ADR-0020）：切换带着决定时的当前账号 alice 作前置条件；交换锁内发现
+    /// 当前账号已不是 alice（用户手动抢先切换了），返回「已被取代」：无输出行、不留切换审计、
+    /// 不写冷却；退出码 2，JSON `stay` / reason=superseded。
+    #[tokio::test]
+    async fn status_auto_swap_superseded_is_stay_without_audit_or_cooldown() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let requested = Arc::new(Mutex::new(None));
+        let requested_cb = requested.clone();
+        let effect = super::apply_status_auto_swap(
+            &auto_swap_on(),
+            &[acc("alice", true), acc("bob", false)],
+            &[ready("alice", 99, 100), ready("bob", 10, 100)],
+            now(),
+            None,
+            None,
+            move |to: AccountId, expected: AccountId| {
+                *requested_cb.lock().unwrap() = Some((to.0, expected.0));
+                async { Ok(ActivateOutcome::Superseded) }
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert_eq!(
+            requested.lock().unwrap().clone(),
+            Some(("bob".to_string(), "alice".to_string())),
+            "期望当前账号取决定时的当前账号"
+        );
+        assert!(effect.line.is_none());
+        assert!(!effect.swapped);
+        assert_eq!(effect.exit_code(), 2);
+        let event = parse_status_event(&effect);
+        assert_eq!(event["type"], "stay");
+        assert_eq!(event["reason"], "superseded");
+        assert!(!state.exists(), "已被取代不写冷却");
+        assert!(!audit.path().exists(), "已被取代不留切换审计");
+    }
+
+    /// 回驻同口径（ADR-0020）：已被取代 → 退出码 2、reason=superseded，不审计、不写冷却。
+    #[tokio::test]
+    async fn status_resident_return_superseded_is_stay_without_audit_or_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit = AuditLog::new(tmp.path().join("audit.log"));
+        let state = tmp.path().join("auto_swap.json");
+        let mut settings = auto_swap_on();
+        settings.resident_lower_tier = true;
+        settings.resident_confirm_n = 1;
+        let mut alice = ready("alice", 10, 100);
+        alice.membership = Some("LEVEL_ADVANCED".into());
+        let mut bob = ready("bob", 20, 100);
+        bob.membership = Some("LEVEL_INTERMEDIATE".into());
+        let effect = super::apply_status_auto_swap(
+            &settings,
+            &[acc("alice", true), acc("bob", false)],
+            &[alice, bob],
+            now(),
+            None,
+            None,
+            |to, expected| async move {
+                assert_eq!((to.0.as_str(), expected.0.as_str()), ("bob", "alice"));
+                Ok(ActivateOutcome::Superseded)
+            },
+            &audit,
+            &state,
+        )
+        .await;
+        assert!(effect.line.is_none());
+        assert!(!effect.swapped);
+        assert_eq!(effect.exit_code(), 2);
+        assert_eq!(parse_status_event(&effect)["reason"], "superseded");
+        assert!(!audit.path().exists(), "已被取代不留切换审计");
+        assert!(
+            kimi_switch_core::read_last_auto_swap_at(&state).is_none(),
+            "已被取代不写冷却"
+        );
     }
 
     /// issue #113：已达阈值无合格候选 → 退出码 3，JSON `no_candidate`。
@@ -2692,7 +2802,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2726,7 +2836,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2760,7 +2870,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { panic!("无候选不得 activate") },
+            |_to, _expected| async { panic!("无候选不得 activate") },
             &audit,
             &state,
         )
@@ -2787,7 +2897,7 @@ mod tests {
             now(),
             None,
             None,
-            |_id| async { Err(kimi_switch_core::Error::provider("disk full")) },
+            |_to, _expected| async { Err(kimi_switch_core::Error::provider("disk full")) },
             &audit,
             &state,
         )
@@ -3450,6 +3560,110 @@ mod tests {
         );
     }
 
+    /// 耗尽账本（issue #192 / ADR-0020）：GUI 没开，额度缓存停在第一次触发之前。alice 撞上
+    /// 额度耗尽、被动切到 bob；冷却过后 bob 也撞上耗尽。alice 的缓存仍显示有余量，但它刚因
+    /// 耗尽被切走、之后没有更新的额度快照，不得被切回：不切换，留痕 no_eligible_candidate。
+    /// 额度缓存字节不变，内核不向上报错（入口恒退出码 0）；手动切换到有耗尽记录的 alice
+    /// 照常成功。
+    #[tokio::test]
+    async fn passive_does_not_swap_back_to_just_exhausted_account() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+        let paths = AppPaths::resolve().unwrap();
+        let cache_before = std::fs::read(paths.quota_cache_file()).unwrap();
+        let settings = passive_settings();
+        let raw = event_429_5h();
+
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#,
+            "alice 耗尽先切到 bob"
+        );
+
+        // 冷却过后：把上次自动切换时刻拨到冷却之前，bob 接着撞上额度耗尽。
+        kimi_switch_core::write_last_auto_swap_at(
+            &paths.auto_swap_state_file(),
+            Utc::now()
+                - chrono::Duration::milliseconds(settings.cooldown_ms)
+                - chrono::Duration::minutes(1),
+        );
+        super::run_on_quota_failure_with(&ctx, &raw, &settings)
+            .await
+            .expect("观察型内核不得向上报错");
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"bob","access_token":"tok-bob"}"#,
+            "不得切回刚耗尽的 alice"
+        );
+        let traces = audits("on_quota_failure");
+        assert_eq!(traces.len(), 2, "{traces:?}");
+        assert_eq!(
+            traces[1].detail.as_deref(),
+            Some("hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=stay reason=no_eligible_candidate")
+        );
+        assert_eq!(
+            std::fs::read(paths.quota_cache_file()).unwrap(),
+            cache_before,
+            "被动路径不得回写额度缓存"
+        );
+
+        // 手动切换不看耗尽账本。
+        super::swap(&ctx, Some("alice"))
+            .await
+            .expect("手动切换到有耗尽记录的账号照常成功");
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#
+        );
+    }
+
+    /// 总开关关闭（issue #192）：撞上额度耗尽也不写耗尽账本——已有的状态文件与额度缓存
+    /// 字节都不变，内核不向上报错（入口恒退出码 0）。
+    #[tokio::test]
+    async fn passive_disabled_writes_no_exhaustion_ledger() {
+        use kimi_switch_core::paths::AppPaths;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+        let paths = AppPaths::resolve().unwrap();
+        kimi_switch_core::set_manual_hold_until(
+            &paths.auto_swap_state_file(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+        let state_before = std::fs::read(paths.auto_swap_state_file()).unwrap();
+        let cache_before = std::fs::read(paths.quota_cache_file()).unwrap();
+        let mut off = passive_settings();
+        off.enabled = false;
+
+        for raw in [event_429_5h(), event_403_5h()] {
+            super::run_on_quota_failure_with(&ctx, &raw, &off)
+                .await
+                .expect("观察型内核不得向上报错");
+        }
+
+        assert_eq!(
+            std::fs::read(paths.auto_swap_state_file()).unwrap(),
+            state_before,
+            "总开关关闭不写耗尽账本"
+        );
+        assert_eq!(
+            std::fs::read(paths.quota_cache_file()).unwrap(),
+            cache_before
+        );
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"alice","access_token":"tok-alice"}"#
+        );
+    }
+
     /// 冷却收敛：第一次切换完成后，后续触发（新当前账号健康 + 冷却未过）自然落空，
     /// 不再产生切换或切换审计（只留痕）。
     #[tokio::test]
@@ -3472,6 +3686,61 @@ mod tests {
             r#"{"label":"bob","access_token":"tok-bob"}"#
         );
         assert_eq!(auto_swap_audits().len(), 1, "冷却期内不得再次切换");
+    }
+
+    /// 期望当前账号（ADR-0020）：被动判定决定从 alice 切到 bob 之后、交换锁之前，用户手动切到
+    /// 了 carol。带前置条件的切换返回「已被取代」：手动选择保住（当前登录文件与 registry 都是
+    /// carol），不留 auto_swap 审计、不写冷却，留痕 reason=superseded，观察型内核不报错。
+    #[tokio::test]
+    async fn passive_superseded_by_manual_switch_keeps_manual_choice() {
+        use kimi_switch_core::paths::AppPaths;
+        use kimi_switch_core::Provider;
+
+        let env = passive_env::isolate();
+        let ctx = seed_passive_fixture(&env, &[("alice", true), ("bob", false), ("carol", false)]);
+        seed_quota_cache(&[("alice", 80, 100), ("bob", 10, 100)]);
+        let kimi = ctx.kimi.clone();
+        super::before_next_passive_activate(move || {
+            // 手动切换走无前置条件的 activate；跑在另一线程自己的 runtime 上，探针本身是同步的。
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(kimi.activate(&AccountId("carol".into())))
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+        });
+
+        let raw = event_429_5h();
+        super::run_on_quota_failure_with(&ctx, &raw, &passive_settings())
+            .await
+            .expect("观察型内核不得向上报错");
+
+        assert_eq!(
+            live_blob(&env),
+            r#"{"label":"carol","access_token":"tok-carol"}"#,
+            "手动选择不得被自动切换覆盖"
+        );
+        assert!(
+            ctx.registry
+                .list_by_provider("kimi")
+                .unwrap()
+                .iter()
+                .any(|a| a.id.0 == "carol" && a.active),
+            "registry 当前标记保持手动切换的 carol"
+        );
+        assert!(auto_swap_audits().is_empty(), "已被取代不留切换审计");
+        let state = AppPaths::resolve().unwrap().auto_swap_state_file();
+        assert!(
+            kimi_switch_core::read_last_auto_swap_at(&state).is_none(),
+            "已被取代不写冷却"
+        );
+        assert_one_trace(
+            &raw,
+            "hook_event=StopFailure error_type=APIProviderQuotaExhaustedError signal=quota_429 window=5h decision=stay reason=superseded",
+        );
     }
 
     /// 畸形 stdin / 总开关关闭：切换侧零副作用（无切换审计、无状态文件、live 不动，
