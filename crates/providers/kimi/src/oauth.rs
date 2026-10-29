@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use kimi_switch_core::error::{Error, Result};
 use kimi_switch_core::Account;
-use kimi_switch_engine::{extract_access_token, extract_refresh_token, RefreshOutcome};
+use kimi_switch_engine::{
+    extract_access_token, extract_refresh_token, forced_rotation_fits, FileBlobRuntime,
+    RefreshOutcome,
+};
 use sha2::{Digest, Sha256};
 
 use crate::kimi_files::decode_jwt_payload;
@@ -24,7 +27,7 @@ const MIN_COORDINATED_REFRESH_VERSION: (u64, u64, u64) = (1, 31, 0);
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// 轮换请求的总超时：连接到响应体读完，代理回退直连也只用剩余时间（net.rs）。停泊账号的
-/// 强制轮换据此核对剩余预算（ADR-0019）。
+/// 强制轮换与当前账号的 401 协调恢复都据此核对剩余预算（ADR-0019）。
 pub(crate) const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const TYPESCRIPT_STALE_AFTER: Duration = Duration::from_secs(10);
 const STALE_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -394,6 +397,20 @@ pub(crate) async fn recover_active_401_at(
         .as_ref()
         .is_some_and(|fp| locked.dead_refresh_fingerprints.contains(fp))
     {
+        release_lock(locked.guard).await;
+        return Ok(None);
+    }
+
+    // 预算门（ADR-0019 决策 7），与停泊账号的强制轮换同一条规则：等官方刷新锁可能已用掉本次
+    // attempt 的大半预算，剩余时间盖不住轮换请求的超时上限加余量就不发，放锁按未恢复返回、留给
+    // 下次查询；照发的话外层超时可能在响应返回前取消查询，丢掉服务端已消耗的 refresh token。
+    let time_left = kimi_switch_core::quota_query::attempt_time_left();
+    if !forced_rotation_fits(time_left, runtime.refresh_timeout()) {
+        tracing::warn!(
+            account = %account.id,
+            time_left_ms = time_left.map(|left| left.as_millis()),
+            "active 401 recovery got the refresh lock too late in its attempt; leaving rotation to the next query"
+        );
         release_lock(locked.guard).await;
         return Ok(None);
     }
@@ -1371,6 +1388,61 @@ mod tests {
         let stored = runtime.store.get("kimi", "u-123", "blob").unwrap().unwrap();
         assert_eq!(extract_refresh_token(&stored).as_deref(), Some("R2"));
         assert_eq!(server.finish(), vec!["POST /api/oauth/token HTTP/1.1"]);
+    }
+
+    /// 等官方刷新锁可能用掉本次额度查询 attempt 的大半预算（锁等待上限 15 秒，单次预算默认
+    /// 20 秒）。拿到锁后剩余时间盖不住轮换请求的超时上限加 2 秒余量时不发刷新：放锁，按未恢复的
+    /// 401 返回，留给下次查询（ADR-0019 决策 7）。照发的话外层超时可能在响应返回前取消查询，
+    /// 丢掉服务端已消耗的 refresh token。
+    #[tokio::test]
+    async fn recovery_too_late_in_attempt_leaves_refresh_to_next_query() {
+        use crate::test_support::MockServer;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let credential_path = paths::active_cred_path(home);
+        std::fs::create_dir_all(credential_path.parent().unwrap()).unwrap();
+        let runtime = recovery_runtime(home);
+        let old_access = jwt("OLD");
+        let original = blob(&old_access, "R1");
+        std::fs::write(&credential_path, &original).unwrap();
+        runtime
+            .store
+            .set("kimi", "u-123", "blob", &original)
+            .unwrap();
+        runtime.registry.upsert(active_account()).unwrap();
+        let server = MockServer::start(vec![(
+            "200 OK",
+            r#"{"access_token":"NEW","refresh_token":"R2","expires_in":3600}"#,
+        )]);
+        // 本次 attempt 只剩轮换超时上限 + 1 秒，不够 2 秒余量。
+        let deadline = tokio::time::Instant::now() + REFRESH_HTTP_TIMEOUT + Duration::from_secs(1);
+
+        let fresh = kimi_switch_core::quota_query::with_attempt_deadline(
+            deadline,
+            recover_active_401_at(
+                &old_access,
+                &active_account(),
+                home,
+                server.base_url(),
+                RefreshLockProtocol::PythonFile,
+                &runtime,
+            ),
+        )
+        .await
+        .expect("不发刷新，attempt 远在超时前结束")
+        .unwrap();
+
+        assert_eq!(fresh, None, "剩余时间不够：不发刷新，按未恢复的 401 呈现");
+        assert_eq!(server.received(), 0, "刷新请求不得发出");
+        assert_eq!(std::fs::read_to_string(&credential_path).unwrap(), original);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths::credentials_lock_path(home))
+            .unwrap();
+        lock.try_lock_exclusive()
+            .expect("放弃刷新时必须放开官方刷新锁");
     }
 
     /// 本地 OAuth 替身：收下刷新请求后先停住（此刻服务端已消耗旧 refresh token），测试放行后

@@ -1013,16 +1013,13 @@ fn exhaustion_recovers_at(
         .unwrap_or_else(|| observed_at + exhaustion_window_length(window))
 }
 
-/// 恢复时刻估计用的窗口时长：5 小时窗 5 小时、7 天窗 7 天、月度窗 31 天。分类器只辨认
-/// 这三种窗口（见 [`window_from_usage_limit_texts`]），其余窗口与辨认不出一样按 5 小时窗。
+/// 恢复时刻估计用的窗口时长：已知时长的窗口（[`known_window_duration`]：5 小时窗、7 天窗）
+/// 取其时长；月度窗长短不一，取上限 31 天。分类器只辨认这三种窗口（见
+/// [`window_from_usage_limit_texts`]），其余窗口与辨认不出一样按 5 小时窗。
 fn exhaustion_window_length(window: QuotaWindow) -> chrono::Duration {
     match window {
-        QuotaWindow::SevenDay => chrono::Duration::days(7),
         QuotaWindow::Month => chrono::Duration::days(31),
-        QuotaWindow::FiveHour
-        | QuotaWindow::FirstPartyModels
-        | QuotaWindow::Api
-        | QuotaWindow::Custom => chrono::Duration::hours(5),
+        other => known_window_duration(other).unwrap_or_else(|| chrono::Duration::hours(5)),
     }
 }
 
@@ -1064,26 +1061,18 @@ pub fn read_resident_confirm_counts(path: &Path) -> HashMap<AccountId, u32> {
 /// 文件本不存在且计数全 0 时不建文件（保持「从未写过」）。
 pub fn write_resident_confirm_counts(path: &Path, counts: &HashMap<AccountId, u32>) {
     let mapped: HashMap<String, u32> = counts.iter().map(|(id, n)| (id.0.clone(), *n)).collect();
-    match read_state(path) {
-        None if mapped.is_empty() => {}
-        None => {
-            write_state_or_warn(
-                path,
-                AutoSwapStateFile {
-                    resident_confirm: mapped,
-                    ..AutoSwapStateFile::default()
-                },
-                Utc::now(),
-            );
-        }
+    update_state(path, Utc::now(), move |state| match state {
+        None if mapped.is_empty() => None,
+        None => Some(AutoSwapStateFile {
+            resident_confirm: mapped,
+            ..AutoSwapStateFile::default()
+        }),
+        Some(state) if state.resident_confirm == mapped => None,
         Some(mut state) => {
-            if state.resident_confirm == mapped {
-                return;
-            }
             state.resident_confirm = mapped;
-            write_state_or_warn(path, state, Utc::now());
+            Some(state)
         }
-    }
+    });
 }
 
 /// 读状态文件中的回驻确认计数、判定、写回。调用方不必自己搬 HashMap。
@@ -1559,17 +1548,20 @@ pub fn record_exhaustion(
     window: Option<QuotaWindow>,
     now: DateTime<Utc>,
 ) {
-    let mut state = read_state(path).unwrap_or_default();
-    state
-        .exhaustion_ledger
-        .retain(|record| !(record.account_id == *account_id && record.window == window));
-    state.exhaustion_ledger.push(ExhaustionRecord {
+    let record = ExhaustionRecord {
         account_id: account_id.clone(),
         window,
         observed_at: now,
         recovers_at: exhaustion_recovers_at(cached, window, now),
+    };
+    update_state(path, now, move |state| {
+        let mut state = state.unwrap_or_default();
+        state.exhaustion_ledger.retain(|existing| {
+            !(existing.account_id == record.account_id && existing.window == window)
+        });
+        state.exhaustion_ledger.push(record);
+        Some(state)
     });
-    write_state_or_warn(path, state, now);
 }
 
 /// 配额失败被动切换判定门面（issue #162）：调用方先用 [`overlay_exhausted_snapshot`]
@@ -1622,11 +1614,13 @@ pub fn burn_trip_from_target(
 
 /// 抢用成功：写冷却时刻与往返记忆，清掉回驻确认计数。读改写保留手动保持期。
 pub fn write_burn_trip_and_last_auto_swap_at(path: &Path, at: DateTime<Utc>, trip: &BurnTrip) {
-    let mut state = read_state(path).unwrap_or_default();
-    state.last_auto_swap_at = Some(at);
-    state.resident_confirm.clear();
-    state.burn_trip = Some(trip.clone());
-    write_state_or_warn(path, state, at);
+    update_state(path, at, |state| {
+        let mut state = state.unwrap_or_default();
+        state.last_auto_swap_at = Some(at);
+        state.resident_confirm.clear();
+        state.burn_trip = Some(trip.clone());
+        Some(state)
+    });
 }
 
 /// 自动切换 activate 成功后写冷却时刻。抢用同时写入往返记忆；回程与其它路径清掉既有记忆。
@@ -1646,49 +1640,108 @@ pub fn record_auto_swap_success(
 }
 
 fn persist_burn_trip(path: &Path, trip: Option<BurnTrip>, now: DateTime<Utc>) {
-    match read_state(path) {
-        None if trip.is_none() => {}
-        None => {
-            write_state_or_warn(
-                path,
-                AutoSwapStateFile {
-                    burn_trip: trip,
-                    ..AutoSwapStateFile::default()
-                },
-                now,
-            );
-        }
+    update_state(path, now, move |state| match state {
+        None if trip.is_none() => None,
+        None => Some(AutoSwapStateFile {
+            burn_trip: trip,
+            ..AutoSwapStateFile::default()
+        }),
+        Some(state) if state.burn_trip == trip => None,
         Some(mut state) => {
-            if state.burn_trip == trip {
-                return;
-            }
             state.burn_trip = trip;
-            write_state_or_warn(path, state, now);
+            Some(state)
         }
-    }
+    });
 }
 
 /// 写入上次自动切换成功时刻，读改写保留手动保持期，清掉回驻确认计数
 /// （账号角色已变，确认期从头计）与往返记忆（非抢用写入路径）。失败只 warn，不回传错误。
 pub fn write_last_auto_swap_at(path: &Path, at: DateTime<Utc>) {
-    let mut state = read_state(path).unwrap_or_default();
-    state.last_auto_swap_at = Some(at);
-    state.resident_confirm.clear();
-    state.burn_trip = None;
-    write_state_or_warn(path, state, at);
+    update_state(path, at, |state| {
+        let mut state = state.unwrap_or_default();
+        state.last_auto_swap_at = Some(at);
+        state.resident_confirm.clear();
+        state.burn_trip = None;
+        Some(state)
+    });
 }
 
 /// 写入手动保持期截止，读改写不动上次自动切换时刻（没有切换史保持 None），
 /// 并清掉回驻确认计数与往返记忆（手动决定作废未完成的确认 / 用户接管）。
-/// 失败只 warn，不回传错误。
+/// 失败只 warn，不回传错误。手动切换不拿自动切换串行化锁，与自动触发的写入靠状态文件锁
+/// 排队（见 [`update_state`]）。
 pub fn set_manual_hold_until(path: &Path, until: DateTime<Utc>) {
     // 文件缺失或损坏时重建：没有切换史就不伪造任何时刻（issue #96）。保持期只约束
     // 回驻与新开抢用，不得借 last_auto_swap_at 把耗尽切换也锁进冷却（ADR-0008 第 4 条）。
-    let mut state = read_state(path).unwrap_or_default();
-    state.manual_hold_until = Some(until);
-    state.resident_confirm.clear();
-    state.burn_trip = None;
-    write_state_or_warn(path, state, Utc::now());
+    update_state(path, Utc::now(), |state| {
+        let mut state = state.unwrap_or_default();
+        state.manual_hold_until = Some(until);
+        state.resident_confirm.clear();
+        state.burn_trip = None;
+        Some(state)
+    });
+}
+
+/// 状态文件的一次读改写（spec #185 对抗评审 5）：在状态文件专用的叶子锁下读出当前状态
+/// （缺失或损坏为 `None`）交给 `update`，返回 `Some` 才写回。全部写入都经它：手动切换写
+/// 保持期不拿自动切换串行化锁，同一 GUI 进程里也可能两处同时写，不加锁的读改写会互相吞掉
+/// 冷却、耗尽记录或保持期。
+///
+/// 叶子锁只包住这一次本地读写：持锁期间不拿别的锁、不跨 activate，手动切换至多等它几毫秒。
+/// 等不到（3 秒）或锁不上时记 warn，照常不加锁读改写：状态文件可丢弃，少写一笔冷却比
+/// 丢掉这次写入代价小。
+fn update_state(
+    path: &Path,
+    now: DateTime<Utc>,
+    update: impl FnOnce(Option<AutoSwapStateFile>) -> Option<AutoSwapStateFile>,
+) {
+    let _lock = StateFileLock::acquire(path);
+    if let Some(state) = update(read_state(path)) {
+        write_state_or_warn(path, state, now);
+    }
+}
+
+/// 自动切换状态文件专用的叶子锁 `<状态文件>.lock`，见 [`update_state`]。drop 即释放。
+struct StateFileLock(std::fs::File);
+
+impl StateFileLock {
+    fn acquire(state_path: &Path) -> Option<Self> {
+        use crate::switch_lock::{lock_within_wait_limit, open_lock_file, LockWaitError};
+
+        let lock_path = {
+            let mut name = state_path.as_os_str().to_os_string();
+            name.push(".lock");
+            std::path::PathBuf::from(name)
+        };
+        let file = match open_lock_file(&lock_path) {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(err = %err, lock = %lock_path.display(), "auto_swap state lock unavailable; writing without it");
+                return None;
+            }
+        };
+        match lock_within_wait_limit(&file) {
+            Ok(()) => Some(Self(file)),
+            Err(LockWaitError::Busy { waited }) => {
+                tracing::warn!(
+                    lock = %lock_path.display(),
+                    waited_ms = waited.as_millis() as u64,
+                    "auto_swap state lock busy; writing without it"
+                );
+                None
+            }
+            Err(LockWaitError::Failed(err)) => {
+                tracing::warn!(err = %err, lock = %lock_path.display(), "auto_swap state lock failed; writing without it");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for StateFileLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 /// 写状态文件，顺带清掉恢复时刻已到（不晚于 `now`）的耗尽记录（issue #192），状态文件
@@ -1707,16 +1760,23 @@ fn write_state_or_warn(path: &Path, mut state: AutoSwapStateFile, now: DateTime<
     }
 }
 
+/// 同进程内状态文件临时名的序号：与 pid 一起让每次写入的临时文件各不相同，并发写不会把
+/// 别人写到一半的临时文件 rename 上去。
+static STATE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn try_write_state(path: &Path, state: &AutoSwapStateFile) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_vec(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let seq = STATE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -5809,5 +5869,51 @@ mod tests {
             ledger_keys(&path),
             vec![key("carol", Some("five_hour")), key("carol", None)]
         );
+    }
+
+    /// 状态文件的读改写互不吞写（spec #185 对抗评审 5）：手动切换写保持期不拿自动切换串行化锁，
+    /// 同一 GUI 进程里也可能两处同时写。多个线程并发记耗尽账本、写手动保持期与冷却，每一笔都
+    /// 留得下来，文件也不会被写坏。
+    #[test]
+    fn concurrent_state_writes_keep_every_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auto_swap.json");
+        let wall = Utc::now();
+        let hold_until = wall + chrono::Duration::hours(8);
+        std::thread::scope(|scope| {
+            for writer in 0..4 {
+                let path = &path;
+                scope.spawn(move || {
+                    for i in 0..10 {
+                        record_exhaustion(
+                            path,
+                            &AccountId(format!("w{writer}-{i}")),
+                            None,
+                            Some(QuotaWindow::FiveHour),
+                            wall,
+                        );
+                    }
+                });
+            }
+            let path = &path;
+            scope.spawn(move || {
+                for _ in 0..10 {
+                    set_manual_hold_until(path, hold_until);
+                }
+            });
+            scope.spawn(move || {
+                for _ in 0..10 {
+                    write_last_auto_swap_at(path, wall);
+                }
+            });
+        });
+
+        assert_eq!(
+            read_exhaustion_ledger(&path).len(),
+            40,
+            "并发写入不得吞掉耗尽记录"
+        );
+        assert_eq!(read_manual_hold_until(&path), Some(hold_until));
+        assert_eq!(read_last_auto_swap_at(&path), Some(wall));
     }
 }

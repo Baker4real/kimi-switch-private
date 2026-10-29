@@ -18,5 +18,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 探测交换锁是否被占（另开句柄 try-lock）：legacy 钥匙串迁移不得发生在交换锁内。
+fs2 = { workspace = true }
 # 暂停时钟（`start_paused`）：慢 401 用例在虚拟时间里走完 20 秒单次超时预算。
 tokio = { workspace = true, features = ["test-util"] }

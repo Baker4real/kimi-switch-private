@@ -1180,10 +1180,11 @@ impl AutoSwapSnapshotEffect {
 }
 
 /// collect 完成后的自动切换编排，整段在自动切换串行化锁内（ADR-0020）：拿锁 → 重读状态 →
-/// 判定 → 带期望当前账号的切换 → 写冷却。`pending_auth` 或开关关闭立即返回，不拿锁。`serialize`
-/// 拿锁，3 秒等不到（另一自动触发正在切换）时本轮静默跳过：不判定、不 toast、不审计、不写状态，
-/// 下一轮快照照常重试。冷却与手动保持期在拿到锁之后才读，往返记忆、回驻确认计数与耗尽账本由
-/// 判定自己从状态文件读，前一个持锁者刚写下的状态因此都看得见。activate 失败不写冷却。
+/// 判定 → 带期望当前账号的切换 → 写冷却。`pending_auth` 或开关关闭立即返回，不拿锁。
+/// `acquire_lock` 拿锁，3 秒等不到（另一自动触发正在切换）时本轮静默跳过：不判定、不 toast、
+/// 不审计、不写状态，下一轮快照照常重试。冷却与手动保持期在拿到锁之后才读，往返记忆、回驻
+/// 确认计数与耗尽账本由判定自己从状态文件读，前一个持锁者刚写下的状态因此都看得见。activate
+/// 失败不写冷却。
 /// 决定之后、真正 activate 之前再读 pending：设备码授权已开始则放弃（不 toast、不审计、不写冷却）。
 /// `activate(目标, 期望当前账号)` 是带前置条件的切换（期望当前账号，ADR-0020），期望当前账号取
 /// 决定时的当前账号；返回「已被取代」（用户已手动抢先切换）同样放弃，不 toast、不审计、不写冷却。
@@ -1194,7 +1195,7 @@ pub(crate) async fn apply_snapshot_auto_swap<L, LFut, G, F, Fut, P>(
     accounts: &[Account],
     snapshots: &[QuotaSnapshot],
     now: DateTime<Utc>,
-    serialize: L,
+    acquire_lock: L,
     activate: F,
     audit: &AuditLog,
     state_path: &Path,
@@ -1209,7 +1210,7 @@ where
     if pending_auth() || !auto_swap.enabled {
         return AutoSwapSnapshotEffect::none();
     }
-    let Some(_serialized) = serialize().await else {
+    let Some(_serialized) = acquire_lock().await else {
         return AutoSwapSnapshotEffect::none();
     };
     let last_auto_swap_at = read_last_auto_swap_at(state_path);

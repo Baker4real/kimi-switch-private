@@ -15,20 +15,15 @@
 //!   返回 `None` 并记 warn：自动切换宁可这一轮不做，也不在锁外判定。
 //! - 文件锁随 guard drop 或进程退出释放；guard 不绑定线程，可以跨 `.await` 持有。
 
-use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
+use crate::switch_lock::{lock_within_wait_limit, open_lock_file, LockWaitError};
+
 /// 锁文件名，沿用 #162 被动串行化锁的旧名（免迁移）。
 pub const LOCK_FILE_NAME: &str = "passive-swap.lock";
-
-/// 等待上限，对齐交换锁。
-const WAIT_LIMIT: Duration = Duration::from_secs(3);
-/// 等待期间的轮询间隔；总等待最多超出一个间隔。
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// 持有期间独占自动切换串行化锁，drop 即释放。
 ///
@@ -37,7 +32,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub struct AutoSwapLock(File);
 
 impl AutoSwapLock {
-    /// 阻塞获取：锁被他人持有时轮询等待，最多 3 秒。拿不到返回 `None`。
+    /// 阻塞获取：锁被他人持有时轮询等待，最多 3 秒（与交换锁同一个等待循环）。拿不到返回 `None`。
     ///
     /// 阻塞 IO；异步上下文用 [`Self::acquire_async`]。
     pub fn acquire(path: &Path) -> Option<Self> {
@@ -48,25 +43,19 @@ impl AutoSwapLock {
                 return None;
             }
         };
-        let started = Instant::now();
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Some(Self(file)),
-                Err(err) if crate::switch_lock::is_lock_contention(&err) => {
-                    if started.elapsed() >= WAIT_LIMIT {
-                        tracing::debug!(
-                            lock = %path.display(),
-                            waited_ms = started.elapsed().as_millis() as u64,
-                            "auto-swap lock busy; another automatic swap is in progress"
-                        );
-                        return None;
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Err(err) => {
-                    tracing::warn!(err = %err, lock = %path.display(), "auto-swap lock failed");
-                    return None;
-                }
+        match lock_within_wait_limit(&file) {
+            Ok(()) => Some(Self(file)),
+            Err(LockWaitError::Busy { waited }) => {
+                tracing::debug!(
+                    lock = %path.display(),
+                    waited_ms = waited.as_millis() as u64,
+                    "auto-swap lock busy; another automatic swap is in progress"
+                );
+                None
+            }
+            Err(LockWaitError::Failed(err)) => {
+                tracing::warn!(err = %err, lock = %path.display(), "auto-swap lock failed");
+                None
             }
         }
     }
@@ -88,18 +77,6 @@ impl Drop for AutoSwapLock {
         // 显式解锁；即便遗漏，进程退出时 OS 也会释放文件锁。
         let _ = FileExt::unlock(&self.0);
     }
-}
-
-fn open_lock_file(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
 }
 
 #[cfg(test)]

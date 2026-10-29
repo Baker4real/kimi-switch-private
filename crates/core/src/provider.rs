@@ -11,7 +11,8 @@ use async_trait::async_trait;
 pub enum ActivateOutcome {
     /// 期望当前账号仍是当前账号，已切换。
     Activated,
-    /// 已被取代：交换锁内重读时当前账号已不是期望账号（决定之后别处抢先切换了）。
+    /// 已被取代：交换锁内重读时当前账号已不是期望账号（决定之后别处抢先切换了），或当前
+    /// 登录文件确证属于别的账号（如未导入的外部登录）。
     /// 没有切换，当前登录文件、registry 与切换前快照都没动；不是错误。
     Superseded,
 }
@@ -32,7 +33,8 @@ pub trait Provider: Send + Sync {
     ///
     /// 实现须在切换用的交换锁内、写当前登录文件之前重读 registry 当前标记：不是
     /// `expected_current` 就返回 [`ActivateOutcome::Superseded`]，不写当前登录文件、不写
-    /// registry、不进回滚。一致时与 [`Self::activate`] 相同。
+    /// registry、不进回滚。当前登录文件读得出身份且确证不是 `expected_current` 时同样返回
+    /// `Superseded`；读不出或解析不出身份不算不符。都一致时与 [`Self::activate`] 相同。
     async fn activate_if_current(
         &self,
         id: &AccountId,
