@@ -80,15 +80,7 @@ fn enter(path: &Path) -> Result<()> {
             }
         }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
+        let file = open_lock_file(path)?;
         acquire_exclusive(&file, path)?;
         *slot.borrow_mut() = Some(Held {
             path: path.to_path_buf(),
@@ -102,36 +94,69 @@ fn enter(path: &Path) -> Result<()> {
 /// 以 [`LOCK_WAIT_LIMIT`] 为上限获取排他锁：锁被他人持有时轮询等待，
 /// 超时返回 [`Error::SwitchLockTimeout`]；非竞争类错误（权限、IO 故障）如实上抛。
 fn acquire_exclusive(file: &File, path: &Path) -> Result<()> {
+    match lock_within_wait_limit(file) {
+        Ok(()) => Ok(()),
+        Err(LockWaitError::Busy { waited }) => {
+            tracing::warn!(
+                lock = %path.display(),
+                waited_ms = waited.as_millis() as u64,
+                "swap lock wait exceeded limit; giving up"
+            );
+            Err(Error::SwitchLockTimeout)
+        }
+        Err(LockWaitError::Failed(e)) => Err(Error::provider(format!(
+            "lock {} failed: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// 打开（必要时连同父目录创建）锁文件。交换锁、自动切换串行化锁与自动切换状态文件锁共用。
+pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// 带等待上限的排他锁没拿到的原因。
+pub(crate) enum LockWaitError {
+    /// 等满 [`LOCK_WAIT_LIMIT`] 仍被他人持有。
+    Busy { waited: Duration },
+    /// 非竞争类错误（权限、IO 故障）。
+    Failed(io::Error),
+}
+
+/// 在 `file` 上取排他锁，最多等 [`LOCK_WAIT_LIMIT`]（3 秒）：被他人持有时每
+/// [`LOCK_POLL_INTERVAL`] 重试一次，竞争判据见 [`is_lock_contention`]，其余错误立即返回。
+/// 交换锁、自动切换串行化锁与自动切换状态文件锁共用这一个等待循环，各自决定没拿到时怎么办。
+pub(crate) fn lock_within_wait_limit(file: &File) -> std::result::Result<(), LockWaitError> {
     let started = Instant::now();
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(()),
             Err(e) if is_lock_contention(&e) => {
                 if started.elapsed() >= LOCK_WAIT_LIMIT {
-                    tracing::warn!(
-                        lock = %path.display(),
-                        waited_ms = started.elapsed().as_millis() as u64,
-                        "swap lock wait exceeded limit; giving up"
-                    );
-                    return Err(Error::SwitchLockTimeout);
+                    return Err(LockWaitError::Busy {
+                        waited: started.elapsed(),
+                    });
                 }
                 std::thread::sleep(LOCK_POLL_INTERVAL);
             }
-            Err(e) => {
-                return Err(Error::provider(format!(
-                    "lock {} failed: {e}",
-                    path.display()
-                )))
-            }
+            Err(e) => return Err(LockWaitError::Failed(e)),
         }
     }
 }
 
 /// fs2 `try_lock_exclusive` 的竞争信号：Unix flock 返回 `EWOULDBLOCK`
 /// （std 映射为 `WouldBlock`），Windows `LockFileEx` 返回 `ERROR_LOCK_VIOLATION`
-/// （raw os error 33）。其余错误视为真实故障，不参与等待循环。自动切换串行化锁
-/// （[`crate::auto_swap_lock`]）沿用同一判据。
-pub(crate) fn is_lock_contention(err: &io::Error) -> bool {
+/// （raw os error 33）。其余错误视为真实故障，不参与等待循环。
+fn is_lock_contention(err: &io::Error) -> bool {
     const ERROR_LOCK_VIOLATION: i32 = 33;
     err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(ERROR_LOCK_VIOLATION)
 }
