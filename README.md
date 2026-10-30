@@ -25,6 +25,7 @@ intent: Install and use the Kimi Code account switcher GUI and CLI.
 - **当前账号主动续期（可选）**：账号库页顶部「账号行为」面板的开关，默认关闭、仅 Windows 生效；开启后在查询额度前为当前账号原子轮换登录凭证，不等官方客户端的懒刷新；极端情况下官方会话可能要求重新登录。
 - **额度耗尽自动切换（可选）**：账号库页顶部「账号行为」面板的开关，默认关闭。开启后，每次静默额度查询完成（节奏见「额度可视化」：常态 90 秒，当前账号用量高时自动加密；GUI 最小化不暂停）会检查当前账号：任一用量窗口已用达到阈值（默认 99%）就自动切到合格停泊账号（默认按已用比例升序），并弹瞬时通知。另有四个子开关「自动切换时优先低档位账号」「额度恢复后回驻低档账号」「pace 预切换」「重置前抢用」，均默认关闭，与主开关、主动续期一起收在「账号行为」一层折叠里（默认收起，不因任一开关已开而自动展开；收起时标题下用一行文字写明当前生效项，全关则不写）；总开关关闭时子开关置灰、不清已选状态。开启「回驻」后，当前账号未耗尽但存在档位严格更低的合格停泊账号时，自动切回其中档位最低者（须连续两个合格快照周期才切回；档位未知的账号不作为回驻目标）；手动切换后 8 小时保持期内不回驻，耗尽被迫切换不受影响；回驻与耗尽切换共用冷却。开启「pace 预切换」后，当前账号未达耗尽阈值、但按当前用量速度预测撑不到窗口重置时，提前切到更健康的停泊账号。开启「重置前抢用」后，未达耗尽、pace 未命中时，若合格停泊账号的 5 小时窗处于最后一小时或 7 天窗处于最后两天、且该窗口已用超过 70%，会自动切过去烧尾巴，烧完（窗口翻过重置点或目标达耗尽阈值）再切回原账号；燃烧期间 pace 与回驻不打断。账号卡上可「摘出自动切换」：被摘出的号不当耗尽 / pace / 回驻 / 抢用候选，手动切换仍可用；本地已确认失效（官方拒绝过其续期）的账号同样不当自动切换候选，但手动切过去仍会成功（带「建议重新授权」提示）。查询失败、数据未知、凭证待续期不触发轮询判定；刚手动选的号约 60 秒内不会被轮询切走（例外见下面的被动切换）；两次自动切换之间有冷却。进阶排序 / 防抖 / pace 预警水位 / 抢用水位与临近窗口只在 `config.toml` 的 `[auto_swap]`，默认关或零变化。CLI 无参列表同样会判定并追加一行英文结果。
 - **配额失败被动切换（可选，须装 hook）**：「额度耗尽自动切换」开着且安装了 hook（命令行执行 `kimi-switch-cli install-hook`）时，Kimi Code 会话实际撞上额度耗尽（官方现为 429 "You've reached your … usage limit"，旧版的 403 也认）的那一刻，官方 StopFailure hook 秒级唤起切换——失败请求间隙从分钟级降到秒级，过载、请求过多、并发上限这类不是额度耗尽的 429 不会误触发；GUI 没开也有兜底（hook 唤起的是独立 CLI 进程，不弹窗、绝不打断会话）。`install-hook` 幂等、只写入自己的条目、不动 `~/.kimi-code/config.toml` 里其他内容；`kimi-switch-cli install-hook --uninstall` 可还原。冷却、合格线、防抖边际、摘出等与轮询切换一致；刚手动选的号仍可能被立刻切走（安顿宽限不挡这次切换）。
+- **跟随启动（Windows，可选，须装 hook）**：开启自动切换后，Kimi Code 新建或恢复会话时自动拉起最小化的 GUI，不抢焦点，让忘开工具时也有完整的轮询切换；已有窗口保持原状。`install-hook` 同时安装 StopFailure 与 SessionStart 两条，`--uninstall` 一起移除，保留用户自己的 hook。只在本机交互桌面会话生效，不增加后台服务或开机自启。
 - **账号管理**：官方昵称已知的账号卡片直接显示官网名、无「重命名」入口；昵称未知的账号仍可起别名。删除带确认弹窗。
 - **凭证安全**：token 只保存在本机私有目录（Unix 下 0600 权限），网络请求只发往 Kimi 官方域名（`auth.kimi.com` / `api.kimi.com` / `www.kimi.com`，其中 `www.kimi.com` 仅限会员到期读取：绑定、用户点刷新、已绑定卡的导入补读；静默查询不打该接口），零遥测；token 刷新在有官方锁协议的平台（macOS/Linux）与官方客户端用同一套锁协调；Windows 上官方无锁协议，默认不替当前账号续期、不会互相抢刷（可选「主动续期」见上文）。
 
@@ -48,7 +49,7 @@ npm run tauri build
 
 产物：`target/release/kimi-switch.exe`（图形界面）、`target/release/kimi-switch-cli.exe`（命令行）、`target/release/bundle/`（MSI/NSIS 安装包）。
 
-Windows 上更新桌面快捷方式指向的本地 GUI 时，先退出正在运行的 `kimi-switch.exe`，再运行 `npm run build:desktop`。该命令会先完成前端检查，若目标程序仍在运行会明确报错，成功后更新固定路径 `target/release/kimi-switch.exe`，接着重建 `target/release/kimi-switch-cli.exe`。装过 hook 时，hook 调用的是执行 `install-hook` 时那个 `kimi-switch-cli.exe`（路径写在 `~/.kimi-code/config.toml` 里）：用这里 `target/release` 的 CLI 装的，被动切换随之用上新逻辑；用别处的 CLI 装的，要更新那份 exe，或用这里的 CLI 重新执行一次 `install-hook`（只刷新本工具那一条的路径）。
+Windows 上更新桌面快捷方式指向的本地 GUI 时，先退出正在运行的 `kimi-switch.exe`，再运行 `npm run build:desktop`。该命令会先完成前端检查，若目标程序仍在运行会明确报错，成功后更新固定路径 `target/release/kimi-switch.exe`，接着重建 `target/release/kimi-switch-cli.exe`。装过 hook 时，hook 调用的是执行 `install-hook` 时那个 `kimi-switch-cli.exe`（路径写在 `~/.kimi-code/config.toml` 里）：用这里 `target/release` 的 CLI 装的，被动切换随之用上新逻辑；用别处的 CLI 装的，要更新那份 exe，或用这里的 CLI 重新执行一次 `install-hook`（刷新本工具两条 hook 的路径）。从只装过被动切换的旧版升级后，也要重跑一次 `install-hook`，补上跟随启动条目；GUI 和 CLI 须放在同一目录。
 
 ### Edge 扩展（Windows GUI）
 
@@ -86,10 +87,10 @@ kimi-switch-cli swap <编号或id>  # 切换激活账号
 kimi-switch-cli rm <编号或id>    # 删除账号
 kimi-switch-cli bind-web <编号或id>  # 从 stdin 读网页 token，绑定后列表显示有效期至
 kimi-switch-cli config           # 打印生效设置（只读，与 GUI 同源）
-kimi-switch-cli install-hook     # 安装配额失败被动切换 hook（写入 ~/.kimi-code/config.toml 的 StopFailure 条目，幂等；--uninstall 还原）
+kimi-switch-cli install-hook     # 同时安装被动切换 StopFailure 和跟随启动 SessionStart 两条 hook（幂等；--uninstall 一起移除）
 ```
 
-被动切换子命令 `on-quota-failure` 由 hook 自动唤起，无需（也不应）手动执行；它任何情况下都以退出码 0 结束，绝不打断 Kimi Code 会话。每次唤起都会在审计日志（见下方「数据目录」）追加一行 `on_quota_failure` 记录：事件名、命中的口径或未命中的原因、最终决定（切到哪个账号，或不切的原因）；不记会话标题、工作目录和错误原文。
+观察型子命令 `on-quota-failure` 和 `on-session-start` 由 hook 自动唤起，无需（也不应）手动执行；它们任何情况下都以退出码 0 结束，绝不打断 Kimi Code 会话。被动切换每次追加一行 `on_quota_failure` 审计（见下方「数据目录」）：事件名、命中的口径或未命中的原因、最终决定。跟随启动每次追加一行 `on_session_start`：事件名、来源、客户端类型和结果（`launched`、`already_running`、`disabled`、`non_interactive`、`unsupported_platform` 或 `launch_failed`），不往 stdout 输出内容。两者都不记会话标题、工作目录和错误原文。
 
 GUI 与 CLI 共用同一份账号库和设置，可以混用。
 
@@ -118,10 +119,10 @@ refresh token 有有效期，长期未使用的账号凭证会过期。在账号
 当前账号的额度查询直接使用 Kimi Code 当前登录文件里的 access token，它只有约 15 分钟有效期，官方客户端闲置时不会自动续期；本工具默认不替当前账号续期，避免与官方客户端争抢凭证。这种情况会单独标成「凭证待续期」：在 Kimi CLI 里发一条消息（触发官方续期）后，点「刷新」会立刻直查，或等静默约 5 秒自动重查；待续期消失时弹「凭证已恢复」。若仍反复 401，再对这张卡点「重新授权」重走登录。Windows 用户也可以在账号库页「账号行为」面板打开「当前账号主动续期」，让工具在查询前自动轮换凭证。
 
 **打开「额度耗尽自动切换」后，没开 kimi-switch 也会换号吗？**
-分两种：装了 hook 会，没装不会。默认不装：GUI 运行时静默查询会判定（默认 90 秒、当前账号用量高时自动加密到 30/10 秒，最小化不暂停），CLI 无参列表时也会。执行过 `kimi-switch-cli install-hook` 后，即使 GUI 没开，Kimi Code 会话撞上额度耗尽的那一刻也会由 hook 秒级唤起切换（见下一条）。手动「切换」始终可用，不依赖额度查询。
+安装 hook 后，Windows 本机桌面会话开始或恢复时会自动拉起 GUI，最小化在任务栏、不抢焦点，让耗尽、pace、回驻、重置前抢用与回程等既有路径照常运行；已有 GUI 的窗口状态不动。触发点是新建或恢复会话，不一定是打开 Kimi Code 窗口。总开关关闭、SSH 等非交互会话和非 Windows 平台不拉起。GUI 关闭后只在下次会话开始或恢复时再拉起，不会反复保活；Kimi Code 退出后 GUI 继续运行。首轮额度快照回来之前，或 GUI 被关掉期间，仍由 StopFailure 被动切换兜底（见下一条）。未装 hook 时需自己打开 GUI；GUI 静默查询默认 90 秒，用量高时加密到 30/10 秒，最小化不暂停，CLI 无参列表时也会判定。手动「切换」始终可用，不依赖额度查询。
 
 **Kimi Code 提示 "You've reached your … usage limit"（额度耗尽）时能自动换号吗？**
-可以，这叫「配额失败被动切换」。前提：「额度耗尽自动切换」开着，且执行过一次 `kimi-switch-cli install-hook`（幂等；`--uninstall` 还原）。安装只写入 `~/.kimi-code/config.toml` 里属于本工具的一条 StopFailure hook，不动其他内容。命中条件是官方额度耗尽错误：同一条错误文案里同时有 "reached your" 和 "usage limit"，且这条错误本身带 429（5 小时、7 天、月度三种耗尽文案都是这样）；旧版 Kimi Code 报的 403 + "usage limit" 也照样识别。会话标题（你的首句提示）和工作目录不参与识别，在提示里贴报错文案排查不会误触发。过载、请求过多、并发上限这类不是额度耗尽的 429 不会误触发；切换不新增任何网络请求，冷却与候选合格线和轮询切换一致，但安顿宽限不挡这次切换；多个会话同时撞上额度耗尽，或恰好赶上 GUI / CLI 正在自动切换，都只切一次；刚因额度耗尽被切走的账号，在恢复之前（缓存里该窗口的重置时刻，没有就按窗口时长估计）不会被自动切回，手动切换不受影响；hook 绝不打断你的会话。撞上了却没切换时，原因记在审计日志的 `on_quota_failure` 行里；原因是 `superseded` 表示决定切换之后、真正切换之前，你已手动切了账号或另一次切换刚刚完成，这次就放弃，不覆盖你的选择；原因是 `busy` 表示另一次自动切换正在进行、3 秒内没轮到这次，这次就让给它。
+可以，这叫「配额失败被动切换」。前提：「额度耗尽自动切换」开着，且执行过一次 `kimi-switch-cli install-hook`（幂等；`--uninstall` 还原）。安装维护 `~/.kimi-code/config.toml` 里属于本工具的 StopFailure 与 SessionStart 两条 hook，不动用户自己的条目。命中条件是官方额度耗尽错误：同一条错误文案里同时有 "reached your" 和 "usage limit"，且这条错误本身带 429（5 小时、7 天、月度三种耗尽文案都是这样）；旧版 Kimi Code 报的 403 + "usage limit" 也照样识别。会话标题（你的首句提示）和工作目录不参与识别，在提示里贴报错文案排查不会误触发。过载、请求过多、并发上限这类不是额度耗尽的 429 不会误触发；切换不新增任何网络请求，冷却与候选合格线和轮询切换一致，但安顿宽限不挡这次切换；多个会话同时撞上额度耗尽，或恰好赶上 GUI / CLI 正在自动切换，都只切一次；刚因额度耗尽被切走的账号，在恢复之前（缓存里该窗口的重置时刻，没有就按窗口时长估计）不会被自动切回，手动切换不受影响；hook 绝不打断你的会话。撞上了却没切换时，原因记在审计日志的 `on_quota_failure` 行里；原因是 `superseded` 表示决定切换之后、真正切换之前，你已手动切了账号或另一次切换刚刚完成，这次就放弃，不覆盖你的选择；原因是 `busy` 表示另一次自动切换正在进行、3 秒内没轮到这次，这次就让给它。
 
 ## 免责声明
 

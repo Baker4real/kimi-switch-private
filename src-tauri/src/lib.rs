@@ -12,6 +12,8 @@ use kimi_switch_gui::{
 };
 use tauri::{Manager, State};
 
+#[cfg(windows)]
+mod startup_gate;
 mod web_bind;
 
 struct AppState {
@@ -270,13 +272,15 @@ struct InitFailureNotice {
     title: String,
     message: String,
     exit_code: i32,
+    show_dialog: bool,
 }
 
-fn init_failure_notice(err: &impl std::fmt::Display) -> InitFailureNotice {
+fn init_failure_notice(err: &impl std::fmt::Display, launch: LaunchMode) -> InitFailureNotice {
     InitFailureNotice {
         title: "kimi-switch".into(),
         message: format!("初始化失败：{err}"),
         exit_code: 1,
+        show_dialog: launch == LaunchMode::Normal,
     }
 }
 
@@ -304,10 +308,12 @@ fn show_native_error_dialog(title: &str, message: &str) {
     }
 }
 
-fn abort_on_init_failure(err: &anyhow::Error) -> ! {
-    let notice = init_failure_notice(err);
+fn abort_on_init_failure(err: &anyhow::Error, launch: LaunchMode) -> ! {
+    let notice = init_failure_notice(err, launch);
     eprintln!("kimi-switch: {}", notice.message);
-    show_native_error_dialog(&notice.title, &notice.message);
+    if notice.show_dialog {
+        show_native_error_dialog(&notice.title, &notice.message);
+    }
     std::process::exit(notice.exit_code);
 }
 
@@ -418,36 +424,41 @@ fn show_minimized_inactive(window: &tauri::WebviewWindow) {
 }
 
 pub fn run() {
-    let launch = launch_mode(std::env::args_os());
-    let backend = match Backend::new() {
-        Ok(backend) => {
-            // 启动一致性自检（issue #155）：以 live 为准纠正 active / 提示工具外身份
-            // 可导入；一致时零副作用。提示由首个快照的 toast 带出。
-            backend.startup_check();
-            Arc::new(backend)
-        }
-        Err(err) => abort_on_init_failure(&err),
-    };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if !relaunch_reveals_window(launch_mode(&args)) {
-                return;
-            }
-            if let Some(window) = app.get_webview_window("main") {
-                // 先 show 再 unminimize：后台启动的窗口首次离开最小化前，tao 记的 VISIBLE 仍为
-                // 假（见 show_minimized_inactive），先 unminimize 会在还原后补一次 SW_HIDE。普通
-                // 启动的窗口 VISIBLE 一直为真，show 是空操作，顺序不影响。
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
-        .manage(AppState {
-            backend,
-            web_bind: Arc::new(web_bind::WebBindBroker::default()),
-        })
+    let launch = launch_mode(std::env::args_os());
+    #[cfg(windows)]
+    let startup_gate = startup_gate::StartupGate::acquire()
+        .unwrap_or_else(|err| abort_on_init_failure(&err.into(), launch));
+    let reveal_requested = Arc::new(AtomicBool::new(false));
+    let relaunch_request = Arc::clone(&reveal_requested);
+
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(
+            move |app, args, _cwd| {
+                if !relaunch_reveals_window(launch_mode(&args)) {
+                    return;
+                }
+                // 首次窗口尚未创建时，也记住用户的普通启动请求，setup 完成后还原并聚焦。
+                relaunch_request.store(true, Ordering::Release);
+                if let Some(window) = app.get_webview_window("main") {
+                    reveal_window(&window);
+                }
+            },
+        ))
         .setup(move |app| {
+            // 插件先判定单实例，只有留下的 GUI 才初始化账号库并执行启动自检。
+            let backend = match Backend::new() {
+                Ok(backend) => {
+                    backend.startup_check();
+                    Arc::new(backend)
+                }
+                Err(err) => abort_on_init_failure(&err, launch),
+            };
+            app.manage(AppState {
+                backend,
+                web_bind: Arc::new(web_bind::WebBindBroker::default()),
+            });
             let window = build_main_window(app, launch)?;
             let _ =
                 window.set_background_color(Some(tauri::utils::config::Color(244, 241, 236, 255)));
@@ -457,6 +468,9 @@ pub fn run() {
                 if launch == LaunchMode::Background {
                     show_minimized_inactive(&window);
                 }
+            }
+            if reveal_requested.load(Ordering::Acquire) {
+                reveal_window(&window);
             }
             Ok(())
         })
@@ -482,19 +496,38 @@ pub fn run() {
             set_auto_swap_pace_pre_swap,
             set_auto_swap_opt_out,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running kimi-switch");
+        .build(tauri::generate_context!())
+        .expect("error while building kimi-switch");
+    // build 已建立单实例通知窗口；释放后再进消息循环，避免第二实例 SendMessage 等待成锁环。
+    #[cfg(windows)]
+    drop(startup_gate);
+    app.run(|_, _| {});
+}
+
+/// 先 show 同步后台窗口的 VISIBLE 标志，再还原并聚焦，保持手动启动行为。
+fn reveal_window(window: &tauri::WebviewWindow) {
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
 }
 
 #[cfg(test)]
 mod init_failure_tests {
-    use super::init_failure_notice;
+    use super::{init_failure_notice, LaunchMode};
 
     #[test]
     fn init_failure_notice_uses_chinese_message_and_nonzero_exit() {
-        let notice = init_failure_notice(&"凭证文件损坏");
+        let notice = init_failure_notice(&"凭证文件损坏", LaunchMode::Normal);
         assert_eq!(notice.title, "kimi-switch");
         assert_eq!(notice.message, "初始化失败：凭证文件损坏");
+        assert_eq!(notice.exit_code, 1);
+        assert!(notice.show_dialog);
+    }
+
+    #[test]
+    fn background_init_failure_does_not_request_a_dialog() {
+        let notice = init_failure_notice(&"等待启动超时", LaunchMode::Background);
+        assert!(!notice.show_dialog, "后台拉起失败不得弹窗打断用户");
         assert_eq!(notice.exit_code, 1);
     }
 }

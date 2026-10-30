@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 /// 像 hook 执行方那样唤起 CLI：stdin 写入事件后关闭，stdout / stderr 接管道。
-fn run_hook(home: &Path, stdin: &str) -> Output {
+fn run_hook(home: &Path, stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_kimi-switch-cli"))
         .arg("on-session-start")
         .env("KIMI_SWITCH_HOME", home)
@@ -23,7 +23,7 @@ fn run_hook(home: &Path, stdin: &str) -> Output {
         .stdin
         .take()
         .expect("stdin pipe")
-        .write_all(stdin.as_bytes())
+        .write_all(stdin)
         .unwrap();
     child.wait_with_output().unwrap()
 }
@@ -46,10 +46,15 @@ fn on_session_start_exits_zero_with_empty_stdout() {
         "source": "startup",
     })
     .to_string();
-    for stdin in [event.as_str(), "not json", ""] {
+    for stdin in [
+        event.as_bytes(),
+        b"not json",
+        b"",
+        b"{\"hook_event_name\":\"SessionStart\",\"source\":\"\xff\"}",
+    ] {
         let output = run_hook(home.path(), stdin);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(0), "{stdin}\n{stderr}");
+        assert_eq!(output.status.code(), Some(0), "{stdin:?}\n{stderr}");
         assert!(
             output.stdout.is_empty(),
             "stdout 必须为空：{}",
@@ -72,6 +77,7 @@ fn on_session_start_exits_zero_with_empty_stdout() {
         details,
         [
             "hook_event=SessionStart source=startup client_type=kimi_code_cli decision=disabled",
+            "hook_event=- source=- client_type=- decision=disabled",
             "hook_event=- source=- client_type=- decision=disabled",
             "hook_event=- source=- client_type=- decision=disabled",
         ],

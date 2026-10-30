@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -117,9 +117,8 @@ fn process_running_in_session(image: &str, session: u32) -> bool {
     found
 }
 
-/// 按计划创建进程，创建成功即返回，不等它。返回值说明它是否已脱离 hook 所在的 Job：本进程
-/// 不在 Job 里、或 Job 允许 breakaway 时为 true；计划不要求脱离、或 Job 不允许 breakaway
-/// 时为 false。
+/// 按计划创建进程，创建成功即返回，不等它。要求脱离但 Job 不允许时返回错误，由入口记录
+/// launch_failed；不能降级成随宿主关闭的 GUI。
 ///
 /// - 计划不继承句柄时以 `bInheritHandles = FALSE` 创建，子进程拿不到本进程的任何句柄，包括
 ///   hook 执行方交给本进程的 stdout / stderr 管道。std 的 `Command` 恒以 TRUE 创建进程，即使
@@ -130,21 +129,16 @@ fn process_running_in_session(image: &str, session: u32) -> bool {
 /// - 脱离进程树：`DETACHED_PROCESS`（不挂 hook 的控制台）、`CREATE_NEW_PROCESS_GROUP`（收不到
 ///   发给 hook 进程组的 Ctrl 事件），再加 `CREATE_BREAKAWAY_FROM_JOB`：hook 执行方若把本进程
 ///   放进带 KILL_ON_JOB_CLOSE 的 Job，只有脱离它，GUI 才能在 Kimi Code 退出后活下来。Job
-///   不允许 breakaway 时这次创建返回 `ERROR_ACCESS_DENIED`，去掉该标志重试一次。Job 嵌套时
+///   不允许 breakaway 时这次创建返回 `ERROR_ACCESS_DENIED`，不再去掉标志重试。Job 嵌套时
 ///   拒不拒绝只看直接所在的那层（2026-10-29 本机实测：嵌在不允许 breakaway 的 Job 里、本身
 ///   允许的 Job 照样能脱离）；外层 Job 的策略不归本进程管。
-pub(crate) fn launch(plan: &LaunchPlan) -> io::Result<bool> {
-    if !plan.detach {
-        return create_process(plan, 0).map(|()| false);
-    }
-    let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-    match create_process(plan, detached | CREATE_BREAKAWAY_FROM_JOB) {
-        Ok(()) => Ok(true),
-        Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-            create_process(plan, detached).map(|()| false)
-        }
-        Err(err) => Err(err),
-    }
+pub(crate) fn launch(plan: &LaunchPlan) -> io::Result<()> {
+    let flags = if plan.detach {
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB
+    } else {
+        0
+    };
+    create_process(plan, flags)
 }
 
 fn create_process(plan: &LaunchPlan, flags: PROCESS_CREATION_FLAGS) -> io::Result<()> {
@@ -354,6 +348,8 @@ mod tests {
     struct Rehearsal {
         /// 「hook 唤起的 CLI」正常退出，即真实执行器返回了 Ok。
         hook_exit_ok: bool,
+        /// 执行器是否确实创建了常驻子进程。
+        child_started: bool,
         /// 「hook 唤起的 CLI」退出后 5 秒内，接它 stdout / stderr 的管道读到 EOF，且常驻
         /// 子进程这时仍在运行。
         pipes_closed: bool,
@@ -395,6 +391,7 @@ mod tests {
         }) && hook.wait().unwrap().success();
         let _ = hook.kill();
         let sleeper = Sleeper::open(&sleeper_dir);
+        let child_started = sleeper.is_some();
         let early = pipes.recv_timeout(Duration::from_secs(5)).ok();
         let pipes_closed = early.is_some()
             && sleeper
@@ -412,6 +409,7 @@ mod tests {
             .unwrap_or_default();
         Rehearsal {
             hook_exit_ok,
+            child_started,
             pipes_closed,
             survived_job_close,
             output,
@@ -422,7 +420,8 @@ mod tests {
     /// stdout / stderr 的管道立刻读到 EOF，常驻子进程照常运行在计划给的工作目录里。
     #[test]
     fn real_launch_leaves_hook_pipes_to_close() {
-        let rehearsal = rehearse(None);
+        // cargo 自身可能在禁止 breakaway 的 Job 中；用可脱离的 hook Job 演练成功路径。
+        let rehearsal = rehearse(Some(JOB_OBJECT_LIMIT_BREAKAWAY_OK));
 
         assert!(rehearsal.hook_exit_ok, "{}", rehearsal.output);
         assert!(
@@ -443,11 +442,6 @@ mod tests {
 
         assert!(rehearsal.hook_exit_ok, "{}", rehearsal.output);
         assert!(rehearsal.pipes_closed, "{}", rehearsal.output);
-        assert!(
-            rehearsal.output.contains("outside_job=true"),
-            "{}",
-            rehearsal.output
-        );
         assert_eq!(
             rehearsal.survived_job_close,
             Some(true),
@@ -456,23 +450,19 @@ mod tests {
         );
     }
 
-    /// Job 不允许 breakaway：带 CREATE_BREAKAWAY_FROM_JOB 的创建被拒后，去掉该标志重试，照常
-    /// 拉起；这时 GUI 只能留在 Job 里，随 Job 关闭结束。
+    /// Job 不允许 breakaway：必须拒绝拉起，不能创建一份会随宿主关闭的 GUI 并报告成功。
     #[test]
-    fn real_launch_retries_inside_job_that_denies_breakaway() {
+    fn real_launch_refuses_job_that_denies_breakaway() {
         let rehearsal = rehearse(Some(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE));
 
-        assert!(rehearsal.hook_exit_ok, "{}", rehearsal.output);
-        assert!(rehearsal.pipes_closed, "{}", rehearsal.output);
         assert!(
-            rehearsal.output.contains("outside_job=false"),
-            "{}",
+            !rehearsal.hook_exit_ok,
+            "必须报告创建失败：{}",
             rehearsal.output
         );
-        assert_eq!(
-            rehearsal.survived_job_close,
-            Some(false),
-            "{}",
+        assert!(
+            !rehearsal.child_started,
+            "不应留下依附宿主的 GUI：{}",
             rehearsal.output
         );
     }
@@ -552,8 +542,7 @@ mod tests {
             detach: true,
             inherit_handles: false,
         };
-        let outside_job = super::launch(&plan).expect("real launch");
-        println!("outside_job={outside_job}");
+        super::launch(&plan).expect("real launch");
         assert!(
             wait_until(Duration::from_secs(10), || working_dir
                 .join(SLEEPER_STARTED)

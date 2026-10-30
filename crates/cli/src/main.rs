@@ -163,10 +163,11 @@ enum Cmd {
     OnSessionStart,
 
     /// Idempotently install (or remove with --uninstall) the Kimi Code
-    /// StopFailure [[hooks]] entry wiring events to `on-quota-failure`.
+    /// StopFailure -> `on-quota-failure` and SessionStart -> `on-session-start`
+    /// [[hooks]] entries (startup or resume, both with a 10-second timeout).
     /// No other code path ever modifies Kimi Code's config.toml.
     InstallHook {
-        /// Remove the hook entry instead of installing it.
+        /// Remove both kimi-switch hook entries instead of installing them.
         #[arg(long)]
         uninstall: bool,
     },
@@ -1549,7 +1550,7 @@ struct LaunchPlan {
     args: Vec<&'static str>,
     /// 程序所在目录。hook 在会话的项目目录里执行，GUI 继承它就会一直占住那个目录。
     working_dir: PathBuf,
-    /// 脱离 hook 的进程树：不挂控制台、自成进程组，并尽力脱离 hook 所在的 Job，
+    /// 脱离 hook 的进程树：不挂控制台、自成进程组，并脱离 hook 所在的 Job，
     /// 不随 hook 进程或 Kimi Code 退出而结束。
     detach: bool,
     /// 是否继承本进程的句柄。拉起器恒为 false：GUI 一旦持有 hook 执行方交给本进程的
@@ -1622,13 +1623,7 @@ impl LaunchEnv for SystemLaunchEnv {
     }
 
     fn launch(&self, plan: &LaunchPlan) -> std::io::Result<()> {
-        let outside_job = follow_launch_sys::launch(plan)?;
-        if plan.detach && !outside_job {
-            tracing::warn!(
-                "on-session-start: the hook's job forbids breakaway; the GUI may exit with Kimi Code"
-            );
-        }
-        Ok(())
+        follow_launch_sys::launch(plan)
     }
 }
 
@@ -1648,7 +1643,7 @@ mod follow_launch_sys {
         false
     }
 
-    pub(crate) fn launch(_plan: &super::LaunchPlan) -> std::io::Result<bool> {
+    pub(crate) fn launch(_plan: &super::LaunchPlan) -> std::io::Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }
@@ -1662,8 +1657,9 @@ fn on_session_start() {
     let mut bytes = Vec::new();
     if let Err(err) = std::io::stdin().lock().read_to_end(&mut bytes) {
         tracing::warn!(err = %err, "on-session-start: read stdin failed");
+        bytes.clear();
     }
-    let raw = String::from_utf8_lossy(&bytes);
+    let raw = std::str::from_utf8(&bytes).unwrap_or_default();
     let audit = match AuditLog::from_default_paths() {
         Ok(audit) => audit,
         Err(err) => {
@@ -1674,7 +1670,7 @@ fn on_session_start() {
     };
     run_on_session_start_with(
         &audit,
-        &raw,
+        raw,
         &settings::current().auto_swap,
         &SystemLaunchEnv,
     );
@@ -1771,13 +1767,14 @@ fn session_start_trace(raw: &str, decision: SessionStartDecision) -> AuditEvent 
 }
 
 // ---------------------------------------------------------------------------
-// install-hook（issue #162 / spec #152 决策 16）
+// install-hook（issue #162、#198 / ADR-0017、ADR-0021）
 // ---------------------------------------------------------------------------
 
-/// 我们写入 Kimi Code config.toml 的 StopFailure 条目识别标记：`command` 含
-/// `on-quota-failure` 子命令即视为本工具条目。重复安装只刷新（不重复追加），
-/// 卸载只删自己的，不动用户其它 hooks 条目。
-const HOOK_MARKER: &str = "on-quota-failure";
+/// 本工具维护的事件、子命令标记与 matcher；事件与子命令必须同时匹配，才更新或删除条目。
+const MANAGED_HOOKS: [(&str, &str, Option<&str>); 2] = [
+    ("StopFailure", "on-quota-failure", None),
+    ("SessionStart", "on-session-start", Some("startup|resume")),
+];
 
 /// Kimi Code 工作目录（只读镜像 `crates/providers/kimi/src/paths.rs::kimi_home`，
 /// owner 在那边；布局调整时需同步）。`KIMI_CODE_HOME` > `~/.kimi-code` > `.kimi-code`。
@@ -1791,7 +1788,7 @@ fn kimi_code_home() -> PathBuf {
 }
 
 /// `install-hook` 命令体：幂等写入 / 卸载 Kimi Code `config.toml` 的 `[[hooks]]`
-/// StopFailure 条目，command 指向当前可执行文件的 `on-quota-failure` 子命令。
+/// StopFailure 与 SessionStart 条目，command 指向当前可执行文件的对应观察型子命令。
 fn install_hook(uninstall: bool) -> Result<()> {
     let config_path = kimi_code_home().join("config.toml");
     let exe = std::env::current_exe().context("resolve current executable path")?;
@@ -1803,12 +1800,21 @@ fn install_hook(uninstall: bool) -> Result<()> {
 /// 安装 / 卸载的可测内核（tempdir 假 config）：先 toml_edit 解析后写回，保留注释、
 /// 顺序与既有条目；解析失败报错退出、绝不覆写。无变化时不重写文件（字节不变）。
 fn install_hook_into(config_path: &Path, exe: &Path, uninstall: bool) -> Result<String> {
-    let raw = std::fs::read_to_string(config_path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("read {}", config_path.display())),
+    };
     let mut doc = raw
         .parse::<toml_edit::DocumentMut>()
         .with_context(|| format!("parse {}", config_path.display()))?;
 
     if doc.get("hooks").is_none() {
+        if uninstall {
+            return Ok(
+                "StopFailure: not installed; SessionStart: not installed; nothing to remove".into(),
+            );
+        }
         doc["hooks"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
     }
     let Some(hooks) = doc["hooks"].as_array_of_tables_mut() else {
@@ -1817,81 +1823,105 @@ fn install_hook_into(config_path: &Path, exe: &Path, uninstall: bool) -> Result<
             config_path.display()
         );
     };
-    let ours: Vec<usize> = hooks
-        .iter()
-        .enumerate()
-        .filter(|(_, table)| hook_entry_is_ours(table))
-        .map(|(idx, _)| idx)
-        .collect();
-
-    if uninstall {
-        if ours.is_empty() {
-            return Ok("no kimi-switch StopFailure hook installed; nothing to remove".into());
-        }
-        for idx in ours.into_iter().rev() {
-            hooks.remove(idx);
-        }
-        // 数组被清空时连 `hooks` 键一起移除，还原到没有 hooks 段的原始形态。
-        if hooks.is_empty() {
-            doc.remove("hooks");
-        }
-    } else {
-        let command = format!("\"{}\" {HOOK_MARKER}", exe.display());
-        match ours.first() {
-            // 已安装：刷新 command（可执行文件可能移动过）与 timeout，多余重复条目收敛成一个。
-            Some(&first) => {
-                let table = hooks
-                    .get_mut(first)
-                    .expect("ours 索引来自同一 hooks 数组，必然存在");
-                table.insert("command", toml_edit::value(command));
-                table.insert("timeout", toml_edit::value(HOOK_TIMEOUT_SECS));
-                for idx in ours.into_iter().skip(1).rev() {
+    let mut states = Vec::new();
+    let mut removed = false;
+    for (event, marker, matcher) in MANAGED_HOOKS {
+        // 每轮重新找索引：前一类条目收敛或移除后，后一类的位置可能已经变化。
+        let ours: Vec<usize> = hooks
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| hook_entry_is_ours(table, event, marker))
+            .map(|(idx, _)| idx)
+            .collect();
+        let state = if uninstall {
+            if ours.is_empty() {
+                "not installed"
+            } else {
+                for idx in ours.into_iter().rev() {
                     hooks.remove(idx);
                 }
+                removed = true;
+                "removed"
             }
-            None => {
-                let mut table = toml_edit::Table::new();
-                table.insert("event", toml_edit::value("StopFailure"));
-                table.insert("command", toml_edit::value(command));
-                table.insert("timeout", toml_edit::value(HOOK_TIMEOUT_SECS));
-                hooks.push(table);
+        } else {
+            let command = format!("\"{}\" {marker}", exe.display());
+            match ours.first() {
+                Some(&first) => {
+                    let table = hooks
+                        .get_mut(first)
+                        .expect("ours 索引来自同一 hooks 数组，必然存在");
+                    let before = table.to_string();
+                    set_hook_value(table, "command", command);
+                    set_hook_value(table, "timeout", HOOK_TIMEOUT_SECS);
+                    if let Some(matcher) = matcher {
+                        set_hook_value(table, "matcher", matcher);
+                    }
+                    let changed = before != table.to_string() || ours.len() > 1;
+                    for idx in ours.into_iter().skip(1).rev() {
+                        hooks.remove(idx);
+                    }
+                    if changed {
+                        "updated"
+                    } else {
+                        "already up to date"
+                    }
+                }
+                None => {
+                    let mut table = toml_edit::Table::new();
+                    table.insert("event", toml_edit::value(event));
+                    table.insert("command", toml_edit::value(command));
+                    table.insert("timeout", toml_edit::value(HOOK_TIMEOUT_SECS));
+                    if let Some(matcher) = matcher {
+                        table.insert("matcher", toml_edit::value(matcher));
+                    }
+                    hooks.push(table);
+                    "installed"
+                }
             }
-        }
+        };
+        states.push(format!("{event}: {state}"));
+    }
+    // 删除后数组为空时连 hooks 键一起移除；没有匹配项时保持原文件。
+    if removed && hooks.is_empty() {
+        doc.remove("hooks");
     }
 
     let body = doc.to_string();
-    if body == raw {
-        return Ok(format!(
-            "kimi-switch StopFailure hook already up to date in {}",
-            config_path.display()
-        ));
+    if body != raw {
+        write_config_atomically(config_path, &body)?;
     }
-    write_config_atomically(config_path, &body)?;
-    Ok(if uninstall {
-        format!(
-            "removed kimi-switch StopFailure hook from {}",
-            config_path.display()
-        )
-    } else {
-        format!(
-            "installed kimi-switch StopFailure hook in {} (command runs {})",
-            config_path.display(),
-            HOOK_MARKER
-        )
-    })
+    Ok(format!(
+        "kimi-switch hooks in {}: {}",
+        config_path.display(),
+        states.join("; ")
+    ))
 }
 
 /// hook 条目超时（秒）：被动切换为纯本地文件操作（毫秒级），10s 上限兜底即可，
 /// 不让 hook 拖慢会话（官方默认 30s）。
 const HOOK_TIMEOUT_SECS: i64 = 10;
 
-/// 判定 [[hooks]] 条目是否为本工具写入的 StopFailure 条目。
-fn hook_entry_is_ours(table: &toml_edit::Table) -> bool {
-    table.get("event").and_then(|value| value.as_str()) == Some("StopFailure")
+/// 更新已存在的标量时保留注释与空白；值相同时连原来的引号形式也不改。
+fn set_hook_value(table: &mut toml_edit::Table, key: &str, value: impl Into<toml_edit::Value>) {
+    let mut value = value.into();
+    if let Some(previous) = table.get(key).and_then(toml_edit::Item::as_value) {
+        if (previous.as_str().is_some() && previous.as_str() == value.as_str())
+            || (previous.as_integer().is_some() && previous.as_integer() == value.as_integer())
+        {
+            return;
+        }
+        *value.decor_mut() = previous.decor().clone();
+    }
+    table.insert(key, toml_edit::Item::Value(value));
+}
+
+/// 按事件与子命令共同识别本工具条目，保留用户自己的同事件 hook。
+fn hook_entry_is_ours(table: &toml_edit::Table, event: &str, marker: &str) -> bool {
+    table.get("event").and_then(|value| value.as_str()) == Some(event)
         && table
             .get("command")
             .and_then(|value| value.as_str())
-            .is_some_and(|command| command.contains(HOOK_MARKER))
+            .is_some_and(|command| command.contains(marker))
 }
 
 /// 同目录临时文件 + rename 写回（config.toml 非机密，默认权限即可）。
@@ -4663,6 +4693,103 @@ mod tests {
         );
     }
 
+    /// 一次安装同时提供被动切换与跟随启动，重复执行保持配置字节不变。
+    #[test]
+    fn install_hook_adds_session_start_beside_stop_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(&config, hook_config_seed()).unwrap();
+        let exe = tmp
+            .path()
+            .join("bin with spaces")
+            .join("kimi-switch-cli.exe");
+
+        let message = super::install_hook_into(&config, &exe, false).unwrap();
+        let installed = std::fs::read_to_string(&config).unwrap();
+        let value: toml::Value = toml::from_str(&installed).unwrap();
+        let hooks = value["hooks"].as_array().unwrap();
+        assert_eq!(
+            hooks.len(),
+            3,
+            "保留用户条目，再添加本工具两条：{installed}"
+        );
+        let session = hooks
+            .iter()
+            .find(|hook| hook["event"].as_str() == Some("SessionStart"))
+            .unwrap();
+        assert_eq!(
+            session["command"].as_str(),
+            Some(format!("\"{}\" on-session-start", exe.display()).as_str())
+        );
+        assert_eq!(session["matcher"].as_str(), Some("startup|resume"));
+        assert_eq!(session["timeout"].as_integer(), Some(10));
+        assert_eq!(count_our_hook_entries(&installed), 1);
+        assert!(installed.contains(hook_config_seed()));
+        assert!(
+            message.contains("StopFailure") && message.contains("SessionStart"),
+            "{message}"
+        );
+
+        let message = super::install_hook_into(&config, &exe, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), installed);
+        assert!(message.contains("already up to date"), "{message}");
+    }
+
+    /// 存量安装补齐 SessionStart；刷新路径、timeout 与 matcher 时保留行内注释，并分别去重。
+    #[test]
+    fn install_hook_upgrades_legacy_then_refreshes_and_deduplicates_both_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let legacy = "# legacy installation\n[[hooks]]\nevent = 'StopFailure'\ncommand = 'old-cli on-quota-failure' # keep command note\ntimeout = 3 # keep timeout note\n";
+        std::fs::write(&config, legacy).unwrap();
+        let exe_a = tmp.path().join("bin_a").join("kimi-switch-cli.exe");
+        let message = super::install_hook_into(&config, &exe_a, false).unwrap();
+        let upgraded = std::fs::read_to_string(&config).unwrap();
+        let value: toml::Value = toml::from_str(&upgraded).unwrap();
+        assert_eq!(value["hooks"].as_array().unwrap().len(), 2);
+        assert!(message.contains("StopFailure: updated"), "{message}");
+        assert!(message.contains("SessionStart: installed"), "{message}");
+        assert!(upgraded.contains("# keep command note"), "{upgraded}");
+        assert!(upgraded.contains("# keep timeout note"), "{upgraded}");
+
+        let seed = format!("{upgraded}\n[[hooks]]\nevent = 'SessionStart'\ncommand = 'old-cli on-session-start'\nmatcher = 'startup'\ntimeout = 1\n\n[[hooks]]\nevent = 'StopFailure'\ncommand = 'old-cli on-quota-failure'\ntimeout = 1\n");
+        // 也刷新保留的第一条 SessionStart，避免只删掉重复条目却漏改 matcher。
+        let seed = seed.replace(
+            "matcher = \"startup|resume\"",
+            "matcher = 'startup' # keep matcher note",
+        );
+        std::fs::write(&config, seed).unwrap();
+        let exe_b = tmp.path().join("bin b").join("kimi-switch-cli.exe");
+        let message = super::install_hook_into(&config, &exe_b, false).unwrap();
+        let refreshed = std::fs::read_to_string(&config).unwrap();
+        let value: toml::Value = toml::from_str(&refreshed).unwrap();
+        let hooks = value["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2, "{refreshed}");
+        for (event, subcommand) in [
+            ("StopFailure", "on-quota-failure"),
+            ("SessionStart", "on-session-start"),
+        ] {
+            let hook = hooks
+                .iter()
+                .find(|hook| hook["event"].as_str() == Some(event))
+                .unwrap();
+            assert_eq!(
+                hook["command"].as_str(),
+                Some(format!("\"{}\" {subcommand}", exe_b.display()).as_str())
+            );
+            assert_eq!(hook["timeout"].as_integer(), Some(10));
+            assert!(message.contains(&format!("{event}: updated")), "{message}");
+        }
+        let session = hooks
+            .iter()
+            .find(|hook| hook["event"].as_str() == Some("SessionStart"))
+            .unwrap();
+        assert_eq!(session["matcher"].as_str(), Some("startup|resume"));
+        assert!(refreshed.contains("# keep matcher note"), "{refreshed}");
+        super::install_hook_into(&config, &exe_b, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), refreshed);
+    }
+
     /// 可执行文件移动后重装：条目刷新到新路径，仍只一条。
     #[test]
     fn install_hook_refreshes_moved_executable() {
@@ -4701,7 +4828,7 @@ mod tests {
     fn uninstall_hook_removes_only_ours_and_leaves_file_untouched_when_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("config.toml");
-        let seed = "# user comment line\n\n[[hooks]]\nevent = \"StopFailure\"\ncommand = \"node my-failure-handler.mjs\"\n";
+        let seed = "# user comment line\n\n[[hooks]]\nevent = \"StopFailure\"\ncommand = \"node my-failure-handler.mjs\"\n\n# user session hook\n[[hooks]]\nevent = 'SessionStart'\ncommand = 'node my-session-handler.mjs' # keep my command\nmatcher = 'startup' # keep my matcher\ntimeout = 42\n\n[[hooks]]\nevent = 'PreToolUse'\ncommand = 'echo on-session-start'\n";
         std::fs::write(&config, seed).unwrap();
         let exe = tmp.path().join("kimi-switch-cli.exe");
 
@@ -4711,8 +4838,14 @@ mod tests {
 
         // 安装 → 卸载：我们的条目消失，用户的 StopFailure hook 保留。
         super::install_hook_into(&config, &exe, false).unwrap();
-        super::install_hook_into(&config, &exe, true).unwrap();
+        assert!(std::fs::read_to_string(&config).unwrap().contains(seed));
+        let message = super::install_hook_into(&config, &exe, true).unwrap();
         let raw = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(raw, seed, "用户两类 hook、其它事件与注释应逐字保留");
+        assert!(
+            message.contains("StopFailure: removed") && message.contains("SessionStart: removed"),
+            "{message}"
+        );
         assert_eq!(count_our_hook_entries(&raw), 0, "{raw}");
         assert!(raw.contains("my-failure-handler.mjs"), "{raw}");
         assert!(raw.contains("# user comment line"), "{raw}");
@@ -4758,6 +4891,22 @@ mod tests {
         assert!(super::install_hook_into(&config, &Path::new("x.exe"), false).is_err());
         assert!(super::install_hook_into(&config, &Path::new("x.exe"), true).is_err());
         assert_eq!(std::fs::read_to_string(&config).unwrap(), corrupt);
+    }
+
+    /// 读取失败不能被当成空配置；损坏的编码也必须保持原字节。
+    #[test]
+    fn install_hook_refuses_unreadable_config_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        let invalid = b"# user config\nmodel = '\xff'\n";
+        std::fs::write(&config, invalid).unwrap();
+        for uninstall in [false, true] {
+            assert!(
+                super::install_hook_into(&config, std::path::Path::new("x.exe"), uninstall)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&config).unwrap(), invalid);
+        }
     }
 
     /// `hooks` 存在但不是 [[hooks]] 数组（如被写成普通表）：拒绝触碰，报错不改写。
