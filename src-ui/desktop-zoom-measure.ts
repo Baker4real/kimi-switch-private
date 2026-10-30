@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { ACCEPT_WINDOWS, ACCEPT_ZOOMS, LONG_DISPLAY_NAME, parkedRow } from "./desktop-accept.fixture";
 import { accountCardHtml } from "./library-card";
+import { listenOnBrowserSafePort, startOnBrowserSafePort } from "./desktop-test-port";
 
 const uiRoot = fileURLToPath(new URL(".", import.meta.url));
 
@@ -137,12 +138,71 @@ function pageHtml(): string {
   return html;
 }
 
-function killChrome(child: ChildProcess): void {
-  if (process.platform === "win32" && child.pid) {
-    spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-    return;
+async function killChrome(child: ChildProcess): Promise<void> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === "win32") {
+    await new Promise<void>((resolve, reject) => {
+      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      killer.once("error", reject);
+      killer.once("exit", (code) => {
+        if (code === 0 || child.exitCode !== null || child.signalCode !== null) resolve();
+        else reject(new Error("无法结束本次无头 Chrome"));
+      });
+    });
+  } else {
+    child.kill();
   }
-  child.kill();
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("本次无头 Chrome 退出超时")), 5000);
+    child.once("exit", () => { clearTimeout(timer); resolve(); });
+  });
+}
+
+async function launchChrome(pagePort: number): Promise<{ child: ChildProcess; debugPort: number }> {
+  const executable = chromePath();
+  return startOnBrowserSafePort(async (debugPort) => {
+    const child = spawn(executable, [
+      "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--disable-extensions",
+      `--user-data-dir=${join(tmpdir(), `ks-zoom-measure-${pagePort}-${debugPort}`)}`,
+      `--remote-debugging-port=${debugPort}`, "about:blank",
+    ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let debugLog = "";
+        const cleanup = () => {
+          clearTimeout(timer);
+          child.stdout?.off("data", onData);
+          child.stderr?.off("data", onData);
+          child.off("error", onError);
+          child.off("exit", onExit);
+        };
+        const fail = (error: Error) => { cleanup(); reject(error); };
+        const onError = (error: Error) => fail(error);
+        const onExit = () => fail(new Error("Chrome 在调试端口就绪前退出"));
+        const onData = (chunk: Buffer) => {
+          debugLog = (debugLog + chunk.toString()).slice(-8000);
+          const match = debugLog.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\/devtools\/browser\//);
+          if (match) {
+            if (Number(match[1]) !== debugPort) { fail(new Error("Chrome 调试端口与预留端口不一致")); return; }
+            cleanup();
+            resolve();
+          } else if (/bind\(\) failed|Cannot start http server for devtools/i.test(debugLog)) {
+            fail(Object.assign(new Error("Chrome 调试端口被占用"), { code: "EADDRINUSE" }));
+          }
+        };
+        const timer = setTimeout(() => fail(new Error("Chrome 没有打开预留的调试端口")), 15000);
+        child.stdout?.on("data", onData);
+        child.stderr?.on("data", onData);
+        child.once("error", onError);
+        child.once("exit", onExit);
+      });
+      return { child, debugPort };
+    } catch (error) {
+      await killChrome(child);
+      throw error;
+    }
+  });
 }
 
 /** 用无头 Chrome 的真实布局测量窗口与页面 zoom。deviceScaleFactor 固定为 1，不改系统 DPI。 */
@@ -168,45 +228,14 @@ export async function measureDesktopZoom(): Promise<ZoomFrame[]> {
       res.end("missing");
     }
   });
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-  const port = (server.address() as { port: number }).port;
-  const child = spawn(
-    chromePath(),
-    [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-extensions",
-      `--user-data-dir=${join(tmpdir(), `ks-zoom-measure-${port}`)}`,
-      "--remote-debugging-port=0",
-      "about:blank",
-    ],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  let debugLog = "";
-  const debugPort = await new Promise<number>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Chrome 没有打开调试端口：${debugLog}`)), 15000);
-    const onData = (chunk: Buffer) => {
-      debugLog += chunk.toString();
-      const match = debugLog.match(/127\.0\.0\.1:(\d+)\//);
-      if (match) {
-        clearTimeout(timer);
-        resolve(Number(match[1]));
-      }
-    };
-    child.stderr?.on("data", onData);
-    child.stdout?.on("data", onData);
-    child.on("exit", () => {
-      clearTimeout(timer);
-      reject(new Error(`Chrome 提前退出：${debugLog}`));
-    });
-  });
+  const port = await listenOnBrowserSafePort(server);
   const frames: ZoomFrame[] = [];
+  let child: ChildProcess | null = null;
   let pageWs: WebSocket | null = null;
   try {
+    const launched = await launchChrome(port);
+    child = launched.child;
+    const debugPort = launched.debugPort;
     const created = (await (
       await fetch(`http://127.0.0.1:${debugPort}/json/new?about:blank`, { method: "PUT" })
     ).json()) as { webSocketDebuggerUrl: string };
@@ -279,8 +308,12 @@ export async function measureDesktopZoom(): Promise<ZoomFrame[]> {
     }
   } finally {
     pageWs?.close();
-    killChrome(child);
-    server.close();
+    try {
+      if (child) await killChrome(child);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   }
   return frames;
 }

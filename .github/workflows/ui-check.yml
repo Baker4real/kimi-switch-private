@@ -1,4 +1,4 @@
-name: UI checks
+name: Project checks
 
 on: [push, pull_request]
 
@@ -16,3 +16,16 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check:ui
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: rustup default stable
+      - run: npm ci
+      - run: npm run check
