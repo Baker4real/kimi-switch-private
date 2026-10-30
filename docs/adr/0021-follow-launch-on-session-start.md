@@ -89,11 +89,38 @@ documents:
   不考虑 SSH。
 - **在 SSH 会话里直接拉起**：看不见、关不掉，可能和桌面 GUI 成为两份并行轮换 refresh token。
 
-## 待真机核实（实现第一步）
+## Windows 真机验收（2026-10-30）
 
-1. 桌面版只打开窗口、还没新建或恢复会话时，是否触发 `SessionStart`。不触发时 GUI 在第一个会话
-   开始或恢复时拉起，行为可接受。
-2. Kimi Code 退出时，由 hook 拉起的 GUI 不被连带结束。
-3. 拉起的 GUI 最小化、不抢焦点；GUI 已在运行时窗口状态不变。
+在 Kimi Code Desktop 1.2.0、kimi-switch 1.4.17 的 release GUI/CLI 上完成 #199。
+构建使用 `npm run build:desktop`，源码包含本次跟随启动提交及此前已部署的 OAuth 锁修复、中文
+文案补丁；工作区里这些独立补丁仍由原任务持有。固定 release 路径、桌面快捷方式目标与图标、
+安装后两份 exe 的 SHA-256 均独立回读一致。
 
-SSH 场景不做真机验收。
+- **双 hook 安装**：使用固定路径 release CLI 重跑 `install-hook`，StopFailure 与 SessionStart
+  各一条，timeout 均为 10 秒，后者 matcher 为 `startup|resume`。用户其他配置和 hook 的解析值
+  与文本保持不变；再次安装文件字节和 mtime 均不变。
+- **打开窗口与恢复会话**：退出整个 Kimi Code 进程再启动时，本机桌面版自动恢复上次会话，
+  记录 `source=resume client_type=kimi_code_desktop decision=launched`。不能把这次拉起归因于
+  单纯显示窗口；进入空白的新会话页面、尚未发首条消息时没有新增 SessionStart。
+- **新会话**：在专用验收会话发送一条仅要求回复 OK、禁止工具调用的消息，产生
+  `source=startup client_type=kimi_code_desktop decision=already_running`，原 GUI 窗口不变。
+- **窗口与轮询**：后台启动由隐藏窗口直接转为最小化。以约 20 毫秒间隔采样窗口可见性、
+  最小化状态和前台 PID，未观察到可见且未最小化的中间态，前台一直留在 Kimi Code。
+  GUI 连续最小化约 198 秒；额度缓存写入时刻为 11:06:35.748 → 11:08:12.384 →
+  11:09:42.846（UTC+8），间隔 96.6 / 90.5 秒，符合常态 90 秒加请求耗时的节奏。
+  这项采样不声明排除了小于采样间隔的显示变化。
+- **重复启动**：真实 CLI 两次输入 SessionStart 均 stdout 为空，分别在 278.0 / 42.7 毫秒内返回，
+  决定为 launched / already_running。直接以 `--background` 二次启动，在已有 GUI 最小化、
+  前台、后台三种状态下均保留原窗口及焦点，只留下原实例；普通二次启动仍还原并聚焦。
+- **独立生命周期**：从 Kimi Code 菜单执行完整退出，确认所有 `Kimi Code.exe` 进程消失后，
+  真实 hook 拉起的 GUI 原 PID 和窗口继续存活；关闭 GUI 仍直接退出。
+- **总开关门控**：临时关闭 `auto_swap.enabled`，退出 GUI 后再恢复 Kimi Code 会话，得到
+  `decision=disabled` 且未拉起 GUI。验收结束已恢复全部原有自动切换开关值。
+- **每事件一行**：上述真实 resume/startup/禁用恢复事件各新增一条 `on_session_start`，仅含
+  事件、来源、客户端类型与决定，没有 cwd、会话标题或 stdin 原文。
+
+本机原始证据：`D:/agents/run-evidence/kimi-switch/spec-195-20261030/` 下的
+`hook-install.json`、`synthetic-*.json`、`watch-synthetic-minimized.json`、
+`watch-client-open.json`、`watch-real-startup-existing.json`、`watch-parent-exit.json`、
+`watch-disabled-resume.json`、`duplicate-*.json`、`settings-restored.json`、`shortcut.json`。
+SSH 场景按规格不做真机验收；非 Windows 行为只由平台分支与自动化测试覆盖。
